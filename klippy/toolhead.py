@@ -617,6 +617,10 @@ class ToolHead:
             self.kin.check_move(move)
         if move.axes_d[3]:
             self.extruder.check_move(move)
+        # Apply torque curve limits if configured
+        if hasattr(self, "torque_curves"):
+            for tc in self.torque_curves:
+                tc.limit_move(move)
         self.commanded_pos[:] = move.end_pos
         self.lookahead.add_move(move)
         if self.print_time > self.need_check_pause:
