@@ -355,6 +355,49 @@ class PrinterExtruder:
         )
         self.last_position = move.end_pos[3]
 
+    def move_segment(self, print_time, move, e_start_pos,
+                     accel_t, cruise_t, decel_t, start_v, cruise_v, accel):
+        # Emit one TOPP-RA velocity slice to the extruder trapq, scaled by the
+        # move's extrusion ratio, mirroring the toolhead slice emitted at the
+        # same print_time. This keeps the extruder (and pressure advance) on the
+        # exact velocity profile the toolhead follows. `e_start_pos` is the
+        # extruder position at the start of this slice (tracked by the caller).
+        axis_r = move.axes_r[3]
+        e_accel = accel * axis_r
+        e_start_v = start_v * axis_r
+        e_cruise_v = cruise_v * axis_r
+        pressure_advance = 0.0
+        use_pa_from_trapq = 0.0
+        es = self.extruder_stepper
+        if es is not None and axis_r > 0.0 and (move.axes_d[0] or move.axes_d[1]):
+            pa_curve = getattr(es, "pa_curve", None)
+            if pa_curve is not None and pa_curve.active():
+                # Dynamic pressure advance: look up pa(flow) for this slice's
+                # extruder speed and deliver it via the per-move trapq PA slot.
+                pressure_advance = pa_curve.get_pa_for_speed(e_cruise_v)
+                use_pa_from_trapq = 1.0
+            else:
+                pressure_advance = es.pressure_advance
+                if es.per_move_pressure_advance:
+                    use_pa_from_trapq = 1.0
+        self.trapq_append(
+            self.trapq,
+            print_time,
+            accel_t,
+            cruise_t,
+            decel_t,
+            e_start_pos,
+            0.0,
+            0.0,
+            1.0,
+            pressure_advance,
+            use_pa_from_trapq,
+            e_start_v,
+            e_cruise_v,
+            e_accel,
+        )
+        self.last_position = move.end_pos[3]
+
     def find_past_position(self, print_time):
         if self.extruder_stepper is None:
             return 0.0

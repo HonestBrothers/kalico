@@ -78,12 +78,19 @@ class Move:
             return
         # Allow extruder to calculate its maximum junction
         extruder_v2 = self.toolhead.extruder.calc_junction(prev_move, self)
+        # TOPP-RA: prev move's accel-reachability is the curve integral, not a
+        # constant-accel delta_v2, when the curve reshapes prev_move.
+        ptc = getattr(self.toolhead, "topp_ra", None)
+        if ptc is not None and ptc.active_for(prev_move):
+            prev_reach_v2 = ptc.reach(prev_move.max_start_v2, prev_move.move_d)
+        else:
+            prev_reach_v2 = prev_move.max_start_v2 + prev_move.delta_v2
         max_start_v2 = min(
             extruder_v2,
             self.max_cruise_v2,
             prev_move.max_cruise_v2,
             prev_move.next_junction_v2,
-            prev_move.max_start_v2 + prev_move.delta_v2,
+            prev_reach_v2,
         )
         # Find max velocity using "approximated centripetal velocity"
         axes_r = self.axes_r
@@ -168,9 +175,14 @@ class LookAheadQueue:
         # after the last move.
         delayed = []
         next_end_v2 = next_smoothed_v2 = peak_cruise_v2 = 0.0
+        tc = getattr(self.toolhead, "topp_ra", None)
         for i in range(flush_count - 1, -1, -1):
             move = queue[i]
-            reachable_start_v2 = next_end_v2 + move.delta_v2
+            mtc = tc if (tc is not None and tc.active_for(move)) else None
+            if mtc is not None:
+                reachable_start_v2 = mtc.reach(next_end_v2, move.move_d)
+            else:
+                reachable_start_v2 = next_end_v2 + move.delta_v2
             start_v2 = min(move.max_start_v2, reachable_start_v2)
             reachable_smoothed_v2 = next_smoothed_v2 + move.smooth_delta_v2
             smoothed_v2 = min(move.max_smoothed_v2, reachable_smoothed_v2)
@@ -205,6 +217,15 @@ class LookAheadQueue:
                         move.max_cruise_v2,
                         peak_cruise_v2,
                     )
+                    if mtc is not None:
+                        # The constant-accel midpoint isn't the triangle peak
+                        # under a velocity-dependent limit; clamp to what is
+                        # actually reachable from each end across the move.
+                        cruise_v2 = min(
+                            cruise_v2,
+                            mtc.reach(start_v2, move.move_d),
+                            mtc.reach(next_end_v2, move.move_d),
+                        )
                     move.set_junction(
                         min(start_v2, cruise_v2),
                         cruise_v2,
@@ -457,29 +478,68 @@ class ToolHead:
             self._calc_print_time()
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
+        topp = getattr(self, "topp_ra", None)
         for move in moves:
-            if move.is_kinematic_move:
-                self.trapq_append(
-                    self.trapq,
-                    next_move_time,
-                    move.accel_t,
-                    move.cruise_t,
-                    move.decel_t,
-                    move.start_pos[0],
-                    move.start_pos[1],
-                    move.start_pos[2],
-                    move.axes_r[0],
-                    move.axes_r[1],
-                    move.axes_r[2],
-                    move.start_v,
-                    move.cruise_v,
-                    move.accel,
-                )
-            if move.axes_d[3]:
-                self.extruder.move(next_move_time, move)
-            next_move_time = (
-                next_move_time + move.accel_t + move.cruise_t + move.decel_t
-            )
+            move_dur = move.accel_t + move.cruise_t + move.decel_t
+            segs = None
+            if move.is_kinematic_move and topp is not None:
+                segs = topp.plan_move(move)
+            if segs is not None:
+                # TOPP-RA: emit the velocity-dependent-accel profile as a chain
+                # of constant-accel slices, driving the toolhead trapq and the
+                # (scaled) extruder trapq in lock-step so pressure advance
+                # integrates the real profile.
+                t = next_move_time
+                pos = 0.0
+                extruding = bool(move.axes_d[3])
+                e_pos = move.start_pos[3]
+                e_axis_r = move.axes_r[3]
+                for (at, ct, dt, sv, cv, a, dist) in segs:
+                    self.trapq_append(
+                        self.trapq,
+                        t,
+                        at,
+                        ct,
+                        dt,
+                        move.start_pos[0] + move.axes_r[0] * pos,
+                        move.start_pos[1] + move.axes_r[1] * pos,
+                        move.start_pos[2] + move.axes_r[2] * pos,
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        sv,
+                        cv,
+                        a,
+                    )
+                    if extruding:
+                        self.extruder.move_segment(
+                            t, move, e_pos, at, ct, dt, sv, cv, a
+                        )
+                    t += at + ct + dt
+                    pos += dist
+                    e_pos += e_axis_r * dist
+                move_dur = t - next_move_time
+            else:
+                if move.is_kinematic_move:
+                    self.trapq_append(
+                        self.trapq,
+                        next_move_time,
+                        move.accel_t,
+                        move.cruise_t,
+                        move.decel_t,
+                        move.start_pos[0],
+                        move.start_pos[1],
+                        move.start_pos[2],
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        move.start_v,
+                        move.cruise_v,
+                        move.accel,
+                    )
+                if move.axes_d[3]:
+                    self.extruder.move(next_move_time, move)
+            next_move_time = next_move_time + move_dur
             for cb in move.timing_callbacks:
                 cb(next_move_time)
         # Generate steps for moves

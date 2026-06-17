@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+import math
 import os
 import bisect
 
@@ -36,6 +37,21 @@ class TorqueCurve:
 
         # Enable/disable the dynamic limiting
         self.enabled = config.getboolean("enabled", True)
+
+        # --- TOPP-RA mode -------------------------------------------------
+        # When True, the curve is used as a velocity-dependent acceleration
+        # constraint *inside* the lookahead (reachability analysis) and the
+        # move is emitted as a sequence of constant-accel slices honoring
+        # a_max(v), instead of a single conservative per-move accel cap.
+        self.topp_ra = config.getboolean("enable_topp_ra", False)
+        # Only reshape travel (non-extruding) moves. Extruding moves keep the
+        # stock single-trapezoid so the extruder / pressure-advance sync (which
+        # is tied to one accel per move) stays correct. Leave True until the
+        # extruder sync is reworked for multi-segment moves.
+        self.travel_only = config.getboolean("topp_ra_travel_only", True)
+        # Velocity-space integration step for reach()/segment emission (mm/s).
+        # Smaller = closer to the continuous optimum, more segments/cost.
+        self.dv_slice = config.getfloat("topp_ra_resolution", 25.0, above=1.0)
 
         # Internal data structures for the curve
         # speeds and accels are parallel arrays, sorted by speed
@@ -179,6 +195,15 @@ class TorqueCurve:
         if not hasattr(self.toolhead, "torque_curves"):
             self.toolhead.torque_curves = []
         self.toolhead.torque_curves.append(self)
+        # Publish ourselves as the single active TOPP-RA constraint provider
+        # that the lookahead (Move.calc_junction / LookAheadQueue.flush /
+        # ToolHead._process_moves) consults via getattr(toolhead,"topp_ra",None).
+        if self.topp_ra:
+            if getattr(self.toolhead, "topp_ra", None) is not None:
+                raise self.printer.config_error(
+                    "Only one [torque_curve] may set enable_topp_ra"
+                )
+            self.toolhead.topp_ra = self
 
     def get_max_accel_for_speed(self, speed):
         """
@@ -240,6 +265,136 @@ class TorqueCurve:
         max_accel = self.get_max_accel_for_speed(cruise_speed)
         if max_accel is not None and max_accel < move.accel:
             move.limit_speed(cruise_speed, max_accel)
+
+    # ------------------------------------------------------------------
+    # TOPP-RA: velocity-dependent reachability in u = v^2 space.
+    #
+    # du/ds = 2*a, so the accel constraint a <= a_max(v) becomes a bound on
+    # how fast u may grow/shrink along the path. All helpers use the
+    # *upper-edge* (smaller, conservative) accel within each velocity slice,
+    # so planned velocities are always achievable by the emitter and braking
+    # never exceeds the torque limit. a_max(v) is assumed symmetric for
+    # accel/decel (stepper pull-out torque is ~direction-independent).
+    # ------------------------------------------------------------------
+    def active_for(self, move):
+        # True if TOPP-RA should reshape this move.
+        if not (self.topp_ra and self.enabled and self.curve_loaded):
+            return False
+        if self.travel_only and move.axes_d[3]:
+            return False
+        return True
+
+    def _accel_at(self, v):
+        a = self.get_max_accel_for_speed(v)
+        if a is None or a <= 0.0:
+            return None
+        return a
+
+    def reach(self, u0, dist):
+        # Max u = v^2 reachable from u0 over path-distance `dist`, riding
+        # |du/ds| = 2*a_max(sqrt(u)). Direction-symmetric, so this serves both
+        # forward-accel (calc_junction) and backward-decel (flush).
+        if not self.curve_loaded or dist <= 0.0:
+            return u0
+        v_ceil = self.speeds[-1]
+        v = math.sqrt(max(u0, 0.0))
+        s = 0.0
+        while s < dist and v < v_ceil:
+            v_next = min(v + self.dv_slice, v_ceil)
+            a = self._accel_at(v_next)
+            if a is None:
+                break
+            ds = (v_next * v_next - v * v) / (2.0 * a)
+            if s + ds >= dist:
+                return v * v + 2.0 * a * (dist - s)
+            v, s = v_next, s + ds
+        return v * v
+
+    def _dist_up(self, v_lo, v_hi):
+        # Path distance to accelerate from v_lo to v_hi (>= v_lo) under the
+        # curve, using upper-edge (conservative) accel per slice.
+        if v_hi <= v_lo:
+            return 0.0
+        v = v_lo
+        d = 0.0
+        while v < v_hi:
+            v_next = min(v + self.dv_slice, v_hi)
+            a = self._accel_at(v_next)
+            if a is None:
+                return d
+            d += (v_next * v_next - v * v) / (2.0 * a)
+            v = v_next
+        return d
+
+    def _peak_velocity(self, start_v, end_v, dist):
+        # Highest velocity a move of length `dist` can peak at (accelerate up
+        # to v_p then back down to end_v). Bisection; None if too short to even
+        # connect start_v -> end_v under the curve.
+        lo = max(start_v, end_v)
+        hi = self.speeds[-1]
+        if self._dist_up(start_v, lo) + self._dist_up(end_v, lo) > dist:
+            return None
+        for _ in range(24):
+            mid = 0.5 * (lo + hi)
+            need = self._dist_up(start_v, mid) + self._dist_up(end_v, mid)
+            if need > dist:
+                hi = mid
+            else:
+                lo = mid
+        return lo
+
+    def plan_move(self, move):
+        # Build the TOPP-RA segment list for `move`, honoring a_max(v). Each
+        # segment is (accel_t, cruise_t, decel_t, start_v, cruise_v, accel,
+        # distance) -- ready to feed both the toolhead and (scaled) extruder
+        # trapq. Returns None to fall back to stock single-trapezoid emission.
+        if not self.active_for(move):
+            return None
+        start_v, cruise_v, end_v = move.start_v, move.cruise_v, move.end_v
+        move_d = move.move_d
+        d_acc = self._dist_up(start_v, cruise_v)
+        d_dec = self._dist_up(end_v, cruise_v)
+        cruise_d = move_d - d_acc - d_dec
+        if cruise_d < -1e-9:
+            # Too short to reach cruise_v: solve the triangle peak.
+            v_p = self._peak_velocity(start_v, end_v, move_d)
+            if v_p is None:
+                return None
+            cruise_v = v_p
+            d_acc = self._dist_up(start_v, cruise_v)
+            d_dec = self._dist_up(end_v, cruise_v)
+            cruise_d = max(0.0, move_d - d_acc - d_dec)
+        segs = []
+        # Accel slices: start_v -> cruise_v (accel-only)
+        v = start_v
+        while v < cruise_v - 1e-9:
+            v_next = min(v + self.dv_slice, cruise_v)
+            a = self._accel_at(v_next)
+            if a is None:
+                break
+            dt = (v_next - v) / a
+            dist = (v_next * v_next - v * v) / (2.0 * a)
+            segs.append((dt, 0.0, 0.0, v, v_next, a, dist))
+            v = v_next
+        # Cruise (single constant-velocity segment)
+        if cruise_d > 1e-9 and cruise_v > 1e-9:
+            ct = cruise_d / cruise_v
+            segs.append((0.0, ct, 0.0, cruise_v, cruise_v, 0.0, cruise_d))
+        # Decel slices: cruise_v -> end_v (decel-only, high->low)
+        ladder = []
+        v = end_v
+        while v < cruise_v - 1e-9:
+            v_next = min(v + self.dv_slice, cruise_v)
+            ladder.append((v, v_next))
+            v = v_next
+        for v_lo, v_hi in reversed(ladder):
+            a = self._accel_at(v_hi)
+            if a is None:
+                break
+            dt = (v_hi - v_lo) / a
+            dist = (v_hi * v_hi - v_lo * v_lo) / (2.0 * a)
+            segs.append((0.0, 0.0, dt, v_hi, v_hi, a, dist))
+        return segs if segs else None
 
     def set_curve_data(self, speeds, accels):
         """
