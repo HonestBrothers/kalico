@@ -601,6 +601,45 @@ class PrinterExtruder:
         for i in range(3):
             self.last_position[i] += extr_d * extr_r[i]
 
+    def move_segment(self, print_time, move, accel_t, cruise_t, decel_t,
+                     start_v, cruise_v, accel, seg_dist):
+        # TOPP-RA: emit one velocity slice of `move` to the extruder trapq,
+        # scaled by the extrusion ratio, mirroring the toolhead slice queued at
+        # the same print_time. The existing C pressure-advance model (linear,
+        # tanh, recipr, ...) integrates the real per-slice velocity profile
+        # automatically -- no per-move PA slot needed. seg_dist is the toolhead
+        # distance of this slice; the slices' extruder displacements sum to the
+        # move's total, so last_position stays consistent.
+        axis_r = move.axes_r[3]
+        abs_axis_r = abs(axis_r)
+        e_accel = accel * abs_axis_r
+        e_start_v = start_v * abs_axis_r
+        e_cruise_v = cruise_v * abs_axis_r
+        extr_pos = self.last_position
+        if move.is_kinematic_move:
+            extr_r = [math.copysign(r * r, axis_r) for r in move.axes_r[:3]]
+        else:
+            extr_r = [0.0, 0.0, axis_r]
+        self.trapq_append(
+            self.trapq,
+            print_time,
+            accel_t,
+            cruise_t,
+            decel_t,
+            extr_pos[0],
+            extr_pos[1],
+            extr_pos[2],
+            extr_r[0],
+            extr_r[1],
+            extr_r[2],
+            e_start_v,
+            e_cruise_v,
+            e_accel,
+        )
+        extr_d = abs_axis_r * seg_dist
+        for i in range(3):
+            self.last_position[i] += extr_d * extr_r[i]
+
     def find_past_position(self, print_time):
         if not self.extruder_steppers:
             return 0.0
