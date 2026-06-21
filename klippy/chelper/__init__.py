@@ -31,6 +31,7 @@ SOURCE_FILES = [
     "kin_cartesian.c",
     "kin_corexy.c",
     "kin_corexz.c",
+    "kin_xyz.c",
     "kin_delta.c",
     "kin_deltesian.c",
     "kin_polar.c",
@@ -136,6 +137,10 @@ defs_kin_corexy = """
 
 defs_kin_corexz = """
     struct stepper_kinematics *corexz_stepper_alloc(char type);
+"""
+
+defs_kin_xyz = """
+    struct stepper_kinematics *xyz_stepper_alloc(char type);
 """
 
 defs_kin_delta = """
@@ -251,6 +256,7 @@ defs_all = [
     defs_kin_cartesian,
     defs_kin_corexy,
     defs_kin_corexz,
+    defs_kin_xyz,
     defs_kin_delta,
     defs_kin_deltesian,
     defs_kin_polar,

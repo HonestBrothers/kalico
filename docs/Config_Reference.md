@@ -200,8 +200,9 @@ The printer section controls high level printer settings.
 [printer]
 kinematics:
 #   The type of printer in use. This option may be one of: cartesian,
-#   corexy, corexz, hybrid_corexy, hybrid_corexz, rotary_delta, delta,
-#   deltesian, polar, winch, or none. This parameter must be specified.
+#   corexy, corexz, xyz, hybrid_corexy, hybrid_corexz, rotary_delta,
+#   delta, deltesian, polar, winch, or none. This parameter must be
+#   specified.
 max_velocity:
 #   Maximum velocity (in mm/s) of the toolhead (relative to the
 #   print). This value may be changed at runtime using the
@@ -705,6 +706,46 @@ max_z_accel:
 
 # The stepper_z section is used to describe the Z axis as well as the
 # stepper controlling the X-Z movement.
+[stepper_z]
+```
+
+### XYZ (CoreXYZ) Kinematics
+
+This is a fully coupled cartesian kinematic in which all three motors
+contribute to motion along every toolhead axis. The motors (A, B, C) are
+related to the toolhead coordinates by a symmetric, invertible matrix:
+
+```
+A =  x + y + z
+B =  x - y - z
+C = -x + y - z
+```
+
+Motor A is configured via `[stepper_x]`, motor B via `[stepper_y]`, and
+motor C via `[stepper_z]`. Because every move drives all three motors,
+each axis endstop stops all three carriages during homing.
+
+Only parameters specific to xyz printers are described here - see
+[common kinematic settings](#common-kinematic-settings) for available
+parameters.
+
+```
+[printer]
+kinematics: xyz
+max_z_velocity:
+#   This sets the maximum velocity (in mm/s) of movement along the z
+#   axis. The default is to use max_velocity for max_z_velocity.
+max_z_accel:
+#   This sets the maximum acceleration (in mm/s^2) of movement along
+#   the z axis. The default is to use max_accel for max_z_accel.
+
+# The stepper_x section describes motor A (A = x + y + z).
+[stepper_x]
+
+# The stepper_y section describes motor B (B = x - y - z).
+[stepper_y]
+
+# The stepper_z section describes motor C (C = -x + y - z).
 [stepper_z]
 ```
 
