@@ -711,19 +711,26 @@ max_z_accel:
 
 ### XYZ (CoreXYZ) Kinematics
 
-This is a fully coupled cartesian kinematic in which all three motors
-contribute to motion along every toolhead axis. The motors (A, B, C) are
-related to the toolhead coordinates by a symmetric, invertible matrix:
+CoreXYZ is a fully coupled kinematic that uses four motors (A, B, C, D),
+each of which moves the toolhead along every axis. Z is a common-mode of
+all four belts while X and Y are differential:
 
 ```
 A =  x + y + z
-B =  x - y - z
-C = -x + y - z
+B =  x - y + z
+C = -x - y + z
+D = -x + y + z
 ```
 
-Motor A is configured via `[stepper_x]`, motor B via `[stepper_y]`, and
-motor C via `[stepper_z]`. Because every move drives all three motors,
-each axis endstop stops all three carriages during homing.
+The forward (over-determined) transform is `x = (A+B-C-D)/4`,
+`y = (A-B-C+D)/4`, `z = (A+B+C+D)/4`.
+
+Motor A is configured via `[stepper_x]`, B via `[stepper_y]`, C via
+`[stepper_z]` (these three carry the axis endstops and the per-axis
+`position_min`/`position_max` ranges), and the fourth motor D via
+`[stepper_w]` (a plain stepper with no endstop of its own). Because every
+move drives all four motors, each axis endstop stops all four carriages
+during homing.
 
 Only parameters specific to xyz printers are described here - see
 [common kinematic settings](#common-kinematic-settings) for available
@@ -739,14 +746,23 @@ max_z_accel:
 #   This sets the maximum acceleration (in mm/s^2) of movement along
 #   the z axis. The default is to use max_accel for max_z_accel.
 
-# The stepper_x section describes motor A (A = x + y + z).
+# The stepper_x section describes motor A (A = x + y + z) and carries the
+# X axis endstop and travel limits.
 [stepper_x]
 
-# The stepper_y section describes motor B (B = x - y - z).
+# The stepper_y section describes motor B (B = x - y + z) and carries the
+# Y axis endstop and travel limits.
 [stepper_y]
 
-# The stepper_z section describes motor C (C = -x + y - z).
+# The stepper_z section describes motor C (C = -x - y + z) and carries the
+# Z axis endstop and travel limits.
 [stepper_z]
+
+# The stepper_w section describes the fourth motor D (D = -x + y + z). It
+# has no endstop of its own (it is stopped by the axis endstops during
+# homing), so it only needs the stepper/driver parameters (step_pin,
+# dir_pin, enable_pin, rotation_distance, microsteps, ...).
+[stepper_w]
 ```
 
 ### ⚠️ CoreXZ Kinematics with limits for X and Y axes

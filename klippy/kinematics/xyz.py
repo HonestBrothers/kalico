@@ -1,14 +1,20 @@
-# Code for handling the kinematics of fully coupled xyz (CoreXYZ) robots
+# Code for handling the kinematics of CoreXYZ robots
 #
-# In this kinematic all three motors (A, B, C) move on all three toolhead
-# axes via a symmetric, invertible coupling matrix:
+# CoreXYZ uses four motors (A, B, C, D) that each move on all three
+# toolhead axes.  Z is a common-mode of all four belts while X and Y are
+# differential:
 #     A =  x + y + z
-#     B =  x - y - z
-#     C = -x + y - z
-# The inverse used for forward kinematics is:
-#     x =  0.5 * (A + B)
-#     y =  0.5 * (A + C)
-#     z = -0.5 * (B + C)
+#     B =  x - y + z
+#     C = -x - y + z
+#     D = -x + y + z
+# The (over-determined) forward transform is:
+#     x = (A + B - C - D) / 4
+#     y = (A - B - C + D) / 4
+#     z = (A + B + C + D) / 4
+#
+# Motor A is configured via [stepper_x], B via [stepper_y], C via
+# [stepper_z] (these three carry the axis endstops and ranges), and the
+# fourth motor D via [stepper_w] (a bare stepper without its own endstop).
 #
 # Copyright (C) 2026  Kalico contributors
 #
@@ -18,23 +24,25 @@ from klippy import stepper
 
 class XYZKinematics:
     def __init__(self, toolhead, config):
-        # Setup axis rails (indexed by toolhead axis: 0=x, 1=y, 2=z)
+        # Setup the three axis rails (motors A, B, C) plus the fourth motor
         self.rails = [
             stepper.LookupMultiRail(config.getsection("stepper_" + n))
             for n in "xyz"
         ]
-        # All three motors move on every axis, so register every stepper with
-        # every rail's endstop so homing any axis stops all carriages.
-        all_steppers = [s for rail in self.rails for s in rail.get_steppers()]
+        self.motor_d = stepper.PrinterStepper(config.getsection("stepper_w"))
+        # All four motors move on every axis, so register every stepper with
+        # every axis endstop so homing any axis stops all carriages.
+        all_steppers = self.get_steppers()
         for rail in self.rails:
             endstop = rail.get_endstops()[0][0]
             for s in all_steppers:
                 endstop.add_stepper(s)
-        # Motor A -> stepper_x, motor B -> stepper_y, motor C -> stepper_z
+        # Assign the coupled itersolve to each motor
         self.rails[0].setup_itersolve("xyz_stepper_alloc", b"a")
         self.rails[1].setup_itersolve("xyz_stepper_alloc", b"b")
         self.rails[2].setup_itersolve("xyz_stepper_alloc", b"c")
-        for s in self.get_steppers():
+        self.motor_d.setup_itersolve("xyz_stepper_alloc", b"d")
+        for s in all_steppers:
             s.set_trapq(toolhead.get_trapq())
             toolhead.register_step_generator(s.generate_steps)
         config.get_printer().register_event_handler(
@@ -55,15 +63,18 @@ class XYZKinematics:
         self.supports_dual_carriage = False
 
     def get_steppers(self):
-        return [s for rail in self.rails for s in rail.get_steppers()]
+        steppers = [s for rail in self.rails for s in rail.get_steppers()]
+        steppers.append(self.motor_d)
+        return steppers
 
     def calc_position(self, stepper_positions):
-        pos = [stepper_positions[rail.get_name()] for rail in self.rails]
-        # Inverse of the coupling matrix (A=pos[0], B=pos[1], C=pos[2])
+        a, b, c = [stepper_positions[rail.get_name()] for rail in self.rails]
+        d = stepper_positions[self.motor_d.get_name()]
+        # Forward transform (inverse of the coupling matrix)
         return [
-            0.5 * (pos[0] + pos[1]),
-            0.5 * (pos[0] + pos[2]),
-            -0.5 * (pos[1] + pos[2]),
+            0.25 * (a + b - c - d),
+            0.25 * (a - b - c + d),
+            0.25 * (a + b + c + d),
         ]
 
     def set_position(self, newpos, homing_axes):
@@ -71,6 +82,7 @@ class XYZKinematics:
             rail.set_position(newpos)
             if i in homing_axes:
                 self.limits[i] = rail.get_range()
+        self.motor_d.set_position(newpos)
 
     def note_z_not_homed(self):
         self.clear_homing_state([2])

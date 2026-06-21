@@ -1,18 +1,20 @@
-// XYZ (fully coupled CoreXYZ) kinematics stepper pulse time generation
+// CoreXYZ kinematics stepper pulse time generation
 //
 // Copyright (C) 2026  Kalico contributors
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 //
-// All three motors (A, B, C) contribute to all three toolhead axes using a
-// symmetric, invertible coupling matrix:
+// CoreXYZ uses four motors (A, B, C, D) that each move on all three
+// toolhead axes.  Z is a common-mode of all four belts while X and Y are
+// differential:
 //     A =  x + y + z
-//     B =  x - y - z
-//     C = -x + y - z
-// The inverse (used for forward kinematics in the Python module) is:
-//     x =  0.5 * (A + B)
-//     y =  0.5 * (A + C)
-//     z = -0.5 * (B + C)
+//     B =  x - y + z
+//     C = -x - y + z
+//     D = -x + y + z
+// The (over-determined) forward transform used by the Python module is:
+//     x = (A + B - C - D) / 4
+//     y = (A - B - C + D) / 4
+//     z = (A + B + C + D) / 4
 
 #include <stdlib.h> // malloc
 #include <string.h> // memset
@@ -33,7 +35,7 @@ xyz_stepper_b_calc_position(struct stepper_kinematics *sk, struct move *m
                             , double move_time)
 {
     struct coord c = move_get_coord(m, move_time);
-    return c.x - c.y - c.z;
+    return c.x - c.y + c.z;
 }
 
 static double
@@ -41,7 +43,15 @@ xyz_stepper_c_calc_position(struct stepper_kinematics *sk, struct move *m
                             , double move_time)
 {
     struct coord c = move_get_coord(m, move_time);
-    return -c.x + c.y - c.z;
+    return -c.x - c.y + c.z;
+}
+
+static double
+xyz_stepper_d_calc_position(struct stepper_kinematics *sk, struct move *m
+                            , double move_time)
+{
+    struct coord c = move_get_coord(m, move_time);
+    return -c.x + c.y + c.z;
 }
 
 struct stepper_kinematics * __visible
@@ -55,6 +65,8 @@ xyz_stepper_alloc(char type)
         sk->calc_position_cb = xyz_stepper_b_calc_position;
     else if (type == 'c')
         sk->calc_position_cb = xyz_stepper_c_calc_position;
+    else if (type == 'd')
+        sk->calc_position_cb = xyz_stepper_d_calc_position;
     sk->active_flags = AF_X | AF_Y | AF_Z;
     return sk;
 }
