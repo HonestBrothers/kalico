@@ -362,6 +362,44 @@ class PrinterExtruder:
         )
         self.last_position = move.end_pos[3]
 
+    def move_segment(self, print_time, move, accel_t, cruise_t, decel_t,
+                     start_v, cruise_v, accel, seg_dist):
+        # Jerk limiting: emit one velocity slice of `move` to the extruder
+        # trapq, scaled by the extrusion ratio and queued at the same
+        # print_time as the matching toolhead slice. The existing pressure
+        # advance model integrates the real (sliced) velocity profile; the
+        # slices' extruder displacements sum to the move's total so
+        # last_position stays consistent. seg_dist is the toolhead distance of
+        # this slice.
+        axis_r = move.axes_r[3]
+        e_accel = accel * axis_r
+        e_start_v = start_v * axis_r
+        e_cruise_v = cruise_v * axis_r
+        pressure_advance = 0.0
+        use_pa_from_trapq = 0.0
+        if self.extruder_stepper:
+            if self.extruder_stepper.per_move_pressure_advance:
+                use_pa_from_trapq = 1.0
+            if axis_r > 0.0 and (move.axes_d[0] or move.axes_d[1]):
+                pressure_advance = self.extruder_stepper.pressure_advance
+        self.trapq_append(
+            self.trapq,
+            print_time,
+            accel_t,
+            cruise_t,
+            decel_t,
+            self.last_position,
+            0.0,
+            0.0,
+            1.0,
+            pressure_advance,
+            use_pa_from_trapq,
+            e_start_v,
+            e_cruise_v,
+            e_accel,
+        )
+        self.last_position += axis_r * seg_dist
+
     def find_past_position(self, print_time):
         if self.extruder_stepper is None:
             return 0.0

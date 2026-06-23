@@ -81,12 +81,22 @@ class Move:
             return
         # Allow extruder to calculate its maximum junction
         extruder_v2 = self.toolhead.extruder.calc_junction(prev_move, self)
+        # Jerk limiting: a jerk-limited ramp needs more distance to change
+        # velocity than a constant-accel one, so the velocity reachable across
+        # the previous move is the jerk integral, not a constant delta_v2.
+        jl = getattr(self.toolhead, "jerk_limiting", None)
+        if jl is not None and jl.active_for(prev_move):
+            prev_reach_v2 = jl.reach(
+                prev_move.max_start_v2, prev_move.move_d, prev_move.accel
+            )
+        else:
+            prev_reach_v2 = prev_move.max_start_v2 + prev_move.delta_v2
         max_start_v2 = min(
             extruder_v2,
             self.max_cruise_v2,
             prev_move.max_cruise_v2,
             prev_move.next_junction_v2,
-            prev_move.max_start_v2 + prev_move.delta_v2,
+            prev_reach_v2,
         )
         # Find max velocity using "approximated centripetal velocity"
         axes_r = self.axes_r
@@ -171,9 +181,16 @@ class LookAheadQueue:
         # after the last move.
         delayed = []
         next_end_v2 = next_smoothed_v2 = peak_cruise_v2 = 0.0
+        jl = getattr(self.toolhead, "jerk_limiting", None)
         for i in range(flush_count - 1, -1, -1):
             move = queue[i]
-            reachable_start_v2 = next_end_v2 + move.delta_v2
+            mjl = jl if (jl is not None and jl.active_for(move)) else None
+            if mjl is not None:
+                reachable_start_v2 = mjl.reach(
+                    next_end_v2, move.move_d, move.accel
+                )
+            else:
+                reachable_start_v2 = next_end_v2 + move.delta_v2
             start_v2 = min(move.max_start_v2, reachable_start_v2)
             reachable_smoothed_v2 = next_smoothed_v2 + move.smooth_delta_v2
             smoothed_v2 = min(move.max_smoothed_v2, reachable_smoothed_v2)
@@ -208,6 +225,15 @@ class LookAheadQueue:
                         move.max_cruise_v2,
                         peak_cruise_v2,
                     )
+                    if mjl is not None:
+                        # The constant-accel midpoint is not the triangle peak
+                        # under a jerk limit; clamp to what is reachable from
+                        # each end across the move.
+                        cruise_v2 = min(
+                            cruise_v2,
+                            mjl.reach(start_v2, move.move_d, move.accel),
+                            mjl.reach(next_end_v2, move.move_d, move.accel),
+                        )
                     move.set_junction(
                         min(start_v2, cruise_v2),
                         cruise_v2,
@@ -226,6 +252,25 @@ class LookAheadQueue:
         del queue[:flush_count]
 
     def add_move(self, move):
+        # Jerk limiting Phase 3: round a sharp corner by replacing the previous
+        # queued move + this move with a trimmed-prev / blend / trimmed-move
+        # chain. Falls back to the stock path when no blend applies.
+        jl = getattr(self.toolhead, "jerk_limiting", None)
+        if (jl is not None and jl.corners_active() and self.queue
+                and move.is_kinematic_move
+                and self.queue[-1].is_kinematic_move):
+            chain = jl.round_corner(self.queue[-1], move)
+            if chain is not None:
+                self.queue[-1] = chain[0]
+                if len(self.queue) >= 2:
+                    self.queue[-1].calc_junction(self.queue[-2])
+                for nm in chain[1:]:
+                    self.queue.append(nm)
+                    nm.calc_junction(self.queue[-2])
+                    self.junction_flush -= nm.min_move_t
+                if self.junction_flush <= 0.0:
+                    self.flush(lazy=True)
+                return
         self.queue.append(move)
         if len(self.queue) == 1:
             return
@@ -326,6 +371,9 @@ class ToolHead:
         gcode = self.printer.lookup_object("gcode")
         self.Coord = gcode.Coord
         self.extruder = extruder.DummyExtruder(self.printer)
+        # Optional jerk-limiting policy (set by [jerk_limiting] on connect);
+        # None means stock constant-acceleration motion.
+        self.jerk_limiting = None
         kin_name = config.get("kinematics")
         try:
             mod = importlib.import_module("klippy.kinematics." + kin_name)
@@ -460,29 +508,65 @@ class ToolHead:
             self._calc_print_time()
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
-        for move in moves:
-            if move.is_kinematic_move:
-                self.trapq_append(
-                    self.trapq,
-                    next_move_time,
-                    move.accel_t,
-                    move.cruise_t,
-                    move.decel_t,
-                    move.start_pos[0],
-                    move.start_pos[1],
-                    move.start_pos[2],
-                    move.axes_r[0],
-                    move.axes_r[1],
-                    move.axes_r[2],
-                    move.start_v,
-                    move.cruise_v,
-                    move.accel,
-                )
-            if move.axes_d[3]:
-                self.extruder.move(next_move_time, move)
-            next_move_time = (
-                next_move_time + move.accel_t + move.cruise_t + move.decel_t
-            )
+        jl = self.jerk_limiting
+        seg_lists = None
+        if jl is not None and jl.retime_active():
+            seg_lists = jl.plan_moves(moves)
+        for idx, move in enumerate(moves):
+            segs = seg_lists[idx] if seg_lists is not None else None
+            move_dur = move.accel_t + move.cruise_t + move.decel_t
+            if segs is not None:
+                # Jerk limiting: emit the move as a chain of constant-accel
+                # slices, driving the toolhead and extruder trapqs in lock-step
+                # so pressure advance integrates the real (S-curve) profile.
+                t = next_move_time
+                pos = 0.0
+                extruding = bool(move.axes_d[3])
+                for (at, ct, dct, sv, cv, a, dist) in segs:
+                    self.trapq_append(
+                        self.trapq,
+                        t,
+                        at,
+                        ct,
+                        dct,
+                        move.start_pos[0] + move.axes_r[0] * pos,
+                        move.start_pos[1] + move.axes_r[1] * pos,
+                        move.start_pos[2] + move.axes_r[2] * pos,
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        sv,
+                        cv,
+                        a,
+                    )
+                    if extruding:
+                        self.extruder.move_segment(
+                            t, move, at, ct, dct, sv, cv, a, dist
+                        )
+                    t += at + ct + dct
+                    pos += dist
+                move_dur = t - next_move_time
+            else:
+                if move.is_kinematic_move:
+                    self.trapq_append(
+                        self.trapq,
+                        next_move_time,
+                        move.accel_t,
+                        move.cruise_t,
+                        move.decel_t,
+                        move.start_pos[0],
+                        move.start_pos[1],
+                        move.start_pos[2],
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        move.start_v,
+                        move.cruise_v,
+                        move.accel,
+                    )
+                if move.axes_d[3]:
+                    self.extruder.move(next_move_time, move)
+            next_move_time = next_move_time + move_dur
             for cb in move.timing_callbacks:
                 cb(next_move_time)
         # Generate steps for moves

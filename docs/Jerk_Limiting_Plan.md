@@ -1,9 +1,31 @@
 # Jerk-Limited Motion (standalone)
 
-Status: **design / plan only** (no implementation yet). This branch
-(`claude/great-pascal-auwn5x`) is cut from `main` and is **independent of the
-torque-curve / TOPP-RA work** (`topp-ra-v2`). Jerk limiting and the torque curve
-are *siblings*, not parent/child — see "Architecture" below.
+Status: **implemented, EXPERIMENTAL (unit-tested, not yet hardware-validated).**
+OFF by default; when disabled the motion pipeline is byte-for-byte stock. This
+branch (`claude/great-pascal-auwn5x`) is cut from `main` and is **independent of
+the torque-curve / TOPP-RA work** (`topp-ra-v2`). Jerk limiting and the torque
+curve are *siblings*, not parent/child — see "Architecture" below.
+
+## Implementation map
+
+- `klippy/extras/jerk_limiting.py` -- the `[jerk_limiting]` config section, the
+  pure trajectory math (`ramp_time`, `dist_jerk`, `reach_v2`, `ramp_slices`,
+  `plan_segments`, `distribute_slices`, cubic B-spline `corner_blend`), and the
+  three phase policies (`plan_moves`, `round_corner`).
+- `klippy/toolhead.py` -- gated hooks: jerk reachability in `Move.calc_junction`
+  and `LookAheadQueue.flush`; the slice emission loop in `_process_moves`; the
+  Phase 3 corner pre-pass in `LookAheadQueue.add_move`. All no-ops when the
+  `[jerk_limiting]` section is absent or `enabled: False`.
+- `klippy/kinematics/extruder.py` -- `move_segment`, per-slice extruder trapq
+  emission keeping pressure advance synced (written for `main`'s extruder ABI;
+  topp-ra's could not be cherry-picked because the ABIs differ).
+- `test/test_jerk_limiting.py` -- unit tests incl. an end-to-end check that the
+  real C trapq accepts emitted slices and yields continuous motion.
+- `config/sample-jerk-limiting.cfg` -- documented sample config.
+
+What is NOT yet validated: behavior on real hardware, and Phase 2/3 interactions
+with the full feature set (arcs, bed mesh, pressure advance) under load. Treat
+as experimental.
 
 ## Motivation
 
