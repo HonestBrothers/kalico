@@ -379,6 +379,19 @@ class JerkLimiting:
         vend = moves[j].end_v
         total_d = sum(moves[k].move_d for k in range(i, j + 1))
         A = min(moves[k].accel for k in range(i, j + 1))
+        # Clamp the run's end velocity to what is actually reachable from v0
+        # over the run length under the jerk limit. The per-move velocities come
+        # from independent symmetric-ramp reachability, so the single coalesced
+        # ramp v0 -> vend can need more distance than the moves provide. Without
+        # this clamp `covered` exceeds total_d, distribute_slices() overflows the
+        # excess into the final move (k >= len-1), and that endpoint overshoot
+        # becomes a trapq position discontinuity -> stepcompress error. This
+        # mirrors the peak_velocity() guard plan_segments() already applies to
+        # single moves.
+        reach = reach_v2(v0 * v0, total_d, A, self.max_jerk,
+                         self.toolhead.max_velocity)
+        if vend * vend > reach:
+            vend = math.sqrt(max(reach, 0.0))
         slices = ramp_slices(v0, vend, A, self.max_jerk, self.resolution)
         covered = sum(s[6] for s in slices)
         filler = total_d - covered
