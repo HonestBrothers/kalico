@@ -71,6 +71,15 @@ def reach_v2(u0, dist, A, J, vmax):
     return lo * lo
 
 
+def is_travel_move(move):
+    # A travel move is a kinematic (XYZ) move that deposits no filament. The
+    # codebase treats bool(move.axes_d[3]) as "is extruding" (see toolhead.py),
+    # so a kinematic move with zero extruder delta is a pure travel. Jerk
+    # limiting exists to keep extrusion smooth (pressure advance / stepcompress);
+    # there is nothing to smooth on a travel, and travels want full speed.
+    return move.is_kinematic_move and not move.axes_d[3]
+
+
 def _accel_profile(dv, A, J):
     # Returns (a_peak, t1, t2): jerk-ramp time t1, const-accel time t2.
     dv = abs(dv)
@@ -375,7 +384,8 @@ class JerkLimiting:
         return self.enabled and self.smooth_ramps
 
     def active_for(self, move):
-        return self.retime_active() and move.is_kinematic_move
+        return (self.retime_active() and move.is_kinematic_move
+                and not is_travel_move(move))
 
     def accel_limit(self, move, v):
         # Acceleration ceiling (mm/s^2) for `move` at speed `v`. Today this is
@@ -524,6 +534,10 @@ class JerkLimiting:
         # None to leave the corner unchanged. Extrusion is distributed by length
         # so total filament is conserved and endpoints are preserved.
         if not (move.is_kinematic_move and prev.is_kinematic_move):
+            return None
+        if is_travel_move(move) or is_travel_move(prev):
+            # Don't reshape a corner that involves a travel leg; jerk limiting is
+            # only applied to extruding motion.
             return None
         Move = type(move)
         cos_t = sum(prev.axes_r[k] * move.axes_r[k] for k in range(3))
