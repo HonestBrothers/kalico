@@ -255,6 +255,61 @@ def max_deviation(points, a, vertex, b):
     return worst
 
 
+def _unit(p, q):
+    d = [q[i] - p[i] for i in range(3)]
+    n = math.sqrt(sum(x * x for x in d))
+    if n <= 1e-12:
+        return None
+    return [x / n for x in d]
+
+
+def _decimate(pts, max_dev, min_len):
+    # Adaptive (Douglas-Peucker) resampling of a dense blend curve: keep only
+    # the vertices needed to stay within max_dev of the dense curve -- i.e.
+    # refine where discrete curvature is high -- then enforce a hard minimum
+    # segment length so no sub-step micro-moves are emitted. Replaces fixed
+    # uniform subdivision, which over-samples shallow corners ~10-20x and is
+    # what produced the un-rampable, pressure-advance-spiking micro-segments.
+    n = len(pts)
+    if n <= 2:
+        return list(pts)
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        worst, wk = -1.0, -1
+        for k in range(i + 1, j):
+            d = _seg_dist(pts[k], pts[i], pts[j])
+            if d > worst:
+                worst, wk = d, k
+        if worst > max_dev:
+            keep[wk] = True
+            stack.append((i, wk))
+            stack.append((wk, j))
+    kept = [pts[k] for k in range(n) if keep[k]]
+    # Min-length floor: drop interior vertices closer than min_len to the last
+    # emitted one (endpoints always kept). Very sharp corners may then exceed
+    # max_dev slightly -- a deliberate trade vs. emitting micro-segments; the
+    # trim shrink in round_corner already bounds the curve's own deviation.
+    out = [kept[0]]
+    for k in range(1, len(kept) - 1):
+        dx = [out[-1][d] - kept[k][d] for d in range(3)]
+        if math.sqrt(sum(x * x for x in dx)) >= min_len:
+            out.append(kept[k])
+    out.append(kept[-1])
+    return out
+
+
+def corner_blend_adaptive(a, vertex, b, max_dev, min_len, rounds=3):
+    # Same limit curve as corner_blend, but sampled with only as many points as
+    # the turn needs (point count scales with turn angle, not a fixed depth).
+    dense = [tuple(a)] + corner_blend(a, vertex, b, rounds) + [tuple(b)]
+    return _decimate(dense, max_dev, min_len)[1:-1]
+
+
 # ---------------------------------------------------------------------------
 # Klipper integration
 # ---------------------------------------------------------------------------
@@ -277,6 +332,20 @@ class JerkLimiting:
         )
         self.corner_blend_ratio = config.getfloat(
             "corner_blend_ratio", 0.25, above=0.0, maxval=0.5
+        )
+        # Adaptive blend: hard floor on emitted blend segment length so the
+        # corner is never sampled into sub-step micro-moves.
+        self.corner_min_seg_len = config.getfloat(
+            "corner_min_seg_len", 0.1, above=0.0
+        )
+        # Per-corner jerk allowance (mm/s^3). A sub-mm blend segment cannot ramp
+        # a velocity change at max_jerk, so any residual decel/accel left in the
+        # blend (after the velocity cap pushes the bulk into the straight legs)
+        # would fall back to constant max-accel and, through pressure advance,
+        # spike the extruder. Permitting higher jerk on blend moves lets that
+        # residual ramp at near-minimum accel instead. 0 -> use max_jerk.
+        self.corner_max_jerk = config.getfloat(
+            "corner_max_jerk", 0.0, minval=0.0
         )
         self.toolhead = None
         self.printer.register_event_handler(
@@ -308,6 +377,24 @@ class JerkLimiting:
     def active_for(self, move):
         return self.retime_active() and move.is_kinematic_move
 
+    def accel_limit(self, move, v):
+        # Acceleration ceiling (mm/s^2) for `move` at speed `v`. Today this is
+        # the move's static accel. This is the single seam where a torque-curve
+        # a_max(v) drops in unchanged for all the jerk/corner logic: the planned
+        # accel ceiling becomes a function of speed (the TOPP-RA motion work,
+        # branch topp-ra-v2) without touching any caller. NB: this is the
+        # *motion* torque curve (a_max vs. speed), unrelated to any TMC stepper
+        # driver register feature.
+        return move.accel
+
+    def _jerk_for(self, move):
+        # Blend (corner) moves get a higher jerk allowance so the small residual
+        # velocity change left after the velocity cap can ramp instead of
+        # falling back to constant max-accel. See corner_max_jerk.
+        if self.corner_max_jerk and getattr(move, "_jl_blend", False):
+            return self.corner_max_jerk
+        return self.max_jerk
+
     def reach(self, u0, dist, accel):
         return reach_v2(u0, dist, accel, self.max_jerk,
                         self.toolhead.max_velocity)
@@ -317,7 +404,8 @@ class JerkLimiting:
             return None
         return plan_segments(
             move.start_v, move.cruise_v, move.end_v, move.move_d,
-            move.accel, self.max_jerk, self.resolution,
+            self.accel_limit(move, move.cruise_v), self._jerk_for(move),
+            self.resolution,
         )
 
     def plan_moves(self, moves):
@@ -405,6 +493,30 @@ class JerkLimiting:
     def corners_active(self):
         return self.enabled and self.round_corners
 
+    def _corner_cruise_v2(self, pts, accel):
+        # Slowest centripetal-limited speed^2 across the discrete blend a..b,
+        # via Klipper's junction-deviation model. Capping the blend moves to
+        # this pushes the bulk decel/accel into the straight legs (which are
+        # long enough to jerk-ramp it) instead of the sub-mm blend segments,
+        # so the corner is traversed at ~constant speed. None -> no limit.
+        jd = self.toolhead.junction_deviation
+        best = None
+        for i in range(1, len(pts) - 1):
+            d0 = _unit(pts[i - 1], pts[i])
+            d1 = _unit(pts[i], pts[i + 1])
+            if d0 is None or d1 is None:
+                continue
+            jcos = -(d0[0] * d1[0] + d0[1] * d1[1] + d0[2] * d1[2])
+            jcos = max(jcos, -0.999999)
+            sin_d2 = math.sqrt(0.5 * (1.0 - jcos))
+            if sin_d2 >= 1.0 - 1e-9:
+                continue  # essentially straight at this vertex
+            R = sin_d2 / (1.0 - sin_d2)
+            v2 = accel * jd * R
+            if best is None or v2 < best:
+                best = v2
+        return best
+
     def round_corner(self, prev, move):
         # Phase 3: replace the sharp corner prev->move with a curvature-
         # continuous cubic B-spline blend inside corner_max_deviation. Returns a
@@ -437,6 +549,17 @@ class JerkLimiting:
             trim *= self.corner_max_deviation / dev * 0.95
         else:
             return None
+        # Emit the blend adaptively: the trim shrink above used the dense curve
+        # to choose how far to round; here we sample only as many points as the
+        # turn needs and never below corner_min_seg_len.
+        blend = corner_blend_adaptive(
+            a, vtx, b, self.corner_max_deviation, self.corner_min_seg_len
+        )
+        # Centripetal speed cap for the curved interior, so the straight legs
+        # absorb the velocity change rather than the tiny blend segments.
+        corner_v2 = self._corner_cruise_v2(
+            [a] + list(blend) + [b], min(prev.accel, move.accel)
+        )
         # Build the chain of points (x,y,z) and per-point cumulative extrusion.
         pa = prev.start_pos
         pb_end = move.end_pos
@@ -481,6 +604,13 @@ class JerkLimiting:
             end = (pts[s + 1][0], pts[s + 1][1], pts[s + 1][2], e_abs)
             spd = prev_speed if s == 0 else move_speed
             nm = Move(th, start, end, spd)
+            # Interior (curved) blend segments: tag them so they get the corner
+            # jerk allowance, and cap them to the centripetal corner speed so
+            # the velocity change stays in the straight legs.
+            if 0 < s < len(seg_len) - 1:
+                nm._jl_blend = True
+                if corner_v2 is not None and corner_v2 < nm.max_cruise_v2:
+                    nm.limit_speed(math.sqrt(corner_v2), nm.accel)
             new_moves.append(nm)
         if len(new_moves) < 2:
             return None
@@ -494,6 +624,8 @@ class JerkLimiting:
             "round_corners": self.round_corners,
             "max_jerk": self.max_jerk,
             "corner_max_deviation": self.corner_max_deviation,
+            "corner_min_seg_len": self.corner_min_seg_len,
+            "corner_max_jerk": self.corner_max_jerk,
         }
 
     cmd_SET_JERK_LIMIT_help = "Enable/disable jerk limiting and set parameters"
@@ -515,6 +647,12 @@ class JerkLimiting:
         dev = gcmd.get_float("CORNER_MAX_DEVIATION", None, above=0.0)
         if dev is not None:
             self.corner_max_deviation = dev
+        cmj = gcmd.get_float("CORNER_MAX_JERK", None, minval=0.0)
+        if cmj is not None:
+            self.corner_max_jerk = cmj
+        msl = gcmd.get_float("CORNER_MIN_SEG_LEN", None, above=0.0)
+        if msl is not None:
+            self.corner_min_seg_len = msl
         self.cmd_JERK_LIMIT_STATUS(gcmd)
 
     cmd_JERK_LIMIT_STATUS_help = "Report jerk limiting configuration"
@@ -522,9 +660,11 @@ class JerkLimiting:
     def cmd_JERK_LIMIT_STATUS(self, gcmd):
         gcmd.respond_info(
             "jerk_limiting: enabled=%s smooth_ramps=%s blend_junctions=%s "
-            "round_corners=%s max_jerk=%.0f corner_max_deviation=%.3f"
+            "round_corners=%s max_jerk=%.0f corner_max_deviation=%.3f "
+            "corner_max_jerk=%.0f corner_min_seg_len=%.3f"
             % (self.enabled, self.smooth_ramps, self.blend_junctions,
-               self.round_corners, self.max_jerk, self.corner_max_deviation)
+               self.round_corners, self.max_jerk, self.corner_max_deviation,
+               self.corner_max_jerk, self.corner_min_seg_len)
         )
 
 

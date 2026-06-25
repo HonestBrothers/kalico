@@ -261,6 +261,19 @@ class LookAheadQueue:
                 and self.queue[-1].is_kinematic_move):
             chain = jl.round_corner(self.queue[-1], move)
             if chain is not None:
+                # These corner moves are synthesized here and never pass
+                # through ToolHead.move(), so apply the same kinematic and
+                # extruder limit checks every queued move normally gets.
+                # Without this they keep the global max_accel and unbounded
+                # extrusion; pressure advance then turns the corner into an
+                # extruder step-rate spike that overflows stepcompress.
+                kin = self.toolhead.kin
+                extruder = self.toolhead.extruder
+                for nm in chain:
+                    if nm.is_kinematic_move:
+                        kin.check_move(nm)
+                    if nm.axes_d[3]:
+                        extruder.check_move(nm)
                 self.queue[-1] = chain[0]
                 if len(self.queue) >= 2:
                     self.queue[-1].calc_junction(self.queue[-2])

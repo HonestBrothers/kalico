@@ -119,6 +119,7 @@ def test_split_slice_conserves():
 
 class _MockTH:
     max_velocity = 400.0
+    junction_deviation = 0.05
 
 
 class _MockMove:
@@ -141,6 +142,12 @@ class _MockMove:
         self.max_cruise_v2 = vel * vel
         self.start_v = self.cruise_v = self.end_v = vel
 
+    def limit_speed(self, speed, accel):
+        speed2 = speed * speed
+        if speed2 < self.max_cruise_v2:
+            self.max_cruise_v2 = speed2
+        self.accel = min(self.accel, accel)
+
 
 def _mk_jl():
     obj = jl.JerkLimiting.__new__(jl.JerkLimiting)
@@ -153,6 +160,8 @@ def _mk_jl():
     obj.corner_max_deviation = 0.05
     obj.corner_min_angle = 5.0
     obj.corner_blend_ratio = 0.25
+    obj.corner_min_seg_len = 0.1
+    obj.corner_max_jerk = 0.0
     obj.toolhead = _MockTH()
     return obj
 
@@ -264,6 +273,51 @@ def test_phase3_skips_gentle_corner():
     assert obj.round_corner(prev, mv) is None
 
 
+def test_phase3_adaptive_blend_is_compact_and_floored():
+    # Adaptive sampling must emit far fewer segments than fixed uniform
+    # subdivision (~25), and never below corner_min_seg_len.
+    th = _MockTH()
+    obj = _mk_jl()
+    prev = _MockMove(th, (0, 0, 0, 0), (40, 0, 0, 2.0), 200)
+    mv = _MockMove(th, (40, 0, 0, 2.0), (40, 40, 0, 4.0), 200)  # 90 deg
+    chain = obj.round_corner(prev, mv)
+    assert 3 <= len(chain) <= 8
+    interior = [c for c in chain if getattr(c, "_jl_blend", False)]
+    assert interior  # the curved part is tagged
+    assert all(c.move_d >= obj.corner_min_seg_len - 1e-9 for c in interior)
+
+
+def test_phase3_blend_velocity_capped_below_legs():
+    # Interior blend moves are capped to the centripetal corner speed so the
+    # velocity change happens in the straight legs, not the sub-mm blend.
+    th = _MockTH()
+    obj = _mk_jl()
+    prev = _MockMove(th, (0, 0, 0, 0), (40, 0, 0, 2.0), 400)
+    mv = _MockMove(th, (40, 0, 0, 2.0), (40, 40, 0, 4.0), 400)  # 90 deg
+    chain = obj.round_corner(prev, mv)
+    legs = [c for c in chain if not getattr(c, "_jl_blend", False)]
+    interior = [c for c in chain if getattr(c, "_jl_blend", False)]
+    assert max(c.max_cruise_v2 for c in interior) < min(
+        c.max_cruise_v2 for c in legs
+    )
+
+
+def test_accel_limit_seam_and_corner_jerk_allowance():
+    th = _MockTH()
+    obj = _mk_jl()
+    mv = _MockMove(th, (0, 0, 0, 0), (40, 0, 0, 2.0), 200)
+    # Seam returns the move's static accel today (drop-in for a_max(v) later).
+    assert obj.accel_limit(mv, 123.0) == mv.accel
+    # corner_max_jerk only applies to tagged blend moves.
+    obj.corner_max_jerk = 5.0e6
+    blend = _MockMove(th, (0, 0, 0, 0), (1, 0, 0, 0.05), 200)
+    blend._jl_blend = True
+    assert obj._jerk_for(blend) == 5.0e6
+    assert obj._jerk_for(mv) == obj.max_jerk
+    obj.corner_max_jerk = 0.0  # 0 -> fall back to max_jerk even for blend
+    assert obj._jerk_for(blend) == obj.max_jerk
+
+
 def test_config_section_parses(
     config_root: typing.Annotated[pathlib.Path, "test_configs/jerk_limiting"],
 ):
@@ -278,6 +332,8 @@ def test_config_section_parses(
         assert abs(sec.getfloat("resolution") - 0.0015) < 1e-12
         assert abs(sec.getfloat("corner_max_deviation") - 0.08) < 1e-12
         assert abs(sec.getfloat("corner_blend_ratio") - 0.3) < 1e-12
+        assert abs(sec.getfloat("corner_min_seg_len") - 0.15) < 1e-12
+        assert abs(sec.getfloat("corner_max_jerk") - 4000000.0) < 1e-6
 
 
 def test_c_trapq_accepts_jerk_slices():

@@ -186,6 +186,43 @@ takes `axes_r` per call, so this is bounded but real. Arc-length
 re-parameterization and re-timing over variable curvature is the genuine
 complexity of Phase 3.
 
+### The corner stepcompress failure and its fix
+
+Synthesized blend moves are created in `LookAheadQueue.add_move`, *after*
+`ToolHead.move()`'s limit checks, and a sub-millimeter blend segment is far too
+short for the jerk slicer to fit a ramp (a 10 mm/s change needs ~2.1 mm at
+`max_jerk=1e5`). So early Phase 3 emitted the corner as **constant full-accel**
+trapezoids that also bypassed `kin.check_move`/`extruder.check_move`. Pressure
+advance differentiates that `0 -> a_max` accel step into a ~400 mm/s extruder
+velocity spike (~280k steps/s) -> `Internal error in MCU 'mcu' stepcompress`.
+x/y survives (fewer steps/mm, no PA); the extruder is the victim.
+
+The fix is three cooperating parts, none sufficient alone:
+
+1. **Limit-check the chain** -- run each synthesized move through
+   `kin`/`extruder` `check_move` in `add_move` (restores the invariant). Not
+   enough on its own: with `scale_xy_accel` a 45-degree blend keeps ~full accel.
+2. **Adaptive blend** (`corner_blend_adaptive` / `_decimate`) -- replace fixed
+   uniform subdivision (always ~23 segments) with deviation-adaptive sampling
+   plus a `corner_min_seg_len` floor. Count scales with turn angle (1-2 typical),
+   and sub-step micro-segments are gone.
+3. **Constant-velocity corner + jerk allowance** -- cap the curved interior to
+   its centripetal cruise speed (`_corner_cruise_v2`) so the velocity change
+   happens in the straight legs (which *can* jerk-ramp it), and give the blend a
+   higher `corner_max_jerk` so any small residual ramps at near-minimum accel
+   instead of falling back to `a_max`.
+
+### The `accel_limit(move, v)` seam
+
+All corner/jerk acceleration ceilings go through `JerkLimiting.accel_limit(move,
+v)`, which returns `move.accel` today. This is the single drop-in point for a
+torque-curve `a_max(v)` (the TOPP-RA motion work on `topp-ra-v2`): the planned
+ceiling becomes speed-dependent without touching the corner/velocity-cap/jerk
+logic. Standalone, the static ceiling is a safe (conservative) bound; the
+seam matters most for high-speed corners, where deliverable torque drops with
+speed. (This is the *motion* torque curve, unrelated to the TMC driver
+`torque_curve` registers in `tmc5160.py`/`tmc2240.py`.)
+
 ## Sequencing
 
 - **Establish the shared core on `main`** (cherry-pick from topp-ra-v2).
