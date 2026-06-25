@@ -93,6 +93,57 @@ class TorqueCurveCalibrate:
         """Home the test axis."""
         self.gcode.run_script_from_command("G28 %s" % self.test_axis.upper())
 
+    def _supports_kinematic_limits(self):
+        """True for kinematics exposing per-axis caps (Kalico limited_*)."""
+        return (
+            hasattr(self.kin, "max_accels")
+            and hasattr(self.kin, "max_velocities")
+            and hasattr(self.kin, "scale_per_axis")
+        )
+
+    def _save_kinematic_limits(self):
+        """Snapshot per-axis kinematic limits so they can be restored.
+
+        limited_cartesian (and friends) enforce per-axis accel/velocity caps,
+        and with scale_xy_accel the commanded accel is rescaled. The sweep
+        drives accel via SET_VELOCITY_LIMIT and needs commanded == actual, so
+        we widen the caps and disable scaling for the run, then put them back.
+        """
+        if not self._supports_kinematic_limits():
+            return None
+        return {
+            "max_accels": list(self.kin.max_accels),
+            "max_velocities": list(self.kin.max_velocities),
+            "scale_per_axis": self.kin.scale_per_axis,
+        }
+
+    def _apply_kinematic_limits(self, gcmd):
+        """Open up per-axis caps to cover the sweep and turn off scaling."""
+        if not self._supports_kinematic_limits():
+            return
+        self.gcode.run_script_from_command(
+            "SET_KINEMATICS_LIMIT X_ACCEL=%.1f Y_ACCEL=%.1f"
+            " X_VELOCITY=%.1f Y_VELOCITY=%.1f SCALE=0"
+            % (self.accel_max, self.accel_max, self.speed_end, self.speed_end)
+        )
+        gcmd.respond_info(
+            "Kinematic limits raised to ACCEL=%.0f VELOCITY=%.0f (SCALE off) "
+            "for calibration" % (self.accel_max, self.speed_end)
+        )
+
+    def _restore_kinematic_limits(self, saved, gcmd):
+        """Restore the snapshot taken by _save_kinematic_limits."""
+        if not saved:
+            return
+        xa, ya, za = saved["max_accels"]
+        xv, yv, zv = saved["max_velocities"]
+        self.gcode.run_script_from_command(
+            "SET_KINEMATICS_LIMIT X_ACCEL=%.1f Y_ACCEL=%.1f Z_ACCEL=%.1f"
+            " X_VELOCITY=%.1f Y_VELOCITY=%.1f Z_VELOCITY=%.1f SCALE=%d"
+            % (xa, ya, za, xv, yv, zv, 1 if saved["scale_per_axis"] else 0)
+        )
+        gcmd.respond_info("Kinematic limits restored")
+
     def _get_current_position(self):
         """Get current position on test axis."""
         axis_idx = self._get_axis_index()
@@ -222,8 +273,13 @@ class TorqueCurveCalibrate:
         toolhead_info = self.toolhead.get_status(systime)
         orig_max_accel = toolhead_info["max_accel"]
         orig_max_velocity = toolhead_info["max_velocity"]
+        saved_kin_limits = self._save_kinematic_limits()
 
         try:
+            # Widen per-axis kinematic caps so the commanded accel is the accel
+            # the motor actually sees (see _save_kinematic_limits).
+            self._apply_kinematic_limits(gcmd)
+
             # Initial home
             gcmd.respond_info("Homing %s axis..." % self.test_axis.upper())
             self._home_axis()
@@ -332,6 +388,7 @@ class TorqueCurveCalibrate:
                 "SET_VELOCITY_LIMIT ACCEL=%.1f VELOCITY=%.1f"
                 % (orig_max_accel, orig_max_velocity)
             )
+            self._restore_kinematic_limits(saved_kin_limits, gcmd)
             self.calibration_running = False
 
         # Filter out failed results (accel = 0)
