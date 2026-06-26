@@ -39,6 +39,12 @@ class TorqueCurveCalibrate:
             "position_tolerance", 0.1, above=0.0
         )
 
+        # Number of back-and-forth passes per (speed, accel) test. A single
+        # move barely loads the motor; repeated rapid reversals keep the coils
+        # loaded and stack up per-reversal peak-torque demands, which is what
+        # actually provokes skipping (cf. the TEST_SPEED macro's pattern).
+        self.test_cycles = config.getint("test_cycles", 5, minval=1)
+
         # Output file for calibration results
         self.output_file = config.get("output_file", "torque_curve.csv")
 
@@ -207,50 +213,35 @@ class TorqueCurveCalibrate:
         return accel_dist * 2  # Need to accelerate and decelerate
 
     def _perform_test_move(self, start_pos, end_pos, speed, accel):
-        """
-        Perform a test move at given speed and acceleration.
-        Returns True if move completed without issues.
-        """
-        # Set acceleration
-        self.gcode.run_script_from_command(
-            "SET_VELOCITY_LIMIT ACCEL=%.1f VELOCITY=%.1f" % (accel, speed)
-        )
+        """Stress the axis at a given speed/accel with test_cycles rapid
+        back-and-forth passes. Lost-step detection is done by the caller via
+        _home_and_measure / _check_for_lost_steps, so nothing is returned."""
+        axis_idx = self._get_axis_index()
 
-        # Get initial stepper position
-        initial_stepper_pos = self._get_stepper_position()
-
-        # Move to start position at safe speed/accel
+        # Move to start position at a safe speed/accel
         self.gcode.run_script_from_command(
             "SET_VELOCITY_LIMIT ACCEL=1000 VELOCITY=100"
         )
-        axis_idx = self._get_axis_index()
         pos = list(self.toolhead.get_position())
         pos[axis_idx] = start_pos
         self.toolhead.move(pos, 100)
         self.toolhead.wait_moves()
 
-        # Set test acceleration
+        # Set the test acceleration/speed, then slam the axis back and forth
+        # test_cycles times. The passes are queued with NO wait_moves between
+        # them, so they pipeline into a continuous zigzag that keeps the coils
+        # loaded; with SCV=0 each 180-degree reversal still brings the axis to
+        # a stop and re-accelerates at full accel. A single wait_moves at the
+        # end lets the whole burst complete before the lost-step check.
         self.gcode.run_script_from_command(
             "SET_VELOCITY_LIMIT ACCEL=%.1f VELOCITY=%.1f" % (accel, speed)
         )
-
-        # Record position before test
-        pre_test_stepper_pos = self._get_stepper_position()
-
-        # Perform test move
-        pos[axis_idx] = end_pos
-        self.toolhead.move(pos, speed)
+        for _ in range(self.test_cycles):
+            pos[axis_idx] = end_pos
+            self.toolhead.move(pos, speed)
+            pos[axis_idx] = start_pos
+            self.toolhead.move(pos, speed)
         self.toolhead.wait_moves()
-
-        # Move back
-        pos[axis_idx] = start_pos
-        self.toolhead.move(pos, speed)
-        self.toolhead.wait_moves()
-
-        # Record position after test
-        post_test_stepper_pos = self._get_stepper_position()
-
-        return pre_test_stepper_pos, post_test_stepper_pos
 
     def _step_dist(self):
         """Step distance (mm) of the test axis stepper."""
@@ -544,6 +535,9 @@ class TorqueCurveCalibrate:
         )
         self.accel_step = gcmd.get_float(
             "ACCEL_STEP", self.accel_step, above=0.0
+        )
+        self.test_cycles = gcmd.get_int(
+            "TEST_CYCLES", self.test_cycles, minval=1
         )
         self.output_file = gcmd.get("OUTPUT_FILE", self.output_file)
 
