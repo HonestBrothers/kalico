@@ -301,6 +301,10 @@ class TorqueCurveCalibrate:
 
         gcmd.respond_info("Starting torque curve calibration on %s axis"
                          % self.test_axis.upper())
+        gcmd.respond_info(
+            "To STOP mid-run press EMERGENCY STOP (M112) -- it is the only "
+            "command Klipper runs while a test is in progress."
+        )
 
         # Save original settings
         systime = self.printer.get_reactor().monotonic()
@@ -366,36 +370,19 @@ class TorqueCurveCalibrate:
                     )
                     continue
 
-                # Binary search for maximum acceleration
-                accel_low = start_accel
-                accel_high = self.accel_max
-                last_good_accel = accel_low
-                test_count = 0
-
-                # First, verify the starting acceleration works
-                ref_home = self._home_and_measure()
-                self._perform_test_move(start_pos, end_pos, test_speed, accel_low)
-                lost, diff = self._check_for_lost_steps(ref_home)
-
-                if lost:
-                    gcmd.respond_info(
-                        "  FAILED at starting accel %.0f (lost %.3f mm)"
-                        % (accel_low, diff)
-                    )
-                    # Can't even do the minimum, record as failed
-                    self.calibration_results.append((test_speed, 0))
-                    continue
-
-                last_good_accel = accel_low
-                gcmd.respond_info("  Accel %.0f: OK" % accel_low)
-
-                # Binary search for maximum working acceleration
-                while accel_high - accel_low > self.accel_step:
+                # Linear ramp-up search (gentle). Step the acceleration up from
+                # start_accel by accel_step until the first skip. This never
+                # commands more than one accel_step above a known-good value, so
+                # a skip overshoots the motor's real limit by at most one step.
+                # A binary search converges faster but its first probe jumps to
+                # the midpoint of [start_accel, accel_max] -- e.g. ~50000 when
+                # accel_max is 100000 -- which can be far above the real limit
+                # and crash the axis hard. Trade time for safety here.
+                last_good_accel = 0
+                test_accel = start_accel
+                while test_accel <= self.accel_max:
                     if not self.calibration_running:
                         break
-
-                    test_accel = (accel_low + accel_high) / 2
-                    test_count += 1
 
                     ref_home = self._home_and_measure()
                     self._perform_test_move(
@@ -405,16 +392,16 @@ class TorqueCurveCalibrate:
 
                     if lost:
                         gcmd.respond_info(
-                            "  Accel %.0f: FAILED (lost %.3f mm)"
+                            "  Accel %.0f: FAILED (lost %.3f mm) -> limit found"
                             % (test_accel, diff)
                         )
-                        accel_high = test_accel
-                    else:
-                        gcmd.respond_info("  Accel %.0f: OK" % test_accel)
-                        accel_low = test_accel
-                        last_good_accel = test_accel
+                        break
 
-                # Record result
+                    gcmd.respond_info("  Accel %.0f: OK" % test_accel)
+                    last_good_accel = test_accel
+                    test_accel += self.accel_step
+
+                # Record result (0 means it skipped at the very first accel)
                 self.calibration_results.append((test_speed, last_good_accel))
                 gcmd.respond_info(
                     "  Result: %.0f mm/s -> max accel %.0f mm/s^2"
@@ -552,13 +539,22 @@ class TorqueCurveCalibrate:
 
         self._run_calibration(gcmd)
 
-    cmd_TORQUE_CURVE_CALIBRATE_ABORT_help = "Abort running calibration"
+    cmd_TORQUE_CURVE_CALIBRATE_ABORT_help = (
+        "Cannot interrupt a running test -- use M112 / Emergency Stop"
+    )
     def cmd_TORQUE_CURVE_CALIBRATE_ABORT(self, gcmd):
-        if not self.calibration_running:
-            gcmd.respond_info("No calibration in progress")
-            return
+        # Klipper processes g-code serially: a running calibration holds the
+        # dispatcher for its whole duration, so this command sits in the queue
+        # until the test finishes (by which point calibration_running is
+        # already False). Only M112 is handled out-of-order. So this can never
+        # interrupt a running test -- direct the user to the one thing that
+        # can. Flag is still cleared in case it is sent between speeds.
         self.calibration_running = False
-        gcmd.respond_info("Calibration abort requested")
+        gcmd.respond_info(
+            "TORQUE_CURVE_CALIBRATE_ABORT cannot interrupt a running test "
+            "(g-code is serialized behind it). Press EMERGENCY STOP (M112) "
+            "to halt the machine immediately."
+        )
 
 
 def load_config_prefix(config):
