@@ -19,19 +19,79 @@ class TorqueCurveCalibrate:
         if self.test_axis not in ("x", "y"):
             raise config.error("axis must be 'x' or 'y'")
 
-        # Speed range to test (mm/s)
+        # Speed range to test (mm/s). speed_end is optional: when omitted, the
+        # sweep runs up to the theoretical back-EMF top speed (see below); when
+        # given, it is still capped at that ceiling.
         self.speed_start = config.getfloat("speed_start", 50.0, above=0.0)
-        self.speed_end = config.getfloat("speed_end", 300.0, above=0.0)
+        self.speed_end = config.getfloat("speed_end", None, above=0.0)
         self.speed_step = config.getfloat("speed_step", 25.0, above=0.0)
 
-        # Acceleration range to test (mm/s^2)
+        # --- Theoretical top-speed model (optional) --------------------------
+        # A stepper is a fixed-voltage device: past the speed where its back-EMF
+        # equals the supply voltage there is no headroom left to drive current,
+        # so torque -> 0 and the carriage physically cannot go faster. That is a
+        # hard kinematic ceiling, so we cap speed_end at it (or, if speed_end is
+        # unset, sweep right up to it). Needs the supply voltage -- which is NOT
+        # in printer.cfg and cannot be read from a TMC2209 (no voltage
+        # telemetry) -- plus the motor's back-EMF constant Ke, given directly or
+        # derived from datasheet holding torque / rated current.
+        self.supply_voltage = config.getfloat(
+            "supply_voltage", 0.0, minval=0.0
+        )
+        # Ke in V/(rad/s). If 0, derived from holding_torque / rated_current.
+        self.motor_back_emf = config.getfloat(
+            "motor_back_emf", 0.0, minval=0.0
+        )
+        self.motor_holding_torque = config.getfloat(
+            "motor_holding_torque", 0.0, minval=0.0
+        )  # N*m (e.g. 0.59 for a 17HS19-2004S1)
+        self.motor_rated_current = config.getfloat(
+            "motor_rated_current", 0.0, minval=0.0
+        )  # A peak, from the datasheet -- NOT run_current
+
+        # --- Peak-velocity dwell (current-saturation hold) -------------------
+        # Phase current settles with the winding time constant tau = L/R; a
+        # pure-triangle apex is shorter than tau, so the motor is judged before
+        # current (hence true torque at speed) has saturated. Each test move
+        # therefore holds at peak velocity for ~SETTLE_TAUS*tau (+ margin) of
+        # cruise. Both the inductance and DC phase resistance must be given (from
+        # the datasheet); without both, the dwell is disabled (pure triangles).
+        self.motor_inductance = config.getfloat(
+            "motor_inductance", 0.0, minval=0.0
+        )  # henries (e.g. 0.0028 for a 17HS19-2004S1)
+        self.motor_resistance = config.getfloat(
+            "motor_resistance", 0.0, minval=0.0
+        )  # ohms, DC phase resistance (e.g. 1.1 for a 17HS19-2004S1)
+        # Extra margin added to the computed dwell (0.2 = +20%).
+        self.dwell_margin = config.getfloat("dwell_margin", 0.2, minval=0.0)
+
+        # Acceleration range to test (mm/s^2). The search climbs geometrically
+        # (x accel_growth) from accel_start up to accel_max; accel_step is the
+        # final resolution -- the search stops once the known-good/known-skip
+        # bracket is narrower than this -- not a linear increment.
         self.accel_start = config.getfloat("accel_start", 1000.0, above=0.0)
         self.accel_max = config.getfloat("accel_max", 50000.0, above=0.0)
         self.accel_step = config.getfloat("accel_step", 1000.0, above=0.0)
 
-        # Move distance for testing (mm)
+        # Multiplicative step for the exponential-from-below search. Each
+        # overshoot (skip) halves this ratio toward 1, so the climb refines onto
+        # the real limit. 2.0 = double each step until the first skip.
+        self.accel_growth = config.getfloat("accel_growth", 1.5, above=1.0)
+
+        # Move distance for testing (mm). This caps the *largest* triangular
+        # move (the low-accel end); each probe's actual distance is sized to
+        # v^2/a so the profile is a pure accel/decel triangle with no cruise.
         self.test_move_distance = config.getfloat(
             "test_move_distance", 50.0, above=10.0
+        )
+
+        # Floor for the triangular (no-cruise) move distance. v^2/a shrinks to
+        # microns at low speed + very high accel; too short a move is dominated
+        # by transients and step quantization rather than torque, so clamp up to
+        # this. The clamp reintroduces a little cruise, but only in the regime
+        # where the motor has ample torque headroom anyway.
+        self.min_move_distance = config.getfloat(
+            "min_move_distance", 2.0, above=0.0
         )
 
         # Position tolerance for detecting lost steps (in mm)
@@ -39,11 +99,13 @@ class TorqueCurveCalibrate:
             "position_tolerance", 0.1, above=0.0
         )
 
-        # Number of back-and-forth passes per (speed, accel) test. A single
-        # move barely loads the motor; repeated rapid reversals keep the coils
-        # loaded and stack up per-reversal peak-torque demands, which is what
-        # actually provokes skipping (cf. the TEST_SPEED macro's pattern).
-        self.test_cycles = config.getint("test_cycles", 5, minval=1)
+        # Number of back-and-forth passes per (speed, accel) test. Each pass is
+        # a hard apex slam; many passes accumulate winding heat (R rises ->
+        # torque sags) and stack up mechanical/resonance stress. The peak dwell
+        # (above) handles per-pass current saturation; pass count handles the
+        # cumulative thermal/mechanical side. Homing dominates per-probe cost,
+        # so a generous count is nearly free.
+        self.test_cycles = config.getint("test_cycles", 10, minval=1)
 
         # Output file for calibration results
         self.output_file = config.get("output_file", "torque_curve.csv")
@@ -212,11 +274,33 @@ class TorqueCurveCalibrate:
         accel_dist = (speed ** 2) / (2 * accel)
         return accel_dist * 2  # Need to accelerate and decelerate
 
-    def _perform_test_move(self, start_pos, end_pos, speed, accel):
-        """Stress the axis at a given speed/accel with test_cycles rapid
-        back-and-forth passes. Lost-step detection is done by the caller via
-        _home_and_measure / _check_for_lost_steps, so nothing is returned."""
+    def _perform_test_move(self, center, max_half, speed, accel, dwell_time):
+        """Stress the axis at (speed, accel) with test_cycles passes,
+        centered on `center`.
+
+        Each pass is a triangle sized to v^2/a (accelerate to exactly `speed`
+        at the midpoint, then decelerate) plus a minimum cruise segment of
+        `dwell_time` seconds held at peak velocity. The triangle puts the
+        hardest mechanical instant (peak velocity + full accel) at the target
+        speed; the dwell holds there long enough (~5*L/R) for phase current --
+        and thus the real torque at that speed -- to saturate before a skip is
+        judged. With dwell_time = 0 it degenerates to the pure triangle.
+
+        D = v^2/a + v*dwell_time, clamped to [min_move_distance, 2*max_half]:
+        the upper bound keeps the move on the bed (the caller's per-speed
+        start_accel accounts for the cruise so the lowest-accel probe still
+        fits), and the lower bound avoids degenerate sub-resolution micro-moves.
+
+        Lost-step detection is done by the caller via _home_and_measure /
+        _check_for_lost_steps, so nothing is returned."""
         axis_idx = self._get_axis_index()
+
+        # Triangle (v^2/a) plus a minimum cruise hold of dwell_time at peak.
+        tri_dist = self._calculate_required_distance(speed, accel)  # v^2/a
+        half = (tri_dist + speed * dwell_time) / 2.0
+        half = max(self.min_move_distance / 2.0, min(half, max_half))
+        start_pos = center - half
+        end_pos = center + half
 
         # Move to start position at a safe speed/accel
         self.gcode.run_script_from_command(
@@ -280,6 +364,102 @@ class TorqueCurveCalibrate:
         diff_mm = abs(after - ref_home_pos) * step_dist
         return diff_mm > self.position_tolerance, diff_mm
 
+    def _axis_rotation_distance(self):
+        """Belt travel per motor revolution (mm) for the test axis."""
+        for rail in self.kin.rails:
+            for stepper in rail.get_steppers():
+                if stepper.is_active_axis(self.test_axis):
+                    return stepper.get_rotation_distance()[0]
+        return None
+
+    def _back_emf_constant(self):
+        """Motor back-EMF constant Ke (V/(rad/s)), or None if unknown.
+
+        Ke is a winding constant, numerically equal (SI) to the torque constant
+        Kt. For a 2-phase hybrid the holding torque is ~2*Kt*I_rated_peak, so
+        Ke ~ holding_torque / (2 * rated_current). A direct motor_back_emf
+        overrides this estimate.
+        """
+        if self.motor_back_emf > 0.0:
+            return self.motor_back_emf
+        if self.motor_holding_torque > 0.0 and self.motor_rated_current > 0.0:
+            return self.motor_holding_torque / (2.0 * self.motor_rated_current)
+        return None
+
+    def _theoretical_max_speed(self):
+        """Back-EMF-limited top speed in mm/s, or None if under-specified.
+
+        At this speed back-EMF == supply voltage, leaving nothing to drive
+        current (zero torque), so the carriage cannot physically go faster:
+            v = V_supply * C / (2*pi*Ke)
+        with C the belt travel per rev and Ke the back-EMF constant.
+        """
+        if self.supply_voltage <= 0.0:
+            return None
+        ke = self._back_emf_constant()
+        rot_dist = self._axis_rotation_distance()
+        if not ke or not rot_dist:
+            return None
+        return self.supply_voltage * rot_dist / (2.0 * math.pi * ke)
+
+    # Time constants of cruise to reach steady-state phase current. ~5 tau is
+    # >99% settled.
+    SETTLE_TAUS = 5.0
+
+    def _winding_resistance(self):
+        """DC phase resistance (ohms) from config, or None if unset."""
+        if self.motor_resistance > 0.0:
+            return self.motor_resistance
+        return None
+
+    def _peak_dwell_time(self):
+        """Cruise-at-peak hold time (s) for current to saturate, or 0.
+
+        tau = L/R; hold ~SETTLE_TAUS*tau plus dwell_margin so the current
+        waveform (and thus the real torque at that speed) settles before a skip
+        is judged. 0 when inductance/resistance are unknown.
+        """
+        if self.motor_inductance <= 0.0:
+            return 0.0
+        r = self._winding_resistance()
+        if not r:
+            return 0.0
+        tau = self.motor_inductance / r
+        return (1.0 + self.dwell_margin) * self.SETTLE_TAUS * tau
+
+    def _resolve_speed_end(self, gcmd):
+        """Set self.speed_end, honoring/cap-ing against the theoretical max."""
+        v_theory = self._theoretical_max_speed()
+        if self.speed_end is None:
+            if v_theory is None:
+                raise gcmd.error(
+                    "speed_end is not set and the theoretical top speed is "
+                    "unavailable. Set supply_voltage plus motor_back_emf (or "
+                    "motor_holding_torque + motor_rated_current), or pass "
+                    "SPEED_END."
+                )
+            self.speed_end = v_theory
+            gcmd.respond_info(
+                "speed_end unset -> sweeping to theoretical back-EMF max "
+                "%.0f mm/s" % v_theory
+            )
+        elif v_theory is not None and self.speed_end > v_theory:
+            gcmd.respond_info(
+                "speed_end %.0f mm/s is above the theoretical back-EMF max "
+                "%.0f mm/s; capping there" % (self.speed_end, v_theory)
+            )
+            self.speed_end = v_theory
+        elif v_theory is not None:
+            gcmd.respond_info(
+                "Theoretical back-EMF max %.0f mm/s; testing to speed_end "
+                "%.0f mm/s" % (v_theory, self.speed_end)
+            )
+        if self.speed_end < self.speed_start:
+            raise gcmd.error(
+                "speed_end (%.0f) is below speed_start (%.0f)"
+                % (self.speed_end, self.speed_start)
+            )
+
     def _run_calibration(self, gcmd):
         """Main calibration routine."""
         self.calibration_running = True
@@ -303,6 +483,10 @@ class TorqueCurveCalibrate:
         saved_kin_limits = self._save_kinematic_limits()
 
         try:
+            # Resolve speed_end now (may set it from / cap it at the theoretical
+            # back-EMF max) before it is used to widen kinematic limits below.
+            self._resolve_speed_end(gcmd)
+
             # Widen per-axis kinematic caps so the commanded accel is the accel
             # the motor actually sees (see _save_kinematic_limits).
             self._apply_kinematic_limits(gcmd)
@@ -326,14 +510,34 @@ class TorqueCurveCalibrate:
             # Lift the gantry clear of the bed before any high-speed sweeping.
             self._raise_z(gcmd)
 
-            # Calculate test positions
+            # Test region: a center and the maximum half-travel. Each probe's
+            # actual move is a triangle sized to v^2/a plus a peak dwell (see
+            # _perform_test_move); max_distance bounds the largest one.
             start_pos, end_pos = self._calculate_test_positions()
-            test_distance = abs(end_pos - start_pos)
+            center = 0.5 * (start_pos + end_pos)
+            max_half = 0.5 * (end_pos - start_pos)
+            max_distance = end_pos - start_pos
 
             gcmd.respond_info(
-                "Test positions: %.1f to %.1f mm (%.1f mm travel)"
-                % (start_pos, end_pos, test_distance)
+                "Test region: center %.1f mm, up to %.1f mm travel"
+                % (center, max_distance)
             )
+
+            # Peak-velocity dwell so phase current saturates before judging.
+            dwell_time = self._peak_dwell_time()
+            if dwell_time > 0.0:
+                r = self._winding_resistance()
+                gcmd.respond_info(
+                    "Peak dwell %.1f ms/pass (tau=L/R=%.2f ms, %d tau, +%.0f%%)"
+                    % (dwell_time * 1e3,
+                       (self.motor_inductance / r) * 1e3,
+                       int(self.SETTLE_TAUS), self.dwell_margin * 100.0)
+                )
+            else:
+                gcmd.respond_info(
+                    "No peak dwell (set motor_inductance to enable the "
+                    "current-saturation hold); using pure triangular moves"
+                )
 
             # Generate speed list
             speeds = []
@@ -358,9 +562,19 @@ class TorqueCurveCalibrate:
                     % (speed_idx + 1, len(speeds), test_speed)
                 )
 
-                # Check if we can reach this speed in the available distance
-                min_accel_for_speed = (test_speed ** 2) / test_distance
-                start_accel = max(self.accel_start, min_accel_for_speed * 1.5)
+                # Lowest accel whose triangle+dwell still fits the bed:
+                # v^2/a + v*dwell <= max_distance, so a >= v^2/(max_distance -
+                # v*dwell). Below this the move can't reach the target speed, so
+                # start the search here.
+                usable_distance = max_distance - test_speed * dwell_time
+                if usable_distance <= 0.0:
+                    gcmd.respond_info(
+                        "  Speed %.0f mm/s: peak dwell alone exceeds travel, "
+                        "skipping" % test_speed
+                    )
+                    continue
+                min_accel_for_speed = (test_speed ** 2) / usable_distance
+                start_accel = max(self.accel_start, min_accel_for_speed)
 
                 if start_accel > self.accel_max:
                     gcmd.respond_info(
@@ -369,36 +583,74 @@ class TorqueCurveCalibrate:
                     )
                     continue
 
-                # Linear ramp-up search (gentle). Step the acceleration up from
-                # start_accel by accel_step until the first skip. This never
-                # commands more than one accel_step above a known-good value, so
-                # a skip overshoots the motor's real limit by at most one step.
-                # A binary search converges faster but its first probe jumps to
-                # the midpoint of [start_accel, accel_max] -- e.g. ~50000 when
-                # accel_max is 100000 -- which can be far above the real limit
-                # and crash the axis hard. Trade time for safety here.
-                last_good_accel = 0
+                # Exponential-from-below search with refinement on overshoot.
+                #
+                # Climb the accel geometrically (x accel_growth) from
+                # start_accel until the motor skips. Multiplicative steps cover
+                # a huge range in a handful of moves (1000 -> 1e6 is ~10 moves
+                # at x2 vs. ~1000 for an additive ramp), and because we always
+                # approach from below, the first skip sits just above a
+                # known-good value -- we never slam the axis at a wildly-high
+                # accel the way a [start, max] bisection's first midpoint probe
+                # would.
+                #
+                # On a skip we don't stop: record it as the upper bound, drop
+                # back to the last good accel, halve the growth ratio (finer
+                # climb), and resume the exponential from there. Each overshoot
+                # shrinks the step, so last_good converges up onto the true
+                # threshold from underneath. A probe is never commanded at or
+                # above a known skip -- if a finer climb would cross an older
+                # skip bound, we split that bracket instead. Stop once the
+                # [last_good, skip] bracket is tighter than accel_step (the
+                # resolution), or at accel_max if it never skips.
+                last_good_accel = 0.0
+                skip_accel = None  # lowest accel known to skip (upper bound)
+                growth = self.accel_growth
                 test_accel = start_accel
-                while test_accel <= self.accel_max:
-                    if not self.calibration_running:
-                        break
+                while self.calibration_running:
+                    # Clamp: never above accel_max, never at/above a known skip.
+                    if test_accel > self.accel_max:
+                        test_accel = self.accel_max
+                    if skip_accel is not None and test_accel >= skip_accel:
+                        test_accel = 0.5 * (last_good_accel + skip_accel)
 
                     ref_home = self._home_and_measure()
                     self._perform_test_move(
-                        start_pos, end_pos, test_speed, test_accel
+                        center, max_half, test_speed, test_accel, dwell_time
                     )
                     lost, diff = self._check_for_lost_steps(ref_home)
 
                     if lost:
+                        skip_accel = test_accel
                         gcmd.respond_info(
-                            "  Accel %.0f: FAILED (lost %.3f mm) -> limit found"
+                            "  Accel %.0f: FAILED (lost %.3f mm)"
                             % (test_accel, diff)
                         )
-                        break
+                        if last_good_accel <= 0.0:
+                            gcmd.respond_info(
+                                "  Skipped at the starting accel -- real limit "
+                                "is below %.0f" % test_accel
+                            )
+                            break
+                        # Overshot: refine. Halve the growth ratio toward 1 and
+                        # resume the climb from the last known-good accel.
+                        growth = 1.0 + 0.5 * (growth - 1.0)
+                        test_accel = last_good_accel * growth
+                    else:
+                        gcmd.respond_info("  Accel %.0f: OK" % test_accel)
+                        last_good_accel = test_accel
+                        if test_accel >= self.accel_max:
+                            gcmd.respond_info(
+                                "  Reached accel_max %.0f without skipping"
+                                % self.accel_max
+                            )
+                            break
+                        test_accel = last_good_accel * growth
 
-                    gcmd.respond_info("  Accel %.0f: OK" % test_accel)
-                    last_good_accel = test_accel
-                    test_accel += self.accel_step
+                    # Converged: bracket tighter than the resolution.
+                    if (skip_accel is not None
+                            and skip_accel - last_good_accel <= self.accel_step):
+                        break
 
                 # Record result (0 means it skipped at the very first accel)
                 self.calibration_results.append((test_speed, last_good_accel))
@@ -535,6 +787,9 @@ class TorqueCurveCalibrate:
         )
         self.accel_step = gcmd.get_float(
             "ACCEL_STEP", self.accel_step, above=0.0
+        )
+        self.accel_growth = gcmd.get_float(
+            "ACCEL_GROWTH", self.accel_growth, above=1.0
         )
         self.test_cycles = gcmd.get_int(
             "TEST_CYCLES", self.test_cycles, minval=1
