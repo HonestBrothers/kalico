@@ -6,6 +6,7 @@
 import logging
 import math
 import os
+import subprocess
 
 
 class TorqueCurveCalibrate:
@@ -256,36 +257,42 @@ class TorqueCurveCalibrate:
 
         return pre_test_stepper_pos, post_test_stepper_pos
 
-    def _check_for_lost_steps(self):
-        """
-        Check for lost steps by re-homing and comparing position.
-        Returns (lost_steps_detected, step_difference)
-        """
-        # Record expected position
-        expected_stepper_pos = self._get_stepper_position()
-
-        # Re-home
-        self._home_axis()
-
-        # Get new position
-        actual_stepper_pos = self._get_stepper_position()
-
-        # Calculate difference
-        if expected_stepper_pos is None or actual_stepper_pos is None:
-            return False, 0
-
-        diff = abs(actual_stepper_pos - expected_stepper_pos)
-
-        # Get step distance to convert to mm
+    def _step_dist(self):
+        """Step distance (mm) of the test axis stepper."""
         for rail in self.kin.rails:
             for stepper in rail.get_steppers():
                 if stepper.is_active_axis(self.test_axis):
-                    step_dist = stepper.get_step_dist()
-                    diff_mm = diff * step_dist
-                    lost = diff_mm > self.position_tolerance
-                    return lost, diff_mm
+                    return stepper.get_step_dist()
+        return None
 
-        return False, 0
+    def _home_and_measure(self):
+        """Home the test axis and return the at-home stepper position.
+
+        Lost steps are only observable against the endstop: the MCU counts
+        commanded steps, so a balanced there-and-back move returns the same
+        count whether or not the motor skipped. Re-homing drives the carriage
+        back to the physical endstop, so the step count *at home* shifts by
+        exactly the steps lost since the previous home. The caller compares two
+        at-home readings -- the same principle TEST_SPEED uses with
+        GET_POSITION before and after a re-home.
+        """
+        self._home_axis()
+        return self._get_stepper_position()
+
+    def _check_for_lost_steps(self, ref_home_pos):
+        """Re-home and report drift from the reference at-home position.
+
+        Returns (lost_steps_detected, drift_mm). ref_home_pos must have been
+        captured by a prior _home_and_measure() (i.e. at the endstop), NOT at
+        an arbitrary position -- otherwise the difference is just the homing
+        travel distance.
+        """
+        after = self._home_and_measure()
+        if ref_home_pos is None or after is None:
+            return False, 0.0
+        step_dist = self._step_dist() or 0.0
+        diff_mm = abs(after - ref_home_pos) * step_dist
+        return diff_mm > self.position_tolerance, diff_mm
 
     def _run_calibration(self, gcmd):
         """Main calibration routine."""
@@ -364,9 +371,9 @@ class TorqueCurveCalibrate:
                 test_count = 0
 
                 # First, verify the starting acceleration works
-                self._home_axis()
+                ref_home = self._home_and_measure()
                 self._perform_test_move(start_pos, end_pos, test_speed, accel_low)
-                lost, diff = self._check_for_lost_steps()
+                lost, diff = self._check_for_lost_steps(ref_home)
 
                 if lost:
                     gcmd.respond_info(
@@ -388,11 +395,11 @@ class TorqueCurveCalibrate:
                     test_accel = (accel_low + accel_high) / 2
                     test_count += 1
 
-                    self._home_axis()
+                    ref_home = self._home_and_measure()
                     self._perform_test_move(
                         start_pos, end_pos, test_speed, test_accel
                     )
-                    lost, diff = self._check_for_lost_steps()
+                    lost, diff = self._check_for_lost_steps(ref_home)
 
                     if lost:
                         gcmd.respond_info(
@@ -434,13 +441,18 @@ class TorqueCurveCalibrate:
 
     def _save_results(self, gcmd, results):
         """Save calibration results to CSV file."""
-        # Resolve output path
+        # Resolve output path: <config_dir>/torque_curve/<stem>_<axis>.csv
         config_file = self.printer.get_start_args().get("config_file")
         if config_file:
-            config_dir = os.path.dirname(os.path.abspath(config_file))
-            output_path = os.path.join(config_dir, self.output_file)
+            base_dir = os.path.dirname(os.path.abspath(config_file))
         else:
-            output_path = os.path.abspath(self.output_file)
+            base_dir = os.getcwd()
+        out_dir = os.path.join(base_dir, "torque_curve")
+        os.makedirs(out_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(self.output_file))[0]
+        output_path = os.path.join(
+            out_dir, "%s_%s.csv" % (stem, self.test_axis)
+        )
 
         # Write CSV
         with open(output_path, "w") as f:
@@ -461,6 +473,9 @@ class TorqueCurveCalibrate:
         for speed, accel in results:
             gcmd.respond_info("  %.0f mm/s -> %.0f mm/s^2" % (speed, accel))
 
+        # Plot the curve to a PNG alongside the CSV
+        self._plot_curve(gcmd, output_path)
+
         # Update target torque_curve if specified
         if self.target_curve:
             try:
@@ -478,6 +493,32 @@ class TorqueCurveCalibrate:
                 gcmd.respond_info(
                     "\nWarning: Could not update torque_curve: %s" % str(e)
                 )
+
+    def _plot_curve(self, gcmd, csv_path):
+        """Render the curve to a PNG next to the CSV (non-blocking).
+
+        Spawns scripts/plot_torque_curve.py with the system python3 so it can
+        use matplotlib without pulling it into klippy-env. Fire-and-forget:
+        the calibration is already done and the toolhead idle, so the fork
+        cannot disturb motion timing.
+        """
+        png_path = os.path.splitext(csv_path)[0] + ".png"
+        klipper_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        script = os.path.join(klipper_root, "scripts", "plot_torque_curve.py")
+        try:
+            subprocess.Popen(
+                ["python3", script, csv_path, png_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            gcmd.respond_info(
+                "Plotting torque curve -> %s (needs python3-matplotlib)"
+                % png_path
+            )
+        except Exception as e:
+            gcmd.respond_info("Could not start plot: %s" % str(e))
 
     cmd_TORQUE_CURVE_CALIBRATE_help = (
         "Run automated torque curve calibration"
