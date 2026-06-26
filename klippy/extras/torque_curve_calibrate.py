@@ -66,11 +66,6 @@ class TorqueCurveCalibrate:
             self.cmd_TORQUE_CURVE_CALIBRATE,
             desc=self.cmd_TORQUE_CURVE_CALIBRATE_help,
         )
-        gcode.register_mux_command(
-            "TORQUE_CURVE_CALIBRATE_ABORT", "NAME", self.name,
-            self.cmd_TORQUE_CURVE_CALIBRATE_ABORT,
-            desc=self.cmd_TORQUE_CURVE_CALIBRATE_ABORT_help,
-        )
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object("toolhead")
@@ -302,8 +297,9 @@ class TorqueCurveCalibrate:
         gcmd.respond_info("Starting torque curve calibration on %s axis"
                          % self.test_axis.upper())
         gcmd.respond_info(
-            "To STOP mid-run press EMERGENCY STOP (M112) -- it is the only "
-            "command Klipper runs while a test is in progress."
+            "If the axis crashes or skips, STOP IT NOW: hit Mainsail's "
+            "Emergency Stop button, or cut printer power. A g-code abort "
+            "cannot interrupt a running test."
         )
 
         # Save original settings
@@ -538,21 +534,6 @@ class TorqueCurveCalibrate:
         self.output_file = gcmd.get("OUTPUT_FILE", self.output_file)
 
         self._run_calibration(gcmd)
-
-    cmd_TORQUE_CURVE_CALIBRATE_ABORT_help = (
-        "Emergency-stop (M112). NOTE: cannot interrupt a test already running"
-    )
-    def cmd_TORQUE_CURVE_CALIBRATE_ABORT(self, gcmd):
-        # Fire an emergency stop. Caveat: g-code is serialized, so if a
-        # calibration is mid-run this command is queued behind it and only
-        # runs once the test ends -- it cannot interrupt. Only the literal
-        # M112 string is handled out-of-order, so to halt a *running* test
-        # send M112 / press Emergency Stop directly.
-        self.calibration_running = False
-        gcmd.respond_info("Emergency stop - calibration abort")
-        self.printer.invoke_shutdown(
-            "Torque curve calibration aborted (TORQUE_CURVE_CALIBRATE_ABORT)"
-        )
 
 
 def load_config_prefix(config):
