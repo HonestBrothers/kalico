@@ -549,8 +549,10 @@ class TorqueCurveCalibrate:
         # M112 string is handled out-of-order, so to halt a *running* test
         # send M112 / press Emergency Stop directly.
         self.calibration_running = False
-        gcmd.respond_info("Emergency stop (M112) - calibration abort")
-        self.gcode.run_script_from_command("M112")
+        gcmd.respond_info("Emergency stop - calibration abort")
+        self.printer.invoke_shutdown(
+            "Torque curve calibration aborted (TORQUE_CURVE_CALIBRATE_ABORT)"
+        )
 
 
 def load_config_prefix(config):
