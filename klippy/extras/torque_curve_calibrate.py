@@ -540,21 +540,17 @@ class TorqueCurveCalibrate:
         self._run_calibration(gcmd)
 
     cmd_TORQUE_CURVE_CALIBRATE_ABORT_help = (
-        "Cannot interrupt a running test -- use M112 / Emergency Stop"
+        "Emergency-stop (M112). NOTE: cannot interrupt a test already running"
     )
     def cmd_TORQUE_CURVE_CALIBRATE_ABORT(self, gcmd):
-        # Klipper processes g-code serially: a running calibration holds the
-        # dispatcher for its whole duration, so this command sits in the queue
-        # until the test finishes (by which point calibration_running is
-        # already False). Only M112 is handled out-of-order. So this can never
-        # interrupt a running test -- direct the user to the one thing that
-        # can. Flag is still cleared in case it is sent between speeds.
+        # Fire an emergency stop. Caveat: g-code is serialized, so if a
+        # calibration is mid-run this command is queued behind it and only
+        # runs once the test ends -- it cannot interrupt. Only the literal
+        # M112 string is handled out-of-order, so to halt a *running* test
+        # send M112 / press Emergency Stop directly.
         self.calibration_running = False
-        gcmd.respond_info(
-            "TORQUE_CURVE_CALIBRATE_ABORT cannot interrupt a running test "
-            "(g-code is serialized behind it). Press EMERGENCY STOP (M112) "
-            "to halt the machine immediately."
-        )
+        gcmd.respond_info("Emergency stop (M112) - calibration abort")
+        self.gcode.run_script_from_command("M112")
 
 
 def load_config_prefix(config):
