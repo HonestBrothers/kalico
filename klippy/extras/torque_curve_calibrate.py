@@ -314,9 +314,11 @@ class TorqueCurveCalibrate:
             # the motor actually sees (see _save_kinematic_limits).
             self._apply_kinematic_limits(gcmd)
 
-            # Initial home
-            gcmd.respond_info("Homing %s axis..." % self.test_axis.upper())
-            self._home_axis()
+            # Initial full home so the test never depends on the user having
+            # homed first, and so the safe-Z lift (and safe_z_home, which needs
+            # X/Y homed to reach its probe point) have everything they need.
+            gcmd.respond_info("Homing all axes...")
+            self.gcode.run_script_from_command("G28")
 
             # Lift the gantry clear of the bed before any high-speed sweeping.
             self._raise_z(gcmd)
