@@ -44,6 +44,11 @@ class TorqueCurveCalibrate:
         # Target torque_curve module to update
         self.target_curve = config.get("target_curve", None)
 
+        # Raise the gantry to a safe height after homing, before the high-speed
+        # sweeps, so the nozzle cannot scrape or crash the bed. 0 disables.
+        self.safe_z = config.getfloat("safe_z", 20.0, minval=0.0)
+        self.z_lift_speed = config.getfloat("z_lift_speed", 25.0, above=0.0)
+
         # Internal state
         self.calibration_running = False
         self.calibration_results = []
@@ -92,6 +97,28 @@ class TorqueCurveCalibrate:
     def _home_axis(self):
         """Home the test axis."""
         self.gcode.run_script_from_command("G28 %s" % self.test_axis.upper())
+
+    def _raise_z(self, gcmd):
+        """Home Z if needed, then lift the gantry to safe_z.
+
+        The sweep only moves the test axis, leaving Z wherever it started, so
+        without this the high-speed moves run at the current gantry height and
+        could scrape/crash the bed. Runs after the initial home; no-op when
+        safe_z is 0.
+        """
+        if self.safe_z <= 0.0:
+            return
+        systime = self.printer.get_reactor().monotonic()
+        if "z" not in self.toolhead.get_status(systime)["homed_axes"]:
+            self.gcode.run_script_from_command("G28 Z")
+        self.gcode.run_script_from_command(
+            "G90\nG1 Z%.3f F%.0f" % (self.safe_z, self.z_lift_speed * 60.0)
+        )
+        self.toolhead.wait_moves()
+        gcmd.respond_info(
+            "Raised Z to %.1f mm (safe height) before calibration"
+            % self.safe_z
+        )
 
     def _supports_kinematic_limits(self):
         """True for kinematics exposing per-axis caps (Kalico limited_*)."""
@@ -283,6 +310,9 @@ class TorqueCurveCalibrate:
             # Initial home
             gcmd.respond_info("Homing %s axis..." % self.test_axis.upper())
             self._home_axis()
+
+            # Lift the gantry clear of the bed before any high-speed sweeping.
+            self._raise_z(gcmd)
 
             # Calculate test positions
             start_pos, end_pos = self._calculate_test_positions()
