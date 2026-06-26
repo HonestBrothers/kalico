@@ -307,12 +307,24 @@ class TorqueCurveCalibrate:
         toolhead_info = self.toolhead.get_status(systime)
         orig_max_accel = toolhead_info["max_accel"]
         orig_max_velocity = toolhead_info["max_velocity"]
+        orig_scv = toolhead_info["square_corner_velocity"]
+        orig_min_cruise_ratio = toolhead_info["minimum_cruise_ratio"]
         saved_kin_limits = self._save_kinematic_limits()
 
         try:
             # Widen per-axis kinematic caps so the commanded accel is the accel
             # the motor actually sees (see _save_kinematic_limits).
             self._apply_kinematic_limits(gcmd)
+
+            # Make every test move a clean, isolated accel/decel: no junction
+            # carry-over (SCV=0) and no forced cruise fraction (min ratio=0), so
+            # the result can't be skewed by short-move top-speed capping. Moves
+            # already fully stop between each (wait_moves), but this keeps the
+            # test self-contained against config edits.
+            self.gcode.run_script_from_command(
+                "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=0"
+                " MINIMUM_CRUISE_RATIO=0"
+            )
 
             # Initial full home so the test never depends on the user having
             # homed first, and so the safe-Z lift (and safe_z_home, which needs
@@ -408,7 +420,9 @@ class TorqueCurveCalibrate:
             # Restore original settings
             self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT ACCEL=%.1f VELOCITY=%.1f"
-                % (orig_max_accel, orig_max_velocity)
+                " SQUARE_CORNER_VELOCITY=%.4f MINIMUM_CRUISE_RATIO=%.4f"
+                % (orig_max_accel, orig_max_velocity,
+                   orig_scv, orig_min_cruise_ratio)
             )
             self._restore_kinematic_limits(saved_kin_limits, gcmd)
             self.calibration_running = False
