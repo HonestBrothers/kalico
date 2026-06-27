@@ -81,10 +81,17 @@ class Move:
             return
         # Allow extruder to calculate its maximum junction
         extruder_v2 = self.toolhead.extruder.calc_junction(prev_move, self)
-        # TOPP-RA: prev move's accel-reachability is the curve integral, not a
-        # constant-accel delta_v2, when the curve reshapes prev_move.
+        # Reachability across prev_move is a reshaper's integral, not a
+        # constant-accel delta_v2, when one is active. Jerk limiting wraps the
+        # torque curve (its accel_limit rides a_max(v)), so it takes precedence;
+        # TOPP-RA alone handles moves jerk doesn't claim (e.g. travel moves).
+        jl = getattr(self.toolhead, "jerk_limiting", None)
         ptc = getattr(self.toolhead, "topp_ra", None)
-        if ptc is not None and ptc.active_for(prev_move):
+        if jl is not None and jl.active_for(prev_move):
+            prev_reach_v2 = jl.reach(
+                prev_move, prev_move.max_start_v2, prev_move.move_d
+            )
+        elif ptc is not None and ptc.active_for(prev_move):
             prev_reach_v2 = ptc.reach(prev_move.max_start_v2, prev_move.move_d)
         else:
             prev_reach_v2 = prev_move.max_start_v2 + prev_move.delta_v2
@@ -179,10 +186,17 @@ class LookAheadQueue:
         delayed = []
         next_end_v2 = next_smoothed_v2 = peak_cruise_v2 = 0.0
         tc = getattr(self.toolhead, "topp_ra", None)
+        jl = getattr(self.toolhead, "jerk_limiting", None)
         for i in range(flush_count - 1, -1, -1):
             move = queue[i]
-            mtc = tc if (tc is not None and tc.active_for(move)) else None
-            if mtc is not None:
+            # Jerk limiting (which rides the torque curve via accel_limit) takes
+            # precedence; TOPP-RA alone covers moves jerk doesn't claim.
+            mjl = jl if (jl is not None and jl.active_for(move)) else None
+            mtc = (tc if (mjl is None and tc is not None
+                          and tc.active_for(move)) else None)
+            if mjl is not None:
+                reachable_start_v2 = mjl.reach(move, next_end_v2, move.move_d)
+            elif mtc is not None:
                 reachable_start_v2 = mtc.reach(next_end_v2, move.move_d)
             else:
                 reachable_start_v2 = next_end_v2 + move.delta_v2
@@ -220,10 +234,17 @@ class LookAheadQueue:
                         move.max_cruise_v2,
                         peak_cruise_v2,
                     )
-                    if mtc is not None:
+                    if mjl is not None:
                         # The constant-accel midpoint isn't the triangle peak
-                        # under a velocity-dependent limit; clamp to what is
-                        # actually reachable from each end across the move.
+                        # under jerk + a velocity-dependent accel limit; clamp
+                        # to what is reachable from each end across the move.
+                        cruise_v2 = min(
+                            cruise_v2,
+                            mjl.reach(move, start_v2, move.move_d),
+                            mjl.reach(move, next_end_v2, move.move_d),
+                        )
+                    elif mtc is not None:
+                        # Same clamp for the TOPP-RA-only (no jerk) case.
                         cruise_v2 = min(
                             cruise_v2,
                             mtc.reach(start_v2, move.move_d),
@@ -247,6 +268,38 @@ class LookAheadQueue:
         del queue[:flush_count]
 
     def add_move(self, move):
+        # Jerk limiting Phase 3: round a sharp corner by replacing the previous
+        # queued move + this move with a trimmed-prev / blend / trimmed-move
+        # chain. Falls back to the stock path when no blend applies.
+        jl = getattr(self.toolhead, "jerk_limiting", None)
+        if (jl is not None and jl.corners_active() and self.queue
+                and move.is_kinematic_move
+                and self.queue[-1].is_kinematic_move):
+            chain = jl.round_corner(self.queue[-1], move)
+            if chain is not None:
+                # These corner moves are synthesized here and never pass
+                # through ToolHead.move(), so apply the same kinematic and
+                # extruder limit checks every queued move normally gets.
+                # Without this they keep the global max_accel and unbounded
+                # extrusion; pressure advance then turns the corner into an
+                # extruder step-rate spike that overflows stepcompress.
+                kin = self.toolhead.kin
+                extruder = self.toolhead.extruder
+                for nm in chain:
+                    if nm.is_kinematic_move:
+                        kin.check_move(nm)
+                    if nm.axes_d[3]:
+                        extruder.check_move(nm)
+                self.queue[-1] = chain[0]
+                if len(self.queue) >= 2:
+                    self.queue[-1].calc_junction(self.queue[-2])
+                for nm in chain[1:]:
+                    self.queue.append(nm)
+                    nm.calc_junction(self.queue[-2])
+                    self.junction_flush -= nm.min_move_t
+                if self.junction_flush <= 0.0:
+                    self.flush(lazy=True)
+                return
         self.queue.append(move)
         if len(self.queue) == 1:
             return
@@ -482,10 +535,19 @@ class ToolHead:
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
         topp = getattr(self, "topp_ra", None)
-        for move in moves:
+        jl = getattr(self, "jerk_limiting", None)
+        # Jerk limiting plans the whole batch at once (it coalesces collinear
+        # runs into single ramps); it returns None for any move it doesn't
+        # reshape, which then falls back to TOPP-RA's per-move plan. Jerk rides
+        # the torque curve via accel_limit, so the two never reshape the same
+        # move. Both emit the identical (accel_t, cruise_t, decel_t, start_v,
+        # cruise_v, accel, dist) slice tuple consumed below.
+        seg_lists = (jl.plan_moves(moves)
+                     if (jl is not None and jl.retime_active()) else None)
+        for idx, move in enumerate(moves):
             move_dur = move.accel_t + move.cruise_t + move.decel_t
-            segs = None
-            if move.is_kinematic_move and topp is not None:
+            segs = seg_lists[idx] if seg_lists is not None else None
+            if segs is None and move.is_kinematic_move and topp is not None:
                 segs = topp.plan_move(move)
             if segs is not None:
                 # TOPP-RA: emit the velocity-dependent-accel profile as a chain
