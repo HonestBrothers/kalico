@@ -173,9 +173,12 @@ def test_phase2_coalesces_collinear_accel_run():
     d1 = jl.dist_jerk(0.0, v1, A, J)
     v2 = math.sqrt(jl.reach_v2(v1 * v1, 20.0, A, J, 400.0))
     d2 = jl.dist_jerk(v1, v2, A, J)
-    m1 = _MockMove(th, (0, 0, 0, 0), (d1, 0, 0, 0), 400)
+    # Extruding moves (E tracks path length): jerk limiting only reshapes
+    # non-travel moves, so the coalescing path must be exercised with print
+    # moves, not pure travel.
+    m1 = _MockMove(th, (0, 0, 0, 0), (d1, 0, 0, d1), 400)
     m1.start_v, m1.cruise_v, m1.end_v = 0.0, v1, v1
-    m2 = _MockMove(th, (d1, 0, 0, 0), (d1 + d2, 0, 0, 0), 400)
+    m2 = _MockMove(th, (d1, 0, 0, d1), (d1 + d2, 0, 0, d1 + d2), 400)
     m2.start_v, m2.cruise_v, m2.end_v = v1, v2, v2
     out = obj.plan_moves([m1, m2])
     assert out[0] and out[1]
@@ -190,9 +193,10 @@ def test_phase2_does_not_coalesce_across_corner():
     obj = _mk_jl()
     v1 = math.sqrt(jl.reach_v2(0.0, 20.0, A, J, 400.0))
     d1 = jl.dist_jerk(0.0, v1, A, J)
-    m1 = _MockMove(th, (0, 0, 0, 0), (d1, 0, 0, 0), 400)
+    # Extruding moves (E tracks path length) -- jerk reshapes print moves only.
+    m1 = _MockMove(th, (0, 0, 0, 0), (d1, 0, 0, d1), 400)
     m1.start_v, m1.cruise_v, m1.end_v = 0.0, v1, v1
-    m2 = _MockMove(th, (d1, 0, 0, 0), (d1, d1, 0, 0), 400)  # 90 deg turn
+    m2 = _MockMove(th, (d1, 0, 0, d1), (d1, d1, 0, 2 * d1), 400)  # 90 deg turn
     m2.start_v, m2.cruise_v, m2.end_v = v1, v1, v1
     out = obj.plan_moves([m1, m2])
     # Still correct per move, just not merged.
@@ -220,7 +224,8 @@ def test_phase2_run_clamps_unreachable_end_velocity():
     moves = []
     x = 0.0
     for sv, ev in vels:
-        m = _MockMove(th, (x, 0, 0, 0), (x + move_d, 0, 0, 0), 400)
+        # Extruding moves (E tracks path length) -- jerk reshapes print moves.
+        m = _MockMove(th, (x, 0, 0, x), (x + move_d, 0, 0, x + move_d), 400)
         m.start_v, m.cruise_v, m.end_v = sv, ev, ev
         moves.append(m)
         x += move_d
