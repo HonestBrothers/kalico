@@ -105,7 +105,7 @@ class TorqueCurveCalibrate:
         # (above) handles per-pass current saturation; pass count handles the
         # cumulative thermal/mechanical side. Homing dominates per-probe cost,
         # so a generous count is nearly free.
-        self.test_cycles = config.getint("test_cycles", 10, minval=1)
+        self.test_cycles = config.getint("test_cycles", 30, minval=1)
 
         # Output file for calibration results
         self.output_file = config.get("output_file", "torque_curve.csv")
