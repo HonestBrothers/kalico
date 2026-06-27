@@ -235,6 +235,42 @@ class TorqueCurveCalibrate:
         )
         gcmd.respond_info("Kinematic limits restored")
 
+    def _disable_reshapers(self, gcmd):
+        """Turn off motion-profile reshapers for the sweep; return saved state.
+
+        The sweep must command raw constant-accel moves. A reshaper would
+        invalidate that: TOPP-RA would clamp the commanded accel to its existing
+        curve (so the search could never climb past it -- silently corrupting
+        the measured limit), and jerk limiting would replace the trapezoid with
+        an S-curve. Both are disabled here and restored in the finally block.
+        (Jerk already skips travel moves, which the sweep uses, but it's
+        disabled anyway so the guard doesn't depend on that detail.)
+        """
+        self.toolhead.flush_step_generation()
+        saved = {}
+        tc = getattr(self.toolhead, "topp_ra", None)
+        if tc is not None and getattr(tc, "enabled", False):
+            saved["topp"] = tc
+            tc.enabled = False
+            gcmd.respond_info("Disabled TOPP-RA reshaping for calibration")
+        jl = getattr(self.toolhead, "jerk_limiting", None)
+        if jl is not None and getattr(jl, "enabled", False):
+            saved["jerk"] = jl
+            jl.enabled = False
+            gcmd.respond_info("Disabled jerk limiting for calibration")
+        return saved
+
+    def _restore_reshapers(self, saved, gcmd):
+        """Re-enable whatever _disable_reshapers turned off."""
+        if not saved:
+            return
+        self.toolhead.flush_step_generation()
+        if "topp" in saved:
+            saved["topp"].enabled = True
+        if "jerk" in saved:
+            saved["jerk"].enabled = True
+        gcmd.respond_info("Restored motion reshaping (TOPP-RA / jerk)")
+
     def _get_current_position(self):
         """Get current position on test axis."""
         axis_idx = self._get_axis_index()
@@ -481,6 +517,7 @@ class TorqueCurveCalibrate:
         orig_scv = toolhead_info["square_corner_velocity"]
         orig_min_cruise_ratio = toolhead_info["minimum_cruise_ratio"]
         saved_kin_limits = self._save_kinematic_limits()
+        saved_reshapers = {}
 
         try:
             # Resolve speed_end now (may set it from / cap it at the theoretical
@@ -500,6 +537,10 @@ class TorqueCurveCalibrate:
                 "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=0"
                 " MINIMUM_CRUISE_RATIO=0"
             )
+
+            # Disable motion-profile reshapers (TOPP-RA / jerk) so the sweep
+            # commands raw constant-accel moves; restored in the finally block.
+            saved_reshapers = self._disable_reshapers(gcmd)
 
             # Initial full home so the test never depends on the user having
             # homed first, and so the safe-Z lift (and safe_z_home, which needs
@@ -668,6 +709,7 @@ class TorqueCurveCalibrate:
                    orig_scv, orig_min_cruise_ratio)
             )
             self._restore_kinematic_limits(saved_kin_limits, gcmd)
+            self._restore_reshapers(saved_reshapers, gcmd)
             self.calibration_running = False
 
         # Filter out failed results (accel = 0)
