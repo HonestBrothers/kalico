@@ -233,6 +233,98 @@ speed. (This is the *motion* torque curve, unrelated to the TMC driver
   so marginal return vs 1-2. If pursued: cubic B-spline subdivision, validated
   against an offline MVC/elastica reference.
 
+## Future direction: vibration-aware planning (one sweep, three knobs)
+
+Phases 1-3 bound jerk and corner geometry from *config constants* (`max_jerk`,
+`corner_max_deviation`). Those constants are guesses. A single accelerometer
+sweep can replace the guesses with *measured* limits and, in doing so, unify
+jerk limiting, the torque curve (TOPP-RA), and input shaping under one
+calibration.
+
+### Idea
+
+During the torque-curve calibration sweep, also log the on-axis accelerometer.
+That yields, per operating point, not just the skip limit but the **excitation
+response** as a function of (accel, jerk, speed). Feed it back as a planning
+constraint.
+
+### Multi-constraint TOPP-RA
+
+TOPP-RA reachability already intersects feasible (v, a) regions, so extra
+constraint curves drop in cleanly -- the planner takes the binding one at each
+speed:
+
+```
+a_max(v) = min( torque(v), thermal(v), excitation(v; J) )
+```
+
+The torque curve answers "how hard *can* I push?"; the measured excitation curve
+answers "how hard *should* I push before the frame rings?". This is the one
+configuration where TOPP-RA serves **print quality**, not just throughput -- it
+becomes a vibration-bounded planner instead of a time-optimal one.
+
+### What the measurement captures that models don't
+
+Input shaping models a single path (commanded motion -> tuned mode) and notches
+`f_n`. A measured map is empirical, so it captures **every** excitation source at
+once -- crucially the **speed-swept** ones input shaping is blind to: motor
+cogging, microstep-table distortion (chopper / StealthChop artifacts), belt
+tooth-mesh. Those spike at specific *speeds* (a motion harmonic crossing a mode),
+so the unique deliverable here is a **speed-band cap**, not an accel cap.
+
+### Jerk from the measured `f_n`
+
+Jerk bounds the force spectrum's rolloff: a jerk-limited ramp takes `T_j = a/J`,
+with its first spectral null near `1/T_j`. To keep energy out of `f_n`,
+`T_j >~ 1/f_n`, i.e.
+
+```
+J_max ~ a * f_n      (order of magnitude; tighten below for margin)
+```
+
+So the *measured* resonance sets the jerk ceiling directly, replacing the
+hand-wave "`max_jerk ~ 20-50 * max_accel`" in `sample-jerk-limiting.cfg` --
+which, rearranged, is just `J/a ~ f_n` for a 40-100 Hz machine. The folklore was
+secretly this. Because the excitation map is speed-dependent, jerk generalizes
+to a curve `J(v)`: tighten in resonance-prone bands, loosen in clean ones --
+another constraint in the same stack.
+
+`J` and `a_max` are coupled through the S-curve (`T_j = a/J`), so the planner
+must co-optimize them, and the objective is multi-objective (excitation vs
+throughput): use the map to find the *knee* where excitation enters tolerance,
+not to minimize it (which drives `J -> 0`, infinitely smooth and infinitely
+slow).
+
+### Division of labor (all from the one spectrum)
+
+- **Input shaping** -- notch the 1-2 tallest peaks (surgical, per-frequency).
+- **Jerk `J(v)`** -- set the rolloff below the lowest significant mode
+  (broadband suppression of the secondaries shaping wasn't tuned for).
+- **TOPP-RA excitation term** -- speed-band caps for the swept sources neither of
+  the above can see.
+
+One sweep -> torque curve + full resonance spectrum -> auto-derives `a_max(v)`,
+`J(v)`, and the shaper parameters.
+
+### Sequencing / scope
+
+- **Now (small, self-contained):** auto-set the scalar `max_jerk` from the input
+  shaper's already-measured frequency (`J = ratio * max_accel * f_n`), with the
+  config value as fallback. First rung; replaces the magic constant with a
+  principled one and needs no new calibration pass.
+- **Later (research-grade):** the full speed-dependent `J(v)` + multi-constraint
+  vibration-aware TOPP-RA. Genuinely novel, but ~80% of the benefit is already
+  covered by input shaping + a principled scalar jerk; the extension earns its
+  keep specifically for the **swept-source speed bands** the analytical tools
+  cannot see.
+
+Caveats: the excitation map is also position/direction-dependent (modes vary
+across travel and across the bed), so an honest implementation is position-aware
+-- a single `a_max(v)` / `J(v)` is a useful average. The calibration-hygiene
+warnings from resonance testing apply (accelerometer clipping, and all
+motion-smoothing features OFF during the sweep, or the feature contaminates its
+own measurement).
+
 ## Supporting analysis
 
 - `scripts/jerk_planning/plot_shaper_max_accel.py` -- why input shaping caps
