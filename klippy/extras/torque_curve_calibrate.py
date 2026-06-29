@@ -597,10 +597,14 @@ class TorqueCurveCalibrate:
             resid_rms = float(np.sqrt((resid * resid).mean()))
             rfreqs, rspec = self._spectrum(np, bt, resid)
 
-        # f_n: shaper if configured, else the residual's dominant mode.
-        fn = self._shaper_freq()
-        if not fn:
-            fn = self._peak_freq(np, rfreqs, rspec, 20.0, 160.0) or None
+        # The MEASURED dominant mode of the residual (commanded removed) is the
+        # truth; the configured shaper frequency is only a fallback when there's
+        # no residual spectrum. Measuring a_fn at this empirical peak -- rather
+        # than a possibly-mistuned shaper value -- is what makes the sweep a
+        # rigorous resonance measurement (and a better input-shaper target than
+        # the canonical pulse sweep, since it excites with real moves).
+        resid_fpeak = self._peak_freq(np, rfreqs, rspec, 20.0, 160.0)
+        fn = resid_fpeak or self._shaper_freq() or 0.0
 
         rd_rms = 0.0
         rdfreqs = rdspec = None
@@ -621,6 +625,7 @@ class TorqueCurveCalibrate:
         return {
             "raw_rms": raw_rms, "raw_fpeak": raw_fpeak,
             "resid_rms": defloor(resid_rms),
+            "resid_fpeak": resid_fpeak,
             "resid_afn": defloor_line(self._mag_at(np, rfreqs, rspec, fn)),
             "rd_rms": defloor(rd_rms),
             "rd_afn": defloor_line(self._mag_at(np, rdfreqs, rdspec, fn)),
@@ -938,18 +943,18 @@ class TorqueCurveCalibrate:
                             row = (
                                 test_speed, test_accel, 1 if lost else 0, diff,
                                 vm["base_rms"], vm["raw_rms"], vm["raw_fpeak"],
-                                vm["resid_rms"], vm["resid_afn"], vm["rd_rms"],
-                                vm["rd_afn"], vm["fn"],
+                                vm["resid_rms"], vm["resid_fpeak"],
+                                vm["resid_afn"], vm["rd_rms"], vm["rd_afn"],
                             )
                             self.vibration_rows.append(row)
                             self._write_vibration_row(row)  # flushed to disk
-                            # resid/ring-down a@fn are the clean, de-floored,
-                            # mode-isolated numbers; raw is shown for contrast.
+                            # a@fn is measured at the detected mode (resid_fpeak)
+                            # -- the de-floored amplitude of the real resonance.
                             gcmd.respond_info(
-                                "    resid rms=%.0f a@%.0fHz=%.1f | ringdown "
-                                "a@fn=%.1f | floor=%.0f | raw rms=%.0f"
-                                % (vm["resid_rms"], vm["fn"], vm["resid_afn"],
-                                   vm["rd_afn"], vm["base_rms"], vm["raw_rms"])
+                                "    mode=%.0fHz resid a@mode=%.1f | ringdown "
+                                "a@mode=%.1f | resid rms=%.0f floor=%.0f"
+                                % (vm["resid_fpeak"], vm["resid_afn"],
+                                   vm["rd_afn"], vm["resid_rms"], vm["base_rms"])
                             )
 
                     if lost:
@@ -1048,16 +1053,17 @@ class TorqueCurveCalibrate:
                 "(rd_freq column is the measured ring-down frequency)\n"
                 "# All metrics quadrature-subtract base_rms (the noise floor).\n"
                 "# resid_* = burst with commanded accel subtracted; rd_* = "
-                "stationary ring-down; *_afn = mode-isolated magnitude at f_n "
-                "(the clean numbers); raw_* shown for contrast.\n"
+                "stationary ring-down. resid_fpeak = MEASURED resonance (mode); "
+                "*_afn = de-floored amplitude at that measured mode (the clean "
+                "numbers); raw_* shown for contrast.\n"
                 "speed,accel,lost,drift_mm,base_rms,raw_rms,raw_fpeak,"
-                "resid_rms,resid_afn,rd_rms,rd_afn,fn\n"
+                "resid_rms,resid_fpeak,resid_afn,rd_rms,rd_afn\n"
                 % (self.test_axis.upper(),
                    "OFF/raw" if self.vibration_shaper_off else "ON",
                    "%.1f" % fn if fn else "n/a")
             )
         self._vib_file.write(
-            "%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f,%.4f,%.4f,%.4f,%.2f\n"
+            "%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f,%.2f,%.4f,%.4f,%.4f\n"
             % row
         )
         self._vib_file.flush()
@@ -1075,6 +1081,22 @@ class TorqueCurveCalibrate:
             "Vibration data -> %s (%d points)"
             % (self._vib_path, len(self.vibration_rows))
         )
+        # Amplitude-weighted measured resonance across the sweep: the dominant
+        # mode frequency, weighted by how strongly each probe excited it. This
+        # is the rigorous input-shaper target (measured under real moves), to
+        # compare against the configured shaper frequency.
+        # row = (..., 8:resid_fpeak, 9:resid_afn, ...)
+        wsum = sum(r[9] for r in self.vibration_rows if r[8] > 0.0)
+        if wsum > 0.0:
+            mode = sum(r[8] * r[9] for r in self.vibration_rows
+                       if r[8] > 0.0) / wsum
+            shaper = self._shaper_freq()
+            gcmd.respond_info(
+                "Measured %s resonance: %.1f Hz (amplitude-weighted)%s"
+                % (self.test_axis.upper(), mode,
+                   "" if not shaper
+                   else " -- configured input shaper is %.1f Hz" % shaper)
+            )
 
     def _save_results(self, gcmd, results):
         """Save calibration results to CSV file."""
