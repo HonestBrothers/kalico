@@ -142,6 +142,8 @@ class TorqueCurveCalibrate:
         self.calibration_running = False
         self.calibration_results = []
         self.vibration_rows = []
+        self._vib_file = None
+        self._vib_path = None
 
         # Register event handler
         self.printer.register_event_handler(
@@ -693,6 +695,7 @@ class TorqueCurveCalibrate:
         self.calibration_running = True
         self.calibration_results = []
         self.vibration_rows = []
+        self._vib_file = None
 
         gcmd.respond_info("Starting torque curve calibration on %s axis"
                          % self.test_axis.upper())
@@ -858,12 +861,14 @@ class TorqueCurveCalibrate:
                     if self.measure_vibration:
                         vm = self._vibration_metrics(cap)
                         if vm is not None:
-                            self.vibration_rows.append((
+                            row = (
                                 test_speed, test_accel, 1 if lost else 0, diff,
                                 vm["raw_rms"], vm["raw_peak"], vm["raw_fpeak"],
                                 vm["resid_rms"], vm["resid_afn"], vm["rd_rms"],
                                 vm["rd_peak"], vm["rd_freq"], vm["fn"],
-                            ))
+                            )
+                            self.vibration_rows.append(row)
+                            self._write_vibration_row(row)  # flushed to disk
                             # ring-down + residual are the clean numbers; raw is
                             # shown for contrast (commanded motion still in it).
                             gcmd.respond_info(
@@ -922,6 +927,10 @@ class TorqueCurveCalibrate:
             )
             self._restore_kinematic_limits(saved_kin_limits, gcmd)
             self._restore_reshapers(saved_reshapers, gcmd)
+            # Vibration rows are written to disk as they're collected; just
+            # close the handle here so even an aborted/shut-down sweep keeps
+            # everything captured up to the failure point.
+            self._close_vibration_csv(gcmd)
             self.calibration_running = False
 
         # Filter out failed results (accel = 0)
@@ -935,11 +944,6 @@ class TorqueCurveCalibrate:
                 "Calibration incomplete - not enough valid data points"
             )
 
-        # Vibration data is independent of the skip results -- save it even when
-        # the torque sweep itself didn't yield a usable curve.
-        if self.measure_vibration and self.vibration_rows:
-            self._save_vibration(gcmd)
-
     def _output_dir_stem(self):
         """(<config_dir>/torque_curve, output-file stem); makes the dir."""
         config_file = self.printer.get_start_args().get("config_file")
@@ -950,31 +954,51 @@ class TorqueCurveCalibrate:
         stem = os.path.splitext(os.path.basename(self.output_file))[0]
         return out_dir, stem
 
-    def _save_vibration(self, gcmd):
-        """Write the per-probe vibration metrics CSV (the excitation map)."""
-        out_dir, stem = self._output_dir_stem()
-        path = os.path.join(
-            out_dir, "%s_%s_vibration.csv" % (stem, self.test_axis)
+    def _write_vibration_row(self, row):
+        """Append one probe's metrics to the CSV, flushing immediately.
+
+        Written incrementally (not batched at the end) so a mid-sweep
+        accelerometer dropout / shutdown can't wipe everything collected so far
+        -- the data is on disk after every probe.
+        """
+        if self._vib_file is None:
+            out_dir, stem = self._output_dir_stem()
+            self._vib_path = os.path.join(
+                out_dir, "%s_%s_vibration.csv" % (stem, self.test_axis)
+            )
+            self._vib_file = open(self._vib_path, "w")
+            fn = self._shaper_freq()
+            self._vib_file.write(
+                "# Vibration sweep on %s axis (input shaping %s)\n"
+                "# Input shaper f_n: %s Hz "
+                "(rd_freq column is the measured ring-down frequency)\n"
+                "# rd_* = stationary ring-down (cleanest); resid_* = burst with "
+                "commanded accel subtracted; raw_* = burst as-measured "
+                "(commanded motion still in it)\n"
+                "speed,accel,lost,drift_mm,raw_rms,raw_peak,raw_fpeak,"
+                "resid_rms,resid_afn,rd_rms,rd_peak,rd_freq,fn\n"
+                % (self.test_axis.upper(),
+                   "OFF/raw" if self.vibration_shaper_off else "ON",
+                   "%.1f" % fn if fn else "n/a")
+            )
+        self._vib_file.write(
+            "%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f\n"
+            % row
         )
-        fn = self._shaper_freq()
-        with open(path, "w") as f:
-            f.write("# Vibration sweep on %s axis (input shaping %s)\n"
-                    % (self.test_axis.upper(),
-                       "OFF/raw" if self.vibration_shaper_off else "ON"))
-            f.write("# Input shaper f_n: %s Hz "
-                    "(rd_freq column is the measured ring-down frequency)\n"
-                    % ("%.1f" % fn if fn else "n/a"))
-            f.write("# rd_* = stationary ring-down (cleanest); resid_* = burst "
-                    "with commanded accel subtracted; raw_* = burst as-measured"
-                    " (commanded motion still in it)\n")
-            f.write("speed,accel,lost,drift_mm,raw_rms,raw_peak,raw_fpeak,"
-                    "resid_rms,resid_afn,rd_rms,rd_peak,rd_freq,fn\n")
-            for row in self.vibration_rows:
-                f.write("%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f,%.4f,%.4f,"
-                        "%.4f,%.2f,%.2f\n" % row)
+        self._vib_file.flush()
+        os.fsync(self._vib_file.fileno())
+
+    def _close_vibration_csv(self, gcmd):
+        """Close the incremental CSV (safe to call when never opened)."""
+        if self._vib_file is None:
+            return
+        try:
+            self._vib_file.close()
+        finally:
+            self._vib_file = None
         gcmd.respond_info(
             "Vibration data -> %s (%d points)"
-            % (path, len(self.vibration_rows))
+            % (self._vib_path, len(self.vibration_rows))
         )
 
     def _save_results(self, gcmd, results):
