@@ -130,6 +130,13 @@ class TorqueCurveCalibrate:
         self.vibration_shaper_off = config.getboolean(
             "vibration_shaper_off", False
         )
+        # Ring-down window (s) captured while stationary right after the stress
+        # burst. Commanded accel is 0 there, so it's the *pure* decaying
+        # resonance -- the cleanest "commanded factored out" metric (and it
+        # measures f_n directly, no input_shaper needed). 0 disables it.
+        self.ring_down_time = config.getfloat(
+            "ring_down_time", 0.15, minval=0.0
+        )
 
         # Internal state
         self.calibration_running = False
@@ -407,8 +414,9 @@ class TorqueCurveCalibrate:
             "SET_VELOCITY_LIMIT ACCEL=%.1f VELOCITY=%.1f" % (accel, speed)
         )
         # Capture the accelerometer over just the stress burst (the slow
-        # positioning move above is excluded). Returns the samples for the
-        # caller to reduce to a vibration metric.
+        # positioning move above is excluded), then -- while the axis sits still
+        # -- a short ring-down window where commanded accel is 0. Returns a dict
+        # the caller reduces to vibration metrics.
         aclient = None
         if capture and self.accel_chip is not None:
             aclient = self.accel_chip.start_internal_client()
@@ -418,45 +426,134 @@ class TorqueCurveCalibrate:
             pos[axis_idx] = start_pos
             self.toolhead.move(pos, speed)
         self.toolhead.wait_moves()
-        if aclient is not None:
-            aclient.finish_measurements()
-            return aclient.get_samples()
-        return None
+        if aclient is None:
+            return None
+        aclient.finish_measurements()
+        cap = {
+            "burst": aclient.get_samples(),
+            "t0": aclient.request_start_time,
+            "t1": aclient.request_end_time,
+        }
+        # Ring-down: hold still and capture the pure decaying resonance.
+        if self.ring_down_time > 0.0:
+            rd = self.accel_chip.start_internal_client()
+            self.toolhead.dwell(self.ring_down_time)
+            self.toolhead.wait_moves()
+            rd.finish_measurements()
+            cap["ringdown"] = rd.get_samples()
+        return cap
 
-    def _vibration_metrics(self, samples):
-        """Reduce raw accelerometer samples to vibration metrics, or None.
+    def _spectrum(self, np, times, sig):
+        """(freqs, magnitude spectrum) of a 1-D signal, or (None, None)."""
+        if len(times) < 4:
+            return None, None
+        dt = (times[-1] - times[0]) / (len(times) - 1)
+        if dt <= 0:
+            return None, None
+        win = np.hanning(len(sig))
+        spec = np.abs(np.fft.rfft(sig * win)) * (2.0 / win.sum())
+        freqs = np.fft.rfftfreq(len(sig), dt)
+        return freqs, spec
 
-        Returns dict: rms (overall AC RMS, mm/s^2), peak (max |AC| vector),
-        f_peak (dominant frequency Hz on the test axis), a_fn (spectral
-        magnitude at the input-shaper f_n -- the resonant-mode energy). The DC
-        component (gravity + offset) is removed first.
-        """
+    def _reduce(self, np, samples, fn=None):
+        """RMS / peak / dominant freq / magnitude-at-fn for a sample set."""
         if not samples or len(samples) < 16:
             return None
-        import numpy as np
         t = np.asarray([s[0] for s in samples], dtype=float)
         data = np.asarray([(s[1], s[2], s[3]) for s in samples], dtype=float)
         ac = data - data.mean(axis=0)
         mag = np.sqrt((ac * ac).sum(axis=1))
-        rms = float(np.sqrt((mag * mag).mean()))
-        peak = float(mag.max())
-        f_peak = 0.0
-        a_fn = 0.0
-        if len(t) > 1:
-            dt = (t[-1] - t[0]) / (len(t) - 1)
-            if dt > 0:
-                sig = ac[:, self._get_axis_index()]
-                n = len(sig)
-                win = np.hanning(n)
-                spec = np.abs(np.fft.rfft(sig * win)) * (2.0 / win.sum())
-                freqs = np.fft.rfftfreq(n, dt)
-                if len(spec) > 1:
-                    k = int(np.argmax(spec[1:])) + 1  # skip DC bin
-                    f_peak = float(freqs[k])
-                    fn = self._shaper_freq()
-                    if fn:
-                        a_fn = float(spec[int(np.argmin(np.abs(freqs - fn)))])
-        return {"rms": rms, "peak": peak, "f_peak": f_peak, "a_fn": a_fn}
+        out = {"rms": float(np.sqrt((mag * mag).mean())),
+               "peak": float(mag.max()), "f_peak": 0.0, "a_fn": 0.0}
+        freqs, spec = self._spectrum(np, t, ac[:, self._get_axis_index()])
+        if freqs is not None and len(spec) > 1:
+            out["f_peak"] = float(freqs[int(np.argmax(spec[1:])) + 1])
+            if fn:
+                out["a_fn"] = float(spec[int(np.argmin(np.abs(freqs - fn)))])
+        return out
+
+    def _commanded_axis_accel(self, np, times):
+        """Commanded test-axis acceleration (mm/s^2) at each print_time.
+
+        Read straight from the toolhead trapq: each segment has a constant
+        accel along its unit direction axes_r, so the axis component is
+        accel * axes_r[axis]. Samples already carry print_time, so this *is*
+        the clock alignment -- evaluate the commanded profile at the sample
+        times and subtract to factor out the bulk motion.
+        """
+        import chelper
+        ffi_main, ffi_lib = chelper.get_ffi()
+        trapq = self.toolhead.get_trapq()
+        axis = self._get_axis_index()
+        data = ffi_main.new("struct pull_move[1024]")
+        count = ffi_lib.trapq_extract_old(
+            trapq, data, 1024, times[0] - 0.05, times[-1] + 0.05
+        )
+        if not count:
+            return None
+        starts = np.empty(count); ends = np.empty(count); accs = np.empty(count)
+        for i in range(count):
+            m = data[i]
+            ar = (m.x_r, m.y_r, m.z_r)[axis]
+            starts[i] = m.print_time
+            ends[i] = m.print_time + m.move_t
+            accs[i] = m.accel * ar
+        idx = np.searchsorted(starts, times, side="right") - 1
+        cmd = np.zeros(len(times))
+        valid = (idx >= 0) & (idx < count)
+        ii = np.clip(idx, 0, count - 1)
+        inside = valid & (times < ends[ii])
+        cmd[inside] = accs[ii][inside]
+        return cmd
+
+    def _residual_metrics(self, np, cap, fn):
+        """RMS + magnitude-at-fn of (measured - commanded) over the burst."""
+        burst = cap.get("burst")
+        if not burst or len(burst) < 16:
+            return None
+        t = np.asarray([s[0] for s in burst], dtype=float)
+        meas = np.asarray([s[1 + self._get_axis_index()] for s in burst],
+                          dtype=float)
+        meas = meas - meas.mean()
+        cmd = self._commanded_axis_accel(np, t)
+        if cmd is None:
+            return None
+        resid = meas - (cmd - cmd.mean())
+        out = {"rms": float(np.sqrt((resid * resid).mean())), "a_fn": 0.0}
+        freqs, spec = self._spectrum(np, t, resid)
+        if freqs is not None and fn and len(spec) > 1:
+            out["a_fn"] = float(spec[int(np.argmin(np.abs(freqs - fn)))])
+        return out
+
+    def _vibration_metrics(self, cap):
+        """Reduce a capture dict to vibration metrics, or None.
+
+        Produces three views of the same probe:
+          raw_*   -- during-burst, commanded motion NOT removed (contaminated)
+          resid_* -- during-burst with the commanded accel subtracted (#3)
+          rd_*    -- the stationary ring-down (commanded == 0, cleanest)
+        f_n is the input-shaper frequency, or -- when that isn't configured --
+        the frequency the ring-down actually decays at (measured directly).
+        """
+        if not cap or not cap.get("burst"):
+            return None
+        import numpy as np
+        rd = self._reduce(np, cap.get("ringdown"))
+        # Prefer the measured ring-down frequency as f_n when no shaper is set.
+        fn = self._shaper_freq() or (rd["f_peak"] if rd else None)
+        raw = self._reduce(np, cap["burst"], fn=fn)
+        if raw is None:
+            return None
+        resid = self._residual_metrics(np, cap, fn) or {"rms": 0.0, "a_fn": 0.0}
+        return {
+            "raw_rms": raw["rms"], "raw_peak": raw["peak"],
+            "raw_fpeak": raw["f_peak"], "raw_afn": raw["a_fn"],
+            "resid_rms": resid["rms"], "resid_afn": resid["a_fn"],
+            "rd_rms": rd["rms"] if rd else 0.0,
+            "rd_peak": rd["peak"] if rd else 0.0,
+            "rd_freq": rd["f_peak"] if rd else 0.0,
+            "fn": fn or 0.0,
+        }
 
     def _step_dist(self):
         """Step distance (mm) of the test axis stepper."""
@@ -752,24 +849,28 @@ class TorqueCurveCalibrate:
                         test_accel = 0.5 * (last_good_accel + skip_accel)
 
                     ref_home = self._home_and_measure()
-                    samples = self._perform_test_move(
+                    cap = self._perform_test_move(
                         center, max_half, test_speed, test_accel, dwell_time,
                         capture=self.measure_vibration
                     )
                     lost, diff = self._check_for_lost_steps(ref_home)
 
                     if self.measure_vibration:
-                        vm = self._vibration_metrics(samples)
+                        vm = self._vibration_metrics(cap)
                         if vm is not None:
                             self.vibration_rows.append((
                                 test_speed, test_accel, 1 if lost else 0, diff,
-                                vm["rms"], vm["peak"], vm["f_peak"], vm["a_fn"],
+                                vm["raw_rms"], vm["raw_peak"], vm["raw_fpeak"],
+                                vm["resid_rms"], vm["resid_afn"], vm["rd_rms"],
+                                vm["rd_peak"], vm["rd_freq"], vm["fn"],
                             ))
+                            # ring-down + residual are the clean numbers; raw is
+                            # shown for contrast (commanded motion still in it).
                             gcmd.respond_info(
-                                "    vib rms=%.0f peak=%.0f f_peak=%.0fHz "
-                                "a@fn=%.0f"
-                                % (vm["rms"], vm["peak"], vm["f_peak"],
-                                   vm["a_fn"])
+                                "    ringdown rms=%.0f @%.0fHz | resid rms=%.0f "
+                                "| raw rms=%.0f"
+                                % (vm["rd_rms"], vm["rd_freq"],
+                                   vm["resid_rms"], vm["raw_rms"])
                             )
 
                     if lost:
@@ -860,11 +961,17 @@ class TorqueCurveCalibrate:
             f.write("# Vibration sweep on %s axis (input shaping %s)\n"
                     % (self.test_axis.upper(),
                        "OFF/raw" if self.vibration_shaper_off else "ON"))
-            f.write("# Input shaper f_n: %s Hz\n"
+            f.write("# Input shaper f_n: %s Hz "
+                    "(rd_freq column is the measured ring-down frequency)\n"
                     % ("%.1f" % fn if fn else "n/a"))
-            f.write("speed,accel,lost,drift_mm,vib_rms,vib_peak,f_peak,a_fn\n")
+            f.write("# rd_* = stationary ring-down (cleanest); resid_* = burst "
+                    "with commanded accel subtracted; raw_* = burst as-measured"
+                    " (commanded motion still in it)\n")
+            f.write("speed,accel,lost,drift_mm,raw_rms,raw_peak,raw_fpeak,"
+                    "resid_rms,resid_afn,rd_rms,rd_peak,rd_freq,fn\n")
             for row in self.vibration_rows:
-                f.write("%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f\n" % row)
+                f.write("%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f,%.4f,%.4f,"
+                        "%.4f,%.2f,%.2f\n" % row)
         gcmd.respond_info(
             "Vibration data -> %s (%d points)"
             % (path, len(self.vibration_rows))
@@ -984,6 +1091,9 @@ class TorqueCurveCalibrate:
             "VIBRATION_SHAPER_OFF", 1 if self.vibration_shaper_off else 0,
             minval=0, maxval=1
         ))
+        self.ring_down_time = gcmd.get_float(
+            "RING_DOWN_TIME", self.ring_down_time, minval=0.0
+        )
         # Resolve the accel chip if vibration was just enabled at runtime.
         if self.measure_vibration and self.accel_chip is None:
             self.accel_chip = self._lookup_accel_chip()
