@@ -118,9 +118,23 @@ class TorqueCurveCalibrate:
         self.safe_z = config.getfloat("safe_z", 20.0, minval=0.0)
         self.z_lift_speed = config.getfloat("z_lift_speed", 25.0, above=0.0)
 
+        # --- Vibration instrumentation (accelerometer) ----------------------
+        # When True, capture the accelerometer during each probe and log a
+        # vibration metric per (speed, accel) point alongside the skip data --
+        # the raw material for the excitation map a TOPP-RA constraint can use
+        # to notch out resonant speed/accel bands. Measures with input shaping
+        # ON by default (real-world, shaped vibration); set
+        # vibration_shaper_off True to disable shaping and capture raw modes.
+        self.measure_vibration = config.getboolean("measure_vibration", False)
+        self.accel_chip_name = config.get("accel_chip", None)
+        self.vibration_shaper_off = config.getboolean(
+            "vibration_shaper_off", False
+        )
+
         # Internal state
         self.calibration_running = False
         self.calibration_results = []
+        self.vibration_rows = []
 
         # Register event handler
         self.printer.register_event_handler(
@@ -139,6 +153,30 @@ class TorqueCurveCalibrate:
         self.toolhead = self.printer.lookup_object("toolhead")
         self.gcode = self.printer.lookup_object("gcode")
         self.kin = self.toolhead.get_kinematics()
+        self.accel_chip = None
+        if self.measure_vibration:
+            self.accel_chip = self._lookup_accel_chip()
+
+    def _lookup_accel_chip(self):
+        """Find the accelerometer chip object, by config name or common ones."""
+        names = ([self.accel_chip_name] if self.accel_chip_name
+                 else ["lis2dw", "adxl345"])
+        for n in names:
+            chip = self.printer.lookup_object(n, None)
+            if chip is not None and hasattr(chip, "start_internal_client"):
+                return chip
+        return None
+
+    def _shaper_freq(self):
+        """Input-shaper frequency (Hz) for the test axis, or None."""
+        ins = self.printer.lookup_object("input_shaper", None)
+        if ins is None:
+            return None
+        for sh in ins.get_shapers():
+            if sh.get_axis() == self.test_axis:
+                f = getattr(getattr(sh, "params", None), "shaper_freq", 0.0)
+                return f or None
+        return None
 
     def _get_axis_index(self):
         """Get axis index (0=X, 1=Y, 2=Z)."""
@@ -258,6 +296,15 @@ class TorqueCurveCalibrate:
             saved["jerk"] = jl
             jl.enabled = False
             gcmd.respond_info("Disabled jerk limiting for calibration")
+        # Optional raw-mode: drop input shaping so the accelerometer sees the
+        # unshaped resonance (default keeps shaping on = real-world vibration).
+        if (self.measure_vibration and self.vibration_shaper_off
+                and self.printer.lookup_object("input_shaper", None)):
+            self.gcode.run_script_from_command("DISABLE_INPUT_SHAPER")
+            saved["shaper"] = True
+            gcmd.respond_info(
+                "Input shaping disabled for raw vibration measurement"
+            )
         return saved
 
     def _restore_reshapers(self, saved, gcmd):
@@ -269,7 +316,9 @@ class TorqueCurveCalibrate:
             saved["topp"].enabled = True
         if "jerk" in saved:
             saved["jerk"].enabled = True
-        gcmd.respond_info("Restored motion reshaping (TOPP-RA / jerk)")
+        if "shaper" in saved:
+            self.gcode.run_script_from_command("ENABLE_INPUT_SHAPER")
+        gcmd.respond_info("Restored motion reshaping (TOPP-RA / jerk / shaper)")
 
     def _get_current_position(self):
         """Get current position on test axis."""
@@ -310,7 +359,8 @@ class TorqueCurveCalibrate:
         accel_dist = (speed ** 2) / (2 * accel)
         return accel_dist * 2  # Need to accelerate and decelerate
 
-    def _perform_test_move(self, center, max_half, speed, accel, dwell_time):
+    def _perform_test_move(self, center, max_half, speed, accel, dwell_time,
+                           capture=False):
         """Stress the axis at (speed, accel) with test_cycles passes,
         centered on `center`.
 
@@ -356,12 +406,57 @@ class TorqueCurveCalibrate:
         self.gcode.run_script_from_command(
             "SET_VELOCITY_LIMIT ACCEL=%.1f VELOCITY=%.1f" % (accel, speed)
         )
+        # Capture the accelerometer over just the stress burst (the slow
+        # positioning move above is excluded). Returns the samples for the
+        # caller to reduce to a vibration metric.
+        aclient = None
+        if capture and self.accel_chip is not None:
+            aclient = self.accel_chip.start_internal_client()
         for _ in range(self.test_cycles):
             pos[axis_idx] = end_pos
             self.toolhead.move(pos, speed)
             pos[axis_idx] = start_pos
             self.toolhead.move(pos, speed)
         self.toolhead.wait_moves()
+        if aclient is not None:
+            aclient.finish_measurements()
+            return aclient.get_samples()
+        return None
+
+    def _vibration_metrics(self, samples):
+        """Reduce raw accelerometer samples to vibration metrics, or None.
+
+        Returns dict: rms (overall AC RMS, mm/s^2), peak (max |AC| vector),
+        f_peak (dominant frequency Hz on the test axis), a_fn (spectral
+        magnitude at the input-shaper f_n -- the resonant-mode energy). The DC
+        component (gravity + offset) is removed first.
+        """
+        if not samples or len(samples) < 16:
+            return None
+        import numpy as np
+        t = np.asarray([s[0] for s in samples], dtype=float)
+        data = np.asarray([(s[1], s[2], s[3]) for s in samples], dtype=float)
+        ac = data - data.mean(axis=0)
+        mag = np.sqrt((ac * ac).sum(axis=1))
+        rms = float(np.sqrt((mag * mag).mean()))
+        peak = float(mag.max())
+        f_peak = 0.0
+        a_fn = 0.0
+        if len(t) > 1:
+            dt = (t[-1] - t[0]) / (len(t) - 1)
+            if dt > 0:
+                sig = ac[:, self._get_axis_index()]
+                n = len(sig)
+                win = np.hanning(n)
+                spec = np.abs(np.fft.rfft(sig * win)) * (2.0 / win.sum())
+                freqs = np.fft.rfftfreq(n, dt)
+                if len(spec) > 1:
+                    k = int(np.argmax(spec[1:])) + 1  # skip DC bin
+                    f_peak = float(freqs[k])
+                    fn = self._shaper_freq()
+                    if fn:
+                        a_fn = float(spec[int(np.argmin(np.abs(freqs - fn)))])
+        return {"rms": rms, "peak": peak, "f_peak": f_peak, "a_fn": a_fn}
 
     def _step_dist(self):
         """Step distance (mm) of the test axis stepper."""
@@ -500,6 +595,7 @@ class TorqueCurveCalibrate:
         """Main calibration routine."""
         self.calibration_running = True
         self.calibration_results = []
+        self.vibration_rows = []
 
         gcmd.respond_info("Starting torque curve calibration on %s axis"
                          % self.test_axis.upper())
@@ -656,10 +752,25 @@ class TorqueCurveCalibrate:
                         test_accel = 0.5 * (last_good_accel + skip_accel)
 
                     ref_home = self._home_and_measure()
-                    self._perform_test_move(
-                        center, max_half, test_speed, test_accel, dwell_time
+                    samples = self._perform_test_move(
+                        center, max_half, test_speed, test_accel, dwell_time,
+                        capture=self.measure_vibration
                     )
                     lost, diff = self._check_for_lost_steps(ref_home)
+
+                    if self.measure_vibration:
+                        vm = self._vibration_metrics(samples)
+                        if vm is not None:
+                            self.vibration_rows.append((
+                                test_speed, test_accel, 1 if lost else 0, diff,
+                                vm["rms"], vm["peak"], vm["f_peak"], vm["a_fn"],
+                            ))
+                            gcmd.respond_info(
+                                "    vib rms=%.0f peak=%.0f f_peak=%.0fHz "
+                                "a@fn=%.0f"
+                                % (vm["rms"], vm["peak"], vm["f_peak"],
+                                   vm["a_fn"])
+                            )
 
                     if lost:
                         skip_accel = test_accel
@@ -723,17 +834,45 @@ class TorqueCurveCalibrate:
                 "Calibration incomplete - not enough valid data points"
             )
 
-    def _save_results(self, gcmd, results):
-        """Save calibration results to CSV file."""
-        # Resolve output path: <config_dir>/torque_curve/<stem>_<axis>.csv
+        # Vibration data is independent of the skip results -- save it even when
+        # the torque sweep itself didn't yield a usable curve.
+        if self.measure_vibration and self.vibration_rows:
+            self._save_vibration(gcmd)
+
+    def _output_dir_stem(self):
+        """(<config_dir>/torque_curve, output-file stem); makes the dir."""
         config_file = self.printer.get_start_args().get("config_file")
-        if config_file:
-            base_dir = os.path.dirname(os.path.abspath(config_file))
-        else:
-            base_dir = os.getcwd()
+        base_dir = (os.path.dirname(os.path.abspath(config_file))
+                    if config_file else os.getcwd())
         out_dir = os.path.join(base_dir, "torque_curve")
         os.makedirs(out_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(self.output_file))[0]
+        return out_dir, stem
+
+    def _save_vibration(self, gcmd):
+        """Write the per-probe vibration metrics CSV (the excitation map)."""
+        out_dir, stem = self._output_dir_stem()
+        path = os.path.join(
+            out_dir, "%s_%s_vibration.csv" % (stem, self.test_axis)
+        )
+        fn = self._shaper_freq()
+        with open(path, "w") as f:
+            f.write("# Vibration sweep on %s axis (input shaping %s)\n"
+                    % (self.test_axis.upper(),
+                       "OFF/raw" if self.vibration_shaper_off else "ON"))
+            f.write("# Input shaper f_n: %s Hz\n"
+                    % ("%.1f" % fn if fn else "n/a"))
+            f.write("speed,accel,lost,drift_mm,vib_rms,vib_peak,f_peak,a_fn\n")
+            for row in self.vibration_rows:
+                f.write("%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f\n" % row)
+        gcmd.respond_info(
+            "Vibration data -> %s (%d points)"
+            % (path, len(self.vibration_rows))
+        )
+
+    def _save_results(self, gcmd, results):
+        """Save calibration results to CSV file."""
+        out_dir, stem = self._output_dir_stem()
         output_path = os.path.join(
             out_dir, "%s_%s.csv" % (stem, self.test_axis)
         )
@@ -837,6 +976,22 @@ class TorqueCurveCalibrate:
             "TEST_CYCLES", self.test_cycles, minval=1
         )
         self.output_file = gcmd.get("OUTPUT_FILE", self.output_file)
+        self.measure_vibration = bool(gcmd.get_int(
+            "MEASURE_VIBRATION", 1 if self.measure_vibration else 0,
+            minval=0, maxval=1
+        ))
+        self.vibration_shaper_off = bool(gcmd.get_int(
+            "VIBRATION_SHAPER_OFF", 1 if self.vibration_shaper_off else 0,
+            minval=0, maxval=1
+        ))
+        # Resolve the accel chip if vibration was just enabled at runtime.
+        if self.measure_vibration and self.accel_chip is None:
+            self.accel_chip = self._lookup_accel_chip()
+            if self.accel_chip is None:
+                raise gcmd.error(
+                    "MEASURE_VIBRATION requested but no accelerometer found; "
+                    "set accel_chip (e.g. lis2dw / adxl345)"
+                )
 
         self._run_calibration(gcmd)
 
