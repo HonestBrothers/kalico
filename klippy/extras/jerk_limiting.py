@@ -517,7 +517,13 @@ class JerkLimiting:
         # lookahead in place of the constant-accel delta_v2. Routing accel
         # through accel_limit is what makes lookahead reachability honor the
         # torque curve when TOPP-RA is active.
-        accel = self.accel_limit(move, move.cruise_v)
+        #
+        # NB: reach() runs during lookahead (calc_junction / flush) BEFORE
+        # set_junction(), so move.cruise_v does not exist yet -- evaluate the
+        # accel ceiling at the move's top speed (max_cruise_v2, set at move
+        # creation), which is also the conservative point on a falling curve.
+        v = math.sqrt(move.max_cruise_v2)
+        accel = self.accel_limit(move, v)
         return reach_v2(u0, dist, accel, self._jerk_for(move),
                         self.toolhead.max_velocity)
 
