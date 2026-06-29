@@ -156,6 +156,7 @@ def _mk_jl():
     obj.blend_junctions = True
     obj.round_corners = True
     obj.max_jerk = J
+    obj.max_jerk_x = obj.max_jerk_y = obj.max_jerk_z = J
     obj.resolution = DT
     obj.corner_max_deviation = 0.05
     obj.corner_min_angle = 5.0
@@ -373,27 +374,37 @@ def test_c_trapq_accepts_jerk_slices():
     assert abs(prev_v) < 0.5
 
 
-def test_auto_jerk_from_shaper_frequency():
-    # max_jerk = auto_jerk_ratio * max_accel * (lowest axis f_n); the lowest
-    # mode is the most excitation-prone, so it sets the most conservative jerk.
-    # With no input shaper frequency available, the configured value is kept.
+def test_auto_jerk_per_axis_from_shaper_frequency():
+    # Each axis: max_jerk_<axis> = auto_jerk_ratio * max_accel_axis * f_n_axis,
+    # using that axis's own input-shaper frequency and (when available) its own
+    # per-axis max accel. Axes without a frequency keep their configured value.
     class _Params:
         def __init__(self, f):
             self.shaper_freq = f
 
     class _Shaper:
-        def __init__(self, f):
+        def __init__(self, axis, f):
+            self._axis = axis
             self.params = _Params(f)
 
+        def get_axis(self):
+            return self._axis
+
     class _Ins:
-        def __init__(self, *freqs):
-            self._s = [_Shaper(f) for f in freqs]
+        def __init__(self, *pairs):
+            self._s = [_Shaper(a, f) for a, f in pairs]
 
         def get_shapers(self):
             return self._s
 
+    class _Kin:
+        max_accels = [18000.0, 12000.0, 500.0]  # per-axis x, y, z
+
     class _TH:
         max_accel = 20000.0
+
+        def get_kinematics(self):
+            return _Kin()
 
     class _Printer:
         def __init__(self, ins):
@@ -404,16 +415,36 @@ def test_auto_jerk_from_shaper_frequency():
 
     obj = jl.JerkLimiting.__new__(jl.JerkLimiting)
     obj.max_jerk = 100000.0
+    obj.max_jerk_x = obj.max_jerk_y = obj.max_jerk_z = 100000.0
     obj.auto_jerk_ratio = 1.0
     obj.toolhead = _TH()
-    obj.printer = _Printer(_Ins(52.0, 41.0))  # lowest mode 41 Hz
+    obj.printer = _Printer(_Ins(("x", 52.0), ("y", 41.0)))
     obj._apply_auto_jerk()
-    assert abs(obj.max_jerk - 1.0 * 20000.0 * 41.0) < 1e-6
-    obj.auto_jerk_ratio = 0.5  # margin
+    assert abs(obj.max_jerk_x - 1.0 * 18000.0 * 52.0) < 1e-6  # x accel + x freq
+    assert abs(obj.max_jerk_y - 1.0 * 12000.0 * 41.0) < 1e-6  # y accel + y freq
+    # ratio scales both
+    obj.auto_jerk_ratio = 0.5
     obj._apply_auto_jerk()
-    assert abs(obj.max_jerk - 0.5 * 20000.0 * 41.0) < 1e-6
-    # No input shaper -> configured value retained.
-    obj.max_jerk = 77777.0
+    assert abs(obj.max_jerk_x - 0.5 * 18000.0 * 52.0) < 1e-6
+    # No input shaper -> configured values retained.
+    obj.max_jerk_x = obj.max_jerk_y = 77777.0
     obj.printer = _Printer(None)
     obj._apply_auto_jerk()
-    assert obj.max_jerk == 77777.0
+    assert obj.max_jerk_x == 77777.0 and obj.max_jerk_y == 77777.0
+
+
+def test_move_jerk_per_axis_direction():
+    # The move's jerk ceiling is min over axes of max_jerk_axis / |axes_r|.
+    th = _MockTH()
+    obj = _mk_jl()
+    obj.max_jerk_x = 200000.0
+    obj.max_jerk_y = 100000.0
+    obj.max_jerk_z = 100000.0
+    # Pure X -> x limit; pure Y -> y limit.
+    mx = _MockMove(th, (0, 0, 0, 0), (10, 0, 0, 10), 400)
+    my = _MockMove(th, (0, 0, 0, 0), (0, 10, 0, 10), 400)
+    assert abs(obj._move_jerk(mx) - 200000.0) < 1e-6
+    assert abs(obj._move_jerk(my) - 100000.0) < 1e-6
+    # 45 deg: each axis r = 1/sqrt(2); binding axis is Y (lower limit).
+    md = _MockMove(th, (0, 0, 0, 0), (10, 10, 0, 14), 400)
+    assert abs(obj._move_jerk(md) - 100000.0 / (1.0 / math.sqrt(2))) < 1e-3
