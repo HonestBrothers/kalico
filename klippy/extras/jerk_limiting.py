@@ -333,6 +333,20 @@ class JerkLimiting:
         self.round_corners = config.getboolean("round_corners", False)
         # Parameters
         self.max_jerk = config.getfloat("max_jerk", 100000.0, above=0.0)
+        # Per-axis jerk ceilings (mm/s^3). X and Y have different moving mass and
+        # resonance, so each gets its own limit; each defaults to the scalar
+        # max_jerk. A move's jerk ceiling is set by its most binding axis (see
+        # _move_jerk), exactly as limited_cartesian derives per-move accel from
+        # per-axis caps. Z defaults to max_jerk and only binds pure-Z moves.
+        self.max_jerk_x = config.getfloat(
+            "max_jerk_x", self.max_jerk, above=0.0
+        )
+        self.max_jerk_y = config.getfloat(
+            "max_jerk_y", self.max_jerk, above=0.0
+        )
+        self.max_jerk_z = config.getfloat(
+            "max_jerk_z", self.max_jerk, above=0.0
+        )
         self.resolution = config.getfloat("resolution", 0.002, above=0.0)
         self.corner_max_deviation = config.getfloat(
             "corner_max_deviation", 0.05, above=0.0
@@ -401,33 +415,49 @@ class JerkLimiting:
         if self.auto_jerk:
             self._apply_auto_jerk()
 
-    def _measured_fn(self):
-        # Lowest configured input-shaper frequency across axes (Hz), or None.
-        # The lowest mode is the most excitation-prone, so it sets the most
-        # conservative (smallest) jerk ceiling.
+    def _measured_fn_per_axis(self):
+        # {axis: input-shaper frequency (Hz)} for the axes that have one. Each
+        # axis's own measured resonance sets that axis's jerk ceiling.
         ins = self.printer.lookup_object("input_shaper", None)
         if ins is None:
-            return None
-        freqs = []
+            return {}
+        out = {}
         for sh in ins.get_shapers():
             f = getattr(getattr(sh, "params", None), "shaper_freq", 0.0)
             if f and f > 0.0:
-                freqs.append(f)
-        return min(freqs) if freqs else None
+                out[sh.get_axis()] = f
+        return out
+
+    def _axis_max_accel(self, axis_idx):
+        # Per-axis max accel (limited_cartesian exposes max_accels), else the
+        # toolhead's scalar max_accel.
+        if hasattr(self.toolhead, "get_kinematics"):
+            accels = getattr(self.toolhead.get_kinematics(), "max_accels", None)
+            if accels is not None and axis_idx < len(accels):
+                return accels[axis_idx]
+        return self.toolhead.max_accel
 
     def _apply_auto_jerk(self, gcmd=None):
-        # max_jerk = auto_jerk_ratio * max_accel * f_n from the measured
-        # resonance; keep the configured value if no frequency is available.
-        f_n = self._measured_fn()
-        if f_n is None:
+        # Per axis: max_jerk_<axis> = auto_jerk_ratio * max_accel_axis * f_n_axis
+        # from that axis's measured input-shaper frequency. Axes without a
+        # frequency keep their configured value.
+        freqs = self._measured_fn_per_axis()
+        if not freqs:
             msg = ("auto_jerk: no input_shaper frequency available; keeping "
-                   "configured max_jerk=%.0f" % self.max_jerk)
+                   "configured jerk limits (x=%.0f y=%.0f)"
+                   % (self.max_jerk_x, self.max_jerk_y))
         else:
-            max_accel = self.toolhead.max_accel
-            self.max_jerk = self.auto_jerk_ratio * max_accel * f_n
-            msg = ("auto_jerk: max_jerk=%.0f mm/s^3 "
-                   "(%.2f * max_accel %.0f * f_n %.1f Hz)"
-                   % (self.max_jerk, self.auto_jerk_ratio, max_accel, f_n))
+            parts = []
+            for ax, idx in (("x", 0), ("y", 1)):
+                f = freqs.get(ax)
+                if not f:
+                    continue
+                a = self._axis_max_accel(idx)
+                jv = self.auto_jerk_ratio * a * f
+                setattr(self, "max_jerk_" + ax, jv)
+                parts.append("%s=%.0f (a=%.0f, f=%.1fHz)" % (ax, jv, a, f))
+            msg = ("auto_jerk: %.2f * max_accel * f_n -> %s"
+                   % (self.auto_jerk_ratio, ", ".join(parts)))
         if gcmd is not None:
             gcmd.respond_info(msg)
         else:
@@ -458,13 +488,28 @@ class JerkLimiting:
                 return a
         return move.accel
 
+    def _move_jerk(self, move):
+        # Directional jerk ceiling from the per-axis limits. Each axis sees jerk
+        # j*|axes_r[axis]|, so to keep every axis within its own limit the move
+        # jerk is min over axes of (max_jerk_axis / |axes_r[axis]|) -- the same
+        # construction limited_cartesian uses for per-move accel. A move with no
+        # X/Y/Z component falls back to the scalar max_jerk.
+        j = None
+        for axis, jmax in ((0, self.max_jerk_x), (1, self.max_jerk_y),
+                           (2, self.max_jerk_z)):
+            r = abs(move.axes_r[axis])
+            if r > 1e-12:
+                cand = jmax / r
+                j = cand if j is None else min(j, cand)
+        return self.max_jerk if j is None else j
+
     def _jerk_for(self, move):
         # Blend (corner) moves get a higher jerk allowance so the small residual
         # velocity change left after the velocity cap can ramp instead of
         # falling back to constant max-accel. See corner_max_jerk.
         if self.corner_max_jerk and getattr(move, "_jl_blend", False):
             return self.corner_max_jerk
-        return self.max_jerk
+        return self._move_jerk(move)
 
     def reach(self, move, u0, dist):
         # Max reachable u = v^2 over `dist`, jerk-limited, using this move's
@@ -514,12 +559,12 @@ class JerkLimiting:
             if not (m.cruise_v > m.start_v + 1e-9
                     and abs(m.cruise_v - m.end_v) < 1e-6):
                 return False
-            d = dist_jerk(m.start_v, m.cruise_v, m.accel, self.max_jerk)
+            d = dist_jerk(m.start_v, m.cruise_v, m.accel, self._jerk_for(m))
         else:
             if not (m.cruise_v > m.end_v + 1e-9
                     and abs(m.cruise_v - m.start_v) < 1e-6):
                 return False
-            d = dist_jerk(m.end_v, m.cruise_v, m.accel, self.max_jerk)
+            d = dist_jerk(m.end_v, m.cruise_v, m.accel, self._jerk_for(m))
         return d >= m.move_d - 1e-6
 
     def _collinear(self, a, b):
@@ -548,6 +593,9 @@ class JerkLimiting:
         # speed); the run uses the most conservative of them.
         A = min(self.accel_limit(moves[k], moves[k].cruise_v)
                 for k in range(i, j + 1))
+        # The run is collinear, so all moves share a direction and one jerk
+        # ceiling -- take it from the first move.
+        J = self._jerk_for(moves[i])
         # Clamp the run's end velocity to what is actually reachable from v0
         # over the run length under the jerk limit. The per-move velocities come
         # from independent symmetric-ramp reachability, so the single coalesced
@@ -557,11 +605,11 @@ class JerkLimiting:
         # becomes a trapq position discontinuity -> stepcompress error. This
         # mirrors the peak_velocity() guard plan_segments() already applies to
         # single moves.
-        reach = reach_v2(v0 * v0, total_d, A, self.max_jerk,
+        reach = reach_v2(v0 * v0, total_d, A, J,
                          self.toolhead.max_velocity)
         if vend * vend > reach:
             vend = math.sqrt(max(reach, 0.0))
-        slices = ramp_slices(v0, vend, A, self.max_jerk, self.resolution)
+        slices = ramp_slices(v0, vend, A, J, self.resolution)
         covered = sum(s[6] for s in slices)
         filler = total_d - covered
         if filler > 1e-9 and vend > 1e-9:
@@ -708,6 +756,9 @@ class JerkLimiting:
             "blend_junctions": self.blend_junctions,
             "round_corners": self.round_corners,
             "max_jerk": self.max_jerk,
+            "max_jerk_x": self.max_jerk_x,
+            "max_jerk_y": self.max_jerk_y,
+            "max_jerk_z": self.max_jerk_z,
             "corner_max_deviation": self.corner_max_deviation,
             "corner_min_seg_len": self.corner_min_seg_len,
             "corner_max_jerk": self.corner_max_jerk,
@@ -728,7 +779,18 @@ class JerkLimiting:
                 setattr(self, attr, bool(v))
         j = gcmd.get_float("MAX_JERK", None, above=0.0)
         if j is not None:
+            # Convenience: set the base and all axes at once.
             self.max_jerk = j
+            self.max_jerk_x = self.max_jerk_y = self.max_jerk_z = j
+        jx = gcmd.get_float("MAX_JERK_X", None, above=0.0)
+        if jx is not None:
+            self.max_jerk_x = jx
+        jy = gcmd.get_float("MAX_JERK_Y", None, above=0.0)
+        if jy is not None:
+            self.max_jerk_y = jy
+        jz = gcmd.get_float("MAX_JERK_Z", None, above=0.0)
+        if jz is not None:
+            self.max_jerk_z = jz
         dev = gcmd.get_float("CORNER_MAX_DEVIATION", None, above=0.0)
         if dev is not None:
             self.corner_max_deviation = dev
@@ -755,10 +817,12 @@ class JerkLimiting:
     def cmd_JERK_LIMIT_STATUS(self, gcmd):
         gcmd.respond_info(
             "jerk_limiting: enabled=%s smooth_ramps=%s blend_junctions=%s "
-            "round_corners=%s max_jerk=%.0f corner_max_deviation=%.3f "
-            "corner_max_jerk=%.0f corner_min_seg_len=%.3f"
+            "round_corners=%s max_jerk x/y/z=%.0f/%.0f/%.0f "
+            "corner_max_deviation=%.3f corner_max_jerk=%.0f "
+            "corner_min_seg_len=%.3f"
             % (self.enabled, self.smooth_ramps, self.blend_junctions,
-               self.round_corners, self.max_jerk, self.corner_max_deviation,
+               self.round_corners, self.max_jerk_x, self.max_jerk_y,
+               self.max_jerk_z, self.corner_max_deviation,
                self.corner_max_jerk, self.corner_min_seg_len)
         )
 
