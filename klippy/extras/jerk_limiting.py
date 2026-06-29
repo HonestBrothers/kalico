@@ -21,6 +21,7 @@
 # Copyright (C) 2026
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import logging
 import math
 
 # ---------------------------------------------------------------------------
@@ -356,9 +357,26 @@ class JerkLimiting:
         self.corner_max_jerk = config.getfloat(
             "corner_max_jerk", 0.0, minval=0.0
         )
+        # Auto-derive the scalar max_jerk from the input shaper's measured
+        # resonant frequency. A jerk-limited ramp lasts T_j = a/J, with its
+        # first spectral null near 1/T_j; keeping energy out of the lowest mode
+        # f_n wants T_j >= 1/f_n, i.e. J <= a * f_n. So set
+        #   max_jerk = auto_jerk_ratio * max_accel * f_n   (ratio <= 1 = margin)
+        # from the lowest measured axis frequency (most excitation-prone),
+        # replacing the folklore "max_jerk ~ 20-50 * max_accel" with a value
+        # tied to the machine's actual resonance. Falls back to the configured
+        # max_jerk when no shaper frequency is available; recompute after a
+        # fresh SHAPER_CALIBRATE with SET_JERK_LIMIT AUTO=1.
+        self.auto_jerk = config.getboolean("auto_jerk", False)
+        self.auto_jerk_ratio = config.getfloat(
+            "auto_jerk_ratio", 1.0, above=0.0
+        )
         self.toolhead = None
         self.printer.register_event_handler(
             "klippy:connect", self._handle_connect
+        )
+        self.printer.register_event_handler(
+            "klippy:ready", self._handle_ready
         )
         gcode = self.printer.lookup_object("gcode")
         gcode.register_command(
@@ -377,6 +395,43 @@ class JerkLimiting:
                 "Only one [jerk_limiting] section is allowed"
             )
         self.toolhead.jerk_limiting = self
+
+    def _handle_ready(self):
+        # Apply auto-derived jerk once everything (incl. input_shaper) is up.
+        if self.auto_jerk:
+            self._apply_auto_jerk()
+
+    def _measured_fn(self):
+        # Lowest configured input-shaper frequency across axes (Hz), or None.
+        # The lowest mode is the most excitation-prone, so it sets the most
+        # conservative (smallest) jerk ceiling.
+        ins = self.printer.lookup_object("input_shaper", None)
+        if ins is None:
+            return None
+        freqs = []
+        for sh in ins.get_shapers():
+            f = getattr(getattr(sh, "params", None), "shaper_freq", 0.0)
+            if f and f > 0.0:
+                freqs.append(f)
+        return min(freqs) if freqs else None
+
+    def _apply_auto_jerk(self, gcmd=None):
+        # max_jerk = auto_jerk_ratio * max_accel * f_n from the measured
+        # resonance; keep the configured value if no frequency is available.
+        f_n = self._measured_fn()
+        if f_n is None:
+            msg = ("auto_jerk: no input_shaper frequency available; keeping "
+                   "configured max_jerk=%.0f" % self.max_jerk)
+        else:
+            max_accel = self.toolhead.max_accel
+            self.max_jerk = self.auto_jerk_ratio * max_accel * f_n
+            msg = ("auto_jerk: max_jerk=%.0f mm/s^3 "
+                   "(%.2f * max_accel %.0f * f_n %.1f Hz)"
+                   % (self.max_jerk, self.auto_jerk_ratio, max_accel, f_n))
+        if gcmd is not None:
+            gcmd.respond_info(msg)
+        else:
+            logging.info(msg)
 
     # -- queried by the toolhead lookahead/emitter (all no-ops when off) --
     def retime_active(self):
@@ -683,6 +738,16 @@ class JerkLimiting:
         msl = gcmd.get_float("CORNER_MIN_SEG_LEN", None, above=0.0)
         if msl is not None:
             self.corner_min_seg_len = msl
+        ratio = gcmd.get_float("AUTO_JERK_RATIO", None, above=0.0)
+        if ratio is not None:
+            self.auto_jerk_ratio = ratio
+        auto = gcmd.get_int("AUTO", None)
+        if auto is not None:
+            self.auto_jerk = bool(auto)
+        # Re-derive max_jerk from the current shaper frequency when AUTO/ratio
+        # is touched (e.g. after a fresh SHAPER_CALIBRATE) and auto_jerk is on.
+        if self.auto_jerk and (auto is not None or ratio is not None):
+            self._apply_auto_jerk(gcmd)
         self.cmd_JERK_LIMIT_STATUS(gcmd)
 
     cmd_JERK_LIMIT_STATUS_help = "Report jerk limiting configuration"

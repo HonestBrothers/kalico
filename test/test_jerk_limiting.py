@@ -371,3 +371,49 @@ def test_c_trapq_accepts_jerk_slices():
     assert abs(total - 60.0) < 0.02
     assert abs(moves[0].start_v) < 1e-6
     assert abs(prev_v) < 0.5
+
+
+def test_auto_jerk_from_shaper_frequency():
+    # max_jerk = auto_jerk_ratio * max_accel * (lowest axis f_n); the lowest
+    # mode is the most excitation-prone, so it sets the most conservative jerk.
+    # With no input shaper frequency available, the configured value is kept.
+    class _Params:
+        def __init__(self, f):
+            self.shaper_freq = f
+
+    class _Shaper:
+        def __init__(self, f):
+            self.params = _Params(f)
+
+    class _Ins:
+        def __init__(self, *freqs):
+            self._s = [_Shaper(f) for f in freqs]
+
+        def get_shapers(self):
+            return self._s
+
+    class _TH:
+        max_accel = 20000.0
+
+    class _Printer:
+        def __init__(self, ins):
+            self._ins = ins
+
+        def lookup_object(self, name, default=None):
+            return self._ins if name == "input_shaper" else default
+
+    obj = jl.JerkLimiting.__new__(jl.JerkLimiting)
+    obj.max_jerk = 100000.0
+    obj.auto_jerk_ratio = 1.0
+    obj.toolhead = _TH()
+    obj.printer = _Printer(_Ins(52.0, 41.0))  # lowest mode 41 Hz
+    obj._apply_auto_jerk()
+    assert abs(obj.max_jerk - 1.0 * 20000.0 * 41.0) < 1e-6
+    obj.auto_jerk_ratio = 0.5  # margin
+    obj._apply_auto_jerk()
+    assert abs(obj.max_jerk - 0.5 * 20000.0 * 41.0) < 1e-6
+    # No input shaper -> configured value retained.
+    obj.max_jerk = 77777.0
+    obj.printer = _Printer(None)
+    obj._apply_auto_jerk()
+    assert obj.max_jerk == 77777.0
