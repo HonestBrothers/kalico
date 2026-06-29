@@ -448,3 +448,16 @@ def test_move_jerk_per_axis_direction():
     # 45 deg: each axis r = 1/sqrt(2); binding axis is Y (lower limit).
     md = _MockMove(th, (0, 0, 0, 0), (10, 10, 0, 14), 400)
     assert abs(obj._move_jerk(md) - 100000.0 / (1.0 / math.sqrt(2))) < 1e-3
+
+
+def test_reach_in_lookahead_has_no_cruise_v():
+    # reach() runs during lookahead (calc_junction / flush) BEFORE
+    # set_junction(), so the move has no cruise_v yet. It must evaluate its
+    # accel ceiling at max_cruise_v2 and not raise. Regression for the
+    # "'Move' object has no attribute 'cruise_v'" shutdown when jerk is enabled.
+    th = _MockTH()
+    obj = _mk_jl()
+    m = _MockMove(th, (0, 0, 0, 0), (50, 0, 0, 50), 300)
+    del m.cruise_v  # emulate the pre-set_junction lookahead state
+    u = obj.reach(m, 0.0, 20.0)
+    assert u > 0.0  # reachable velocity^2, computed without cruise_v
