@@ -155,9 +155,11 @@ class TorqueCurveCalibrate:
         self.calibration_results = []
         self._skip_accel = {}
         self._recommended_shaper = None  # (name, freq) from the last sweep
+        self._resume = False
         self.vibration_rows = []
         self._vib_file = None
         self._vib_path = None
+        self._progress_file = None
         self._baseline = None
         # Running Klipper-format resonance spectrum built from the residual
         # ringing of the real test moves -- fed to the stock shaper fitter at
@@ -992,7 +994,27 @@ class TorqueCurveCalibrate:
         self._skip_accel = {}  # {speed: first accel that lost steps, or None}
         self._recommended_shaper = None
         self._vib_file = None
+        self._progress_file = None
         self._vib_caldata = None
+
+        # Resume: reload completed speeds + the saved PSD; otherwise clear any
+        # stale PSD checkpoint so a later RESUME can't pick up an old run's data.
+        completed = set()
+        if self._resume:
+            completed = self._load_progress()
+            self._load_psd_checkpoint()
+            gcmd.respond_info(
+                "RESUME: %d speeds already done (%s); skipping them"
+                % (len(completed),
+                   ", ".join("%.0f" % s for s in sorted(completed))
+                   or "none"))
+        else:
+            try:
+                if os.path.exists(self._psd_path()):
+                    os.remove(self._psd_path())
+            except OSError:
+                pass
+        self._completed_speeds = completed
 
         gcmd.respond_info("Starting torque curve calibration on %s axis"
                          % self.test_axis.upper())
@@ -1094,6 +1116,13 @@ class TorqueCurveCalibrate:
                 if not self.calibration_running:
                     gcmd.respond_info("Calibration aborted by user")
                     break
+
+                # RESUME: already checkpointed -> reuse, don't re-run.
+                if test_speed in self._completed_speeds:
+                    gcmd.respond_info(
+                        "[%d/%d] Speed %.0f mm/s: from checkpoint"
+                        % (speed_idx + 1, len(speeds), test_speed))
+                    continue
 
                 gcmd.respond_info(
                     "\n[%d/%d] Testing speed: %.0f mm/s"
@@ -1217,6 +1246,11 @@ class TorqueCurveCalibrate:
                 # never skipped) -- the measured upper bound the mode margins
                 # are derived against.
                 self._skip_accel[test_speed] = skip_accel
+                # Checkpoint this speed (result + PSD) so an interruption only
+                # costs the in-progress speed, not the whole sweep.
+                self._write_progress_row(
+                    test_speed, last_good_accel, skip_accel)
+                self._save_psd_checkpoint()
                 gcmd.respond_info(
                     "  Result: %.0f mm/s -> max accel %.0f mm/s^2"
                     % (test_speed, last_good_accel)
@@ -1236,10 +1270,14 @@ class TorqueCurveCalibrate:
             # close the handle here so even an aborted/shut-down sweep keeps
             # everything captured up to the failure point.
             self._close_vibration_csv(gcmd)
+            self._close_progress()
             self.calibration_running = False
 
-        # Filter out failed results (accel = 0)
-        valid_results = [r for r in self.calibration_results if r[1] > 0]
+        # Filter out failed results (accel = 0); sort by speed so a resumed run
+        # (loaded checkpoint rows + newly-run speeds) is always ascending.
+        valid_results = sorted(
+            (r for r in self.calibration_results if r[1] > 0),
+            key=lambda r: r[0])
 
         if len(valid_results) >= 2:
             # Save results
@@ -1414,6 +1452,98 @@ class TorqueCurveCalibrate:
         stem = os.path.splitext(os.path.basename(self.output_file))[0]
         return out_dir, stem
 
+    # --- Resume checkpoints ---------------------------------------------------
+    def _progress_path(self):
+        out_dir, stem = self._output_dir_stem()
+        return os.path.join(
+            out_dir, "%s_%s_progress.csv" % (stem, self.test_axis))
+
+    def _psd_path(self):
+        out_dir, stem = self._output_dir_stem()
+        return os.path.join(
+            out_dir, "%s_%s_psd.npz" % (stem, self.test_axis))
+
+    def _write_progress_row(self, speed, last_good, skip):
+        """Append one completed speed's result, flushed to disk, so RESUME can
+        skip it. Lazily opens (append on resume, truncate+header otherwise)."""
+        if self._progress_file is None:
+            path = self._progress_path()
+            self._progress_file = open(path, "a" if self._resume else "w")
+            if self._progress_file.tell() == 0:
+                self._progress_file.write(
+                    "# Per-speed checkpoint for RESUME (axis %s)\n"
+                    "speed,last_good_accel,first_skip_accel\n"
+                    % self.test_axis.upper())
+        self._progress_file.write(
+            "%.2f,%.2f,%s\n"
+            % (speed, last_good, "" if skip is None else "%.2f" % skip))
+        self._progress_file.flush()
+        os.fsync(self._progress_file.fileno())
+
+    def _close_progress(self):
+        if self._progress_file is not None:
+            try:
+                self._progress_file.close()
+            finally:
+                self._progress_file = None
+
+    def _load_progress(self):
+        """Read the checkpoint into calibration_results + _skip_accel and
+        return the set of completed speeds (empty if none / no file)."""
+        path = self._progress_path()
+        done = set()
+        if not os.path.exists(path):
+            return done
+        with open(path) as f:
+            for line in f:
+                if line[:1] == "#" or line.startswith("speed"):
+                    continue
+                p = line.strip().split(",")
+                if len(p) < 2:
+                    continue
+                speed, last_good = float(p[0]), float(p[1])
+                skip = float(p[2]) if len(p) > 2 and p[2] != "" else None
+                self.calibration_results.append((speed, last_good))
+                self._skip_accel[speed] = skip
+                done.add(speed)
+        return done
+
+    def _save_psd_checkpoint(self):
+        """Persist the accumulated resonance spectrum so the shaper graph
+        survives an interruption. Cheap enough to write once per speed."""
+        cd = self._vib_caldata
+        if cd is None:
+            return
+        try:
+            import numpy as np
+            np.savez(self._psd_path(), freq_bins=cd.freq_bins,
+                     psd_x=cd.psd_x, psd_y=cd.psd_y, psd_z=cd.psd_z,
+                     psd_sum=cd.psd_sum)
+        except Exception:
+            logging.exception(
+                "torque_curve_calibrate: PSD checkpoint save failed")
+
+    def _load_psd_checkpoint(self):
+        """Rebuild the PSD accumulator from a saved checkpoint, if present."""
+        path = self._psd_path()
+        if not os.path.exists(path):
+            return
+        sc = self._shaper_calibrate()
+        if sc is None:
+            return
+        try:
+            import numpy as np
+            from . import shaper_calibrate
+            d = np.load(path)
+            cd = shaper_calibrate.CalibrationData(
+                d["freq_bins"], d["psd_sum"], d["psd_x"], d["psd_y"],
+                d["psd_z"])
+            cd.set_numpy(sc.numpy)
+            self._vib_caldata = cd
+        except Exception:
+            logging.exception(
+                "torque_curve_calibrate: PSD checkpoint load failed")
+
     def _write_vibration_row(self, row):
         """Append one probe's metrics to the CSV, flushing immediately.
 
@@ -1426,7 +1556,8 @@ class TorqueCurveCalibrate:
             self._vib_path = os.path.join(
                 out_dir, "%s_%s_vibration.csv" % (stem, self.test_axis)
             )
-            self._vib_file = open(self._vib_path, "w")
+            self._vib_file = open(self._vib_path, "a" if self._resume else "w")
+        if self._vib_file.tell() == 0:
             fn = self._shaper_freq()
             self._vib_file.write(
                 "# Vibration sweep on %s axis (input shaping %s)\n"
@@ -1604,6 +1735,10 @@ class TorqueCurveCalibrate:
         self.apply_shaper = bool(gcmd.get_int(
             "APPLY_SHAPER", 1 if self.apply_shaper else 0, minval=0, maxval=1
         ))
+        # RESUME=1 continues an interrupted sweep: speeds already checkpointed
+        # to <stem>_<axis>_progress.csv are skipped, their results + the saved
+        # PSD accumulator are reloaded, and new data is appended.
+        self._resume = bool(gcmd.get_int("RESUME", 0, minval=0, maxval=1))
         # Resolve the accel chip if vibration was just enabled at runtime.
         if self.measure_vibration and self.accel_chip is None:
             self.accel_chip = self._lookup_accel_chip()
