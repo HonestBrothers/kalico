@@ -698,7 +698,7 @@ class TorqueCurveCalibrate:
         except Exception:
             logging.exception("torque_curve_calibrate: shaper fit failed")
             return
-        out_dir, stem = self._output_dir_stem()
+        out_dir, stem = self._output_dir_stem("input_shaping")
         csv_path = os.path.join(
             out_dir, "%s_shaper_%s.csv" % (stem, self.test_axis))
         try:
@@ -1190,12 +1190,17 @@ class TorqueCurveCalibrate:
                 "Calibration incomplete - not enough valid data points"
             )
 
-    def _output_dir_stem(self):
-        """(<config_dir>/torque_curve, output-file stem); makes the dir."""
+    def _output_dir_stem(self, subdir="torque_curve"):
+        """(<config_dir>/end_game/<subdir>, output-file stem); makes the dir.
+
+        Everything this module produces lives under an `end_game/` parent, split
+        into `torque_curve/` (sweep results + vibration data) and
+        `input_shaping/` (resonance spectrum + shaper graph).
+        """
         config_file = self.printer.get_start_args().get("config_file")
         base_dir = (os.path.dirname(os.path.abspath(config_file))
                     if config_file else os.getcwd())
-        out_dir = os.path.join(base_dir, "torque_curve")
+        out_dir = os.path.join(base_dir, "end_game", subdir)
         os.makedirs(out_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(self.output_file))[0]
         return out_dir, stem
