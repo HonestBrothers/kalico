@@ -151,6 +151,11 @@ class TorqueCurveCalibrate:
         self._vib_file = None
         self._vib_path = None
         self._baseline = None
+        # Running Klipper-format resonance spectrum built from the residual
+        # ringing of the real test moves -- fed to the stock shaper fitter at
+        # the end of the sweep to produce the standard input-shaper graph.
+        self._vib_caldata = None
+        self._vib_sc = None
 
         # Register event handler
         self.printer.register_event_handler(
@@ -596,6 +601,9 @@ class TorqueCurveCalibrate:
             resid = bsig - (cmd - cmd.mean())
             resid_rms = float(np.sqrt((resid * resid).mean()))
             rfreqs, rspec = self._spectrum(np, bt, resid)
+            # Fold this probe's structural ringing into the running resonance
+            # spectrum for the end-of-sweep input-shaper graph.
+            self._accumulate_psd(np, bt, resid)
 
         # The MEASURED dominant mode of the residual (commanded removed) is the
         # truth; the configured shaper frequency is only a fallback when there's
@@ -631,6 +639,164 @@ class TorqueCurveCalibrate:
             "rd_afn": defloor_line(self._mag_at(np, rdfreqs, rdspec, fn)),
             "fn": fn or 0.0, "base_rms": base_rms,
         }
+
+    def _shaper_calibrate(self):
+        """Lazily build a stock ShaperCalibrate helper (or None if missing)."""
+        if self._vib_sc is None:
+            try:
+                from . import shaper_calibrate
+                self._vib_sc = shaper_calibrate.ShaperCalibrate(self.printer)
+            except Exception:
+                logging.exception(
+                    "torque_curve_calibrate: shaper_calibrate unavailable")
+                self._vib_sc = False
+        return self._vib_sc or None
+
+    def _accumulate_psd(self, np, times, resid):
+        """Fold one probe's residual ringing into the running PSD.
+
+        Each probe's commanded-removed signal is run through Klipper's own
+        calc_freq_response (same windowing/PSD as a resonance test), then
+        combined with add_data (element-wise max across bins) -- exactly how
+        the stock tester builds a spectrum across measurement points. The
+        result is a Klipper-format CalibrationData the shaper fitter can plot,
+        but excited by real moves instead of the canonical pulse sweep.
+        """
+        sc = self._shaper_calibrate()
+        if sc is None or times is None or len(times) < 8:
+            return
+        try:
+            n = len(times)
+            data = np.zeros((n, 4))
+            data[:, 0] = times
+            data[:, 1 + self._get_axis_index()] = resid
+            cd = sc.calc_freq_response(data)  # None if shorter than the window
+            if cd is None:
+                return
+            cd.set_numpy(sc.numpy)
+            if self._vib_caldata is None:
+                self._vib_caldata = cd
+            else:
+                self._vib_caldata.add_data(cd)
+        except Exception:
+            logging.exception(
+                "torque_curve_calibrate: PSD accumulation failed")
+
+    def _emit_shaper_graph(self, gcmd):
+        """Fit shapers to the accumulated real-move spectrum and write the
+        standard resonances CSV + a PNG graph (same as SHAPER_CALIBRATE)."""
+        cd = self._vib_caldata
+        sc = self._shaper_calibrate()
+        if cd is None or sc is None:
+            return
+        try:
+            cd.set_numpy(sc.numpy)
+            cd.normalize_to_frequencies()
+            systime = self.printer.get_reactor().monotonic()
+            scv = self.toolhead.get_status(systime)["square_corner_velocity"]
+            best, all_shapers = sc.find_best_shaper(cd, scv=scv, logger=None)
+        except Exception:
+            logging.exception("torque_curve_calibrate: shaper fit failed")
+            return
+        out_dir, stem = self._output_dir_stem()
+        csv_path = os.path.join(
+            out_dir, "%s_shaper_%s.csv" % (stem, self.test_axis))
+        try:
+            # accel_per_hz is a pulse-sweep concept we don't have; 0.0 is just a
+            # placeholder column so the stock grapher can read the CSV.
+            sc.save_calibration_data(csv_path, cd, all_shapers, accel_per_hz=0.0)
+            gcmd.respond_info("Resonance spectrum -> %s" % csv_path)
+        except Exception:
+            logging.exception("torque_curve_calibrate: CSV write failed")
+        if best is not None:
+            gcmd.respond_info(
+                "Recommended %s shaper (from real moves): %s @ %.1f Hz "
+                "(vibr=%.1f%%, smoothing~=%.2f, accel<=%.0f)"
+                % (self.test_axis.upper(), best.name, best.freq,
+                   best.vibrs * 100.0, best.smoothing,
+                   round(best.max_accel / 100.0) * 100.0))
+        png_path = self._plot_shaper(cd, all_shapers, best, out_dir, stem)
+        if png_path:
+            gcmd.respond_info("Resonance graph -> %s" % png_path)
+
+    def _plot_shaper(self, cd, shapers, best, out_dir, stem):
+        """Render a SHAPER_CALIBRATE-style PNG (PSD + shaper response curves).
+
+        Mirrors scripts/calibrate_shaper.plot_freq_response but headless (Agg)
+        and trimmed to the single test axis.
+        """
+        try:
+            import matplotlib
+            matplotlib.rcParams.update({"figure.autolayout": True})
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import matplotlib.font_manager
+            import matplotlib.ticker
+        except Exception:
+            logging.exception("torque_curve_calibrate: matplotlib unavailable")
+            return None
+        try:
+            max_freq = 200.0
+            freqs = cd.freq_bins
+            freqs = freqs[freqs <= max_freq]
+            psd = cd.get_psd(self.test_axis)[:len(freqs)]
+            # find_best_shaper already trims shaper.vals to <= max_freq; align
+            # every series to that common length.
+            if shapers:
+                m = min(len(freqs), len(shapers[0].vals))
+                freqs, psd = freqs[:m], psd[:m]
+
+            fontP = matplotlib.font_manager.FontProperties()
+            fontP.set_size("x-small")
+            fig, ax = plt.subplots()
+            ax.set_xlabel("Frequency, Hz")
+            ax.set_xlim([0, max_freq])
+            ax.set_ylabel("Power spectral density")
+            ax.plot(freqs, psd, label=self.test_axis.upper(), color="purple")
+            shaper_f = self._shaper_freq()
+            if shaper_f:
+                ax.axvline(shaper_f, color="orange", linestyle=":",
+                           label="configured %.1f Hz" % shaper_f)
+            ax.set_title(
+                "Torque-sweep resonance and shapers (%s axis)"
+                % self.test_axis.upper())
+            ax.xaxis.set_minor_locator(matplotlib.ticker.MultipleLocator(5))
+            ax.grid(which="major", color="grey")
+            ax.grid(which="minor", color="lightgrey")
+
+            ax2 = ax.twinx()
+            ax2.set_ylabel("Shaper vibration reduction (ratio)")
+            best_vals = None
+            best_name = best.name if best is not None else None
+            for shaper in shapers:
+                label = "%s (%.1f Hz, vibr=%.1f%%, sm~=%.2f, accel<=%.0f)" % (
+                    shaper.name.upper(), shaper.freq, shaper.vibrs * 100.0,
+                    shaper.smoothing, round(shaper.max_accel / 100.0) * 100.0)
+                ls = "dotted" if shaper.name.startswith("smooth") else "dashed"
+                lw = 1.0
+                vals = shaper.vals[:len(freqs)]
+                if shaper.name == best_name:
+                    ls, lw, best_vals = "dashdot", 2.0, vals
+                ax2.plot(freqs, vals, label=label,
+                         linestyle=ls, linewidth=lw)
+            if best_vals is not None:
+                ax.plot(freqs, psd * best_vals, label="After shaper",
+                        color="cyan")
+                ax2.plot([], [], " ",
+                         label="Recommended: %s" % best_name.upper())
+            ax.legend(loc="upper left", prop=fontP)
+            ax2.legend(loc="upper right", prop=fontP)
+            ax.set_ylim(bottom=0)
+            ax2.set_ylim(bottom=0)
+
+            png_path = os.path.join(
+                out_dir, "%s_shaper_%s.png" % (stem, self.test_axis))
+            fig.savefig(png_path)
+            plt.close(fig)
+            return png_path
+        except Exception:
+            logging.exception("torque_curve_calibrate: plotting failed")
+            return None
 
     def _step_dist(self):
         """Step distance (mm) of the test axis stepper."""
@@ -771,6 +937,7 @@ class TorqueCurveCalibrate:
         self.calibration_results = []
         self.vibration_rows = []
         self._vib_file = None
+        self._vib_caldata = None
 
         gcmd.respond_info("Starting torque curve calibration on %s axis"
                          % self.test_axis.upper())
@@ -1097,6 +1264,8 @@ class TorqueCurveCalibrate:
                    "" if not shaper
                    else " -- configured input shaper is %.1f Hz" % shaper)
             )
+        # Fit shapers to the real-move spectrum and emit the input-shaper graph.
+        self._emit_shaper_graph(gcmd)
 
     def _save_results(self, gcmd, results):
         """Save calibration results to CSV file."""
