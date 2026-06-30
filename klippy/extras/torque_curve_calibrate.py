@@ -1337,7 +1337,7 @@ class TorqueCurveCalibrate:
             "# band=%.0f%% (median last-good->first-skip bracket); the calmer modes"
             % (band * 100.0),
             "# step down from it by fixed reliability offsets -- edit to taste:",
-            "#   speed=%.2f balanced=%.2f quality=%.2f safe=%.2f"
+            "#   BATSHIT_BENCHY=%.2f OG=%.2f ENDGAME=%.2f QUIET=%.2f"
             % (margins["speed"], margins["balanced"],
                margins["quality"], margins["safe"]),
             "#",
@@ -1350,23 +1350,24 @@ class TorqueCurveCalibrate:
         speed_shaper = ("    SET_INPUT_SHAPER SHAPER_FREQ_%s=0" % AX) if rec \
             else ("    # (shaper left as-is; nothing to disable)")
         body = "\n".join([
-            macro("MOTION_SPEED",
-                  "All-out: bare TOPP-RA, no shaping, no jerk limiting (%s)" % AX,
+            macro("BATSHIT_BENCHY",
+                  "Batshit benchy: bare TOPP-RA, no shaping/jerk (%s)" % AX,
                   margins["speed"], speed_shaper,
-                  "    SET_JERK_LIMIT ENABLE=0", "SPEED (bare TOPP-RA)"),
-            macro("MOTION_QUALITY",
-                  "Fast + quality: TOPP-RA + shaper + auto jerk (%s)" % AX,
+                  "    SET_JERK_LIMIT ENABLE=0",
+                  "BATSHIT BENCHY (bare TOPP-RA)"),
+            macro("ENDGAME",
+                  "Endgame: TOPP-RA + shaper + auto jerk (%s)" % AX,
                   margins["quality"], shaper_on(),
-                  "    SET_JERK_LIMIT ENABLE=1 AUTO=1", "QUALITY"),
-            macro("MOTION_BALANCED",
-                  "Shaped, no jerk smoothing (%s)" % AX,
+                  "    SET_JERK_LIMIT ENABLE=1 AUTO=1", "ENDGAME"),
+            macro("OG",
+                  "OG: shaped, no jerk smoothing (%s)" % AX,
                   margins["balanced"], shaper_on(),
-                  "    SET_JERK_LIMIT ENABLE=0", "BALANCED"),
-            macro("MOTION_SAFE",
-                  "Tall/delicate: TOPP-RA + shaper + gentle jerk (%s)" % AX,
+                  "    SET_JERK_LIMIT ENABLE=0", "OG"),
+            macro("QUIET",
+                  "Quiet: TOPP-RA + shaper + gentle jerk (%s)" % AX,
                   margins["safe"], shaper_on(),
                   "    SET_JERK_LIMIT ENABLE=1 AUTO=1 AUTO_JERK_RATIO=0.7",
-                  "SAFE"),
+                  "QUIET"),
         ])
         out_dir, _ = self._output_dir_stem("")  # end_game/ root
         path = os.path.join(out_dir, "motion_modes.cfg")
@@ -1384,8 +1385,8 @@ class TorqueCurveCalibrate:
         gcmd.respond_info(
             "Motion modes -> %s" % path)
         gcmd.respond_info(
-            "  MOTION_SPEED=%.2f MOTION_BALANCED=%.2f MOTION_QUALITY=%.2f "
-            "MOTION_SAFE=%.2f (x measured skip boundary, band=%.0f%%)"
+            "  BATSHIT_BENCHY=%.2f OG=%.2f ENDGAME=%.2f QUIET=%.2f "
+            "(x measured skip boundary, band=%.0f%%)"
             % (margins["speed"], margins["balanced"], margins["quality"],
                margins["safe"], band * 100.0))
 
