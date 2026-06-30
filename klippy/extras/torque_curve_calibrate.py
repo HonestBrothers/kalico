@@ -1349,25 +1349,34 @@ class TorqueCurveCalibrate:
         ])
         speed_shaper = ("    SET_INPUT_SHAPER SHAPER_FREQ_%s=0" % AX) if rec \
             else ("    # (shaper left as-is; nothing to disable)")
+        # Every ENABLE=1 mode sets all three phase flags explicitly -- they
+        # persist across SET_JERK_LIMIT calls, so a mode must fully define the
+        # jerk state or the previous mode's flags leak in. Benchy keeps ramps
+        # bare (smooth_ramps off) but rounds corners to carry speed through them
+        # (round_corners is independent of smooth_ramps and check_move-guarded).
+        jerk_benchy = ("    SET_JERK_LIMIT ENABLE=1 SMOOTH_RAMPS=0 "
+                       "BLEND_JUNCTIONS=0 ROUND_CORNERS=1")
+        jerk_endgame = ("    SET_JERK_LIMIT ENABLE=1 SMOOTH_RAMPS=1 "
+                        "BLEND_JUNCTIONS=1 ROUND_CORNERS=0 AUTO=1")
+        jerk_quiet = ("    SET_JERK_LIMIT ENABLE=1 SMOOTH_RAMPS=1 "
+                      "BLEND_JUNCTIONS=1 ROUND_CORNERS=0 AUTO=1 "
+                      "AUTO_JERK_RATIO=0.7")
         body = "\n".join([
             macro("BATSHIT_BENCHY",
-                  "Batshit benchy: bare TOPP-RA, no shaping/jerk (%s)" % AX,
-                  margins["speed"], speed_shaper,
-                  "    SET_JERK_LIMIT ENABLE=0",
-                  "BATSHIT BENCHY (bare TOPP-RA)"),
+                  "Batshit benchy: bare TOPP-RA + corner rounding, no "
+                  "shaping (%s)" % AX,
+                  margins["speed"], speed_shaper, jerk_benchy,
+                  "BATSHIT BENCHY (bare TOPP-RA + rounded corners)"),
             macro("ENDGAME",
                   "Endgame: TOPP-RA + shaper + auto jerk (%s)" % AX,
-                  margins["quality"], shaper_on(),
-                  "    SET_JERK_LIMIT ENABLE=1 AUTO=1", "ENDGAME"),
+                  margins["quality"], shaper_on(), jerk_endgame, "ENDGAME"),
             macro("OG",
                   "OG: shaped, no jerk smoothing (%s)" % AX,
                   margins["balanced"], shaper_on(),
                   "    SET_JERK_LIMIT ENABLE=0", "OG"),
             macro("QUIET",
                   "Quiet: TOPP-RA + shaper + gentle jerk (%s)" % AX,
-                  margins["safe"], shaper_on(),
-                  "    SET_JERK_LIMIT ENABLE=1 AUTO=1 AUTO_JERK_RATIO=0.7",
-                  "QUIET"),
+                  margins["safe"], shaper_on(), jerk_quiet, "QUIET"),
         ])
         out_dir, _ = self._output_dir_stem("")  # end_game/ root
         path = os.path.join(out_dir, "motion_modes.cfg")
