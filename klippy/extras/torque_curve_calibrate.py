@@ -143,6 +143,12 @@ class TorqueCurveCalibrate:
         self.baseline_time = config.getfloat(
             "baseline_time", 0.25, minval=0.0
         )
+        # When True, apply the shaper the real-move sweep recommends (live
+        # SET_INPUT_SHAPER) and stage it into SAVE_CONFIG. Off by default so a
+        # sweep never silently changes motion; flip per-run with APPLY_SHAPER=1.
+        # Applying it also closes the loop for auto_jerk, which derives per-axis
+        # max_jerk from the input_shaper frequency.
+        self.apply_shaper = config.getboolean("apply_shaper", False)
 
         # Internal state
         self.calibration_running = False
@@ -715,9 +721,53 @@ class TorqueCurveCalibrate:
                 % (self.test_axis.upper(), best.name, best.freq,
                    best.vibrs * 100.0, best.smoothing,
                    round(best.max_accel / 100.0) * 100.0))
+            self._apply_recommended_shaper(gcmd, sc, best)
         png_path = self._plot_shaper(cd, all_shapers, best, out_dir, stem)
         if png_path:
             gcmd.respond_info("Resonance graph -> %s" % png_path)
+
+    def _apply_recommended_shaper(self, gcmd, sc, best):
+        """Apply the recommended shaper live and stage it into SAVE_CONFIG.
+
+        Mirrors what SHAPER_CALIBRATE does. Gated behind apply_shaper /
+        APPLY_SHAPER (default off) so a sweep never silently changes motion.
+        Applying it also re-points auto_jerk, which reads the input_shaper
+        frequency, at this measured resonance.
+        """
+        if not self.apply_shaper:
+            gcmd.respond_info(
+                "    (APPLY_SHAPER=1 to set shaper_type_%s=%s shaper_freq_%s"
+                "=%.1f and stage SAVE_CONFIG)"
+                % (self.test_axis, best.name, self.test_axis, best.freq))
+            return
+        ins = self.printer.lookup_object("input_shaper", None)
+        if ins is None:
+            gcmd.respond_info(
+                "    APPLY_SHAPER requested but no [input_shaper] configured")
+            return
+        try:
+            # Live apply (SET_INPUT_SHAPER on the test axis).
+            sc.apply_params(ins, self.test_axis, best.name, best.freq)
+            # Stage into SAVE_CONFIG so it survives a restart once saved.
+            configfile = self.printer.lookup_object("configfile")
+            sc.save_params(configfile, self.test_axis, best.name, best.freq)
+        except Exception:
+            logging.exception(
+                "torque_curve_calibrate: applying shaper failed")
+            gcmd.respond_info("    failed to apply shaper (see klippy.log)")
+            return
+        gcmd.respond_info(
+            "    applied shaper_type_%s=%s shaper_freq_%s=%.1f (live); run "
+            "SAVE_CONFIG to persist."
+            % (self.test_axis, best.name, self.test_axis, best.freq))
+        # Close the loop: re-derive auto_jerk from the freq we just applied.
+        jl = self.printer.lookup_object("jerk_limiting", None)
+        if jl is not None and getattr(jl, "auto_jerk", False):
+            try:
+                jl._apply_auto_jerk(gcmd)
+            except Exception:
+                logging.exception(
+                    "torque_curve_calibrate: auto_jerk recompute failed")
 
     def _plot_shaper(self, cd, shapers, best, out_dir, stem):
         """Render a SHAPER_CALIBRATE-style PNG (PSD + shaper response curves).
@@ -1392,6 +1442,9 @@ class TorqueCurveCalibrate:
         self.baseline_time = gcmd.get_float(
             "BASELINE_TIME", self.baseline_time, minval=0.0
         )
+        self.apply_shaper = bool(gcmd.get_int(
+            "APPLY_SHAPER", 1 if self.apply_shaper else 0, minval=0, maxval=1
+        ))
         # Resolve the accel chip if vibration was just enabled at runtime.
         if self.measure_vibration and self.accel_chip is None:
             self.accel_chip = self._lookup_accel_chip()
