@@ -153,6 +153,8 @@ class TorqueCurveCalibrate:
         # Internal state
         self.calibration_running = False
         self.calibration_results = []
+        self._skip_accel = {}
+        self._recommended_shaper = None  # (name, freq) from the last sweep
         self.vibration_rows = []
         self._vib_file = None
         self._vib_path = None
@@ -721,6 +723,7 @@ class TorqueCurveCalibrate:
                 % (self.test_axis.upper(), best.name, best.freq,
                    best.vibrs * 100.0, best.smoothing,
                    round(best.max_accel / 100.0) * 100.0))
+            self._recommended_shaper = (best.name, best.freq)
             self._apply_recommended_shaper(gcmd, sc, best)
         png_path = self._plot_shaper(cd, all_shapers, best, out_dir, stem)
         if png_path:
@@ -986,6 +989,8 @@ class TorqueCurveCalibrate:
         self.calibration_running = True
         self.calibration_results = []
         self.vibration_rows = []
+        self._skip_accel = {}  # {speed: first accel that lost steps, or None}
+        self._recommended_shaper = None
         self._vib_file = None
         self._vib_caldata = None
 
@@ -1208,6 +1213,10 @@ class TorqueCurveCalibrate:
 
                 # Record result (0 means it skipped at the very first accel)
                 self.calibration_results.append((test_speed, last_good_accel))
+                # The lowest accel that lost steps at this speed (None if it
+                # never skipped) -- the measured upper bound the mode margins
+                # are derived against.
+                self._skip_accel[test_speed] = skip_accel
                 gcmd.respond_info(
                     "  Result: %.0f mm/s -> max accel %.0f mm/s^2"
                     % (test_speed, last_good_accel)
@@ -1235,10 +1244,150 @@ class TorqueCurveCalibrate:
         if len(valid_results) >= 2:
             # Save results
             self._save_results(gcmd, valid_results)
+            self._emit_motion_modes(gcmd, valid_results)
         else:
             gcmd.respond_info(
                 "Calibration incomplete - not enough valid data points"
             )
+
+    def _compute_mode_margins(self, valid_results):
+        """Mode SAFETY_MARGINs derived from the measured skip boundary.
+
+        The stored torque curve is the last accel that did NOT lose steps (the
+        measured boundary); SAFETY_MARGIN scales it. Skip data legitimately
+        pins only one thing -- how close to the edge it's safe to run -- so the
+        Speed margin is derived from `band`, the median bracket width between
+        last-good and first-skip accel ((As-Ag)/Ag): a crisp edge (small band)
+        lets Speed sit right under the boundary, a fuzzy/coarse one backs it
+        off. The calmer modes step down from Speed by fixed reliability offsets
+        (these are ride-quality choices, not skip-derived):
+
+            speed    = clamp(0.97 - band/2, 0.90, 0.97)
+            balanced = speed - 0.07
+            quality  = speed - 0.12
+            safe     = speed - 0.25   (all floored at 0.50)
+
+        Returns (margins_dict, band).
+        """
+        bands = []
+        for speed_v, ag in valid_results:
+            as_ = self._skip_accel.get(speed_v)
+            if as_ and ag > 0.0 and as_ > ag:
+                bands.append((as_ - ag) / ag)
+        if bands:
+            bands.sort()
+            band = bands[len(bands) // 2]  # median bracket width
+        else:
+            band = 0.06  # never skipped (accel_max-limited): nominal backoff
+        band = min(0.15, max(0.02, band))
+        speed = min(0.97, max(0.90, 0.97 - 0.5 * band))
+        margins = {
+            "speed": speed,
+            "balanced": speed - 0.07,
+            "quality": speed - 0.12,
+            "safe": speed - 0.25,
+        }
+        return ({k: round(max(0.5, v), 2) for k, v in margins.items()}, band)
+
+    def _emit_motion_modes(self, gcmd, valid_results):
+        """Write end_game/motion_modes.cfg: switchable gcode_macros that layer
+        the three calibrated knobs (TOPP-RA torque curve, input shaper, jerk
+        limiting) into named profiles from one sweep."""
+        margins, band = self._compute_mode_margins(valid_results)
+        ax = self.test_axis
+        AX = ax.upper()
+        curve = self.target_curve or "my_curve"
+        rec = self._recommended_shaper  # (name, freq) or None
+
+        def shaper_on():
+            if rec:
+                return ("    SET_INPUT_SHAPER SHAPER_TYPE_%s=%s "
+                        "SHAPER_FREQ_%s=%.1f" % (AX, rec[0], AX, rec[1]))
+            return ("    # no recommended shaper (run MEASURE_VIBRATION=1); "
+                    "leaving shaper as-is")
+
+        def macro(name, desc, margin, shaper_line, jerk_line, tag):
+            return "\n".join([
+                "[gcode_macro %s]" % name,
+                "description: %s" % desc,
+                "gcode:",
+                "    TORQUE_CURVE_SET NAME=%s ENABLE=1 SAFETY_MARGIN=%.2f"
+                % (curve, margin),
+                shaper_line,
+                jerk_line,
+                "    { action_respond_info(\"Motion mode: %s\") }" % tag,
+                "",
+            ])
+
+        rows = "\n".join(
+            "#   %8.0f  %12.0f  %s"
+            % (s, ag, ("%.0f" % self._skip_accel[s]
+                       if self._skip_accel.get(s) else "(no skip)"))
+            for s, ag in valid_results)
+        header = "\n".join([
+            "# Motion modes -- generated by TORQUE_CURVE_CALIBRATE (axis %s)" % AX,
+            "#",
+            "# Each macro layers the three calibrated knobs into a profile:",
+            "#   TOPP-RA torque curve (velocity-dependent accel ceiling),",
+            "#   input shaper (ringing cancellation), jerk limiting (S-curve).",
+            "# Switch any time, or call one from PRINT_START.",
+            "#",
+            "# SAFETY_MARGIN values are fractions of the MEASURED skip boundary",
+            "# (the last accel that did not lose steps). Speed is derived from",
+            "# band=%.0f%% (median last-good->first-skip bracket); the calmer modes"
+            % (band * 100.0),
+            "# step down from it by fixed reliability offsets -- edit to taste:",
+            "#   speed=%.2f balanced=%.2f quality=%.2f safe=%.2f"
+            % (margins["speed"], margins["balanced"],
+               margins["quality"], margins["safe"]),
+            "#",
+            "# Measured boundary per speed:",
+            "#     speed       last_good     first_skip",
+            rows,
+            "",
+            "",
+        ])
+        speed_shaper = ("    SET_INPUT_SHAPER SHAPER_FREQ_%s=0" % AX) if rec \
+            else ("    # (shaper left as-is; nothing to disable)")
+        body = "\n".join([
+            macro("MOTION_SPEED",
+                  "All-out: bare TOPP-RA, no shaping, no jerk limiting (%s)" % AX,
+                  margins["speed"], speed_shaper,
+                  "    SET_JERK_LIMIT ENABLE=0", "SPEED (bare TOPP-RA)"),
+            macro("MOTION_QUALITY",
+                  "Fast + quality: TOPP-RA + shaper + auto jerk (%s)" % AX,
+                  margins["quality"], shaper_on(),
+                  "    SET_JERK_LIMIT ENABLE=1 AUTO=1", "QUALITY"),
+            macro("MOTION_BALANCED",
+                  "Shaped, no jerk smoothing (%s)" % AX,
+                  margins["balanced"], shaper_on(),
+                  "    SET_JERK_LIMIT ENABLE=0", "BALANCED"),
+            macro("MOTION_SAFE",
+                  "Tall/delicate: TOPP-RA + shaper + gentle jerk (%s)" % AX,
+                  margins["safe"], shaper_on(),
+                  "    SET_JERK_LIMIT ENABLE=1 AUTO=1 AUTO_JERK_RATIO=0.7",
+                  "SAFE"),
+        ])
+        out_dir, _ = self._output_dir_stem("")  # end_game/ root
+        path = os.path.join(out_dir, "motion_modes.cfg")
+        try:
+            with open(path, "w") as f:
+                f.write(header + body)
+        except IOError:
+            logging.exception(
+                "torque_curve_calibrate: motion_modes write failed")
+            return
+        if not self.target_curve:
+            gcmd.respond_info(
+                "  note: set NAME= in the macros to your [torque_curve] (no "
+                "target_curve configured; used placeholder 'my_curve')")
+        gcmd.respond_info(
+            "Motion modes -> %s" % path)
+        gcmd.respond_info(
+            "  MOTION_SPEED=%.2f MOTION_BALANCED=%.2f MOTION_QUALITY=%.2f "
+            "MOTION_SAFE=%.2f (x measured skip boundary, band=%.0f%%)"
+            % (margins["speed"], margins["balanced"], margins["quality"],
+               margins["safe"], band * 100.0))
 
     def _output_dir_stem(self, subdir="torque_curve"):
         """(<config_dir>/end_game/<subdir>, output-file stem); makes the dir.
