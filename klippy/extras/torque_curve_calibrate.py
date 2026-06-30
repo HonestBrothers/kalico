@@ -1672,24 +1672,47 @@ class TorqueCurveCalibrate:
             "Vibration data -> %s (%d points)"
             % (self._vib_path, len(self.vibration_rows))
         )
-        # Measured resonance across the sweep: the MEDIAN of each probe's clean
-        # dominant mode. Median, not amplitude-weighted -- the structural mode
-        # is speed/accel-invariant and recurs across probes, while artifacts
-        # (near-skip stutter, residual leakage) are sparse but can be high
-        # amplitude; a weighted mean lets a few loud outliers hijack the number,
-        # the median ignores them. row col 8 = resid_fpeak (0 when no clean mode).
-        modes = sorted(r[8] for r in self.vibration_rows if r[8] > 0.0)
-        if modes:
-            mid = modes[len(modes) // 2]
+        # Measured resonance by speed-consistency (see _structural_resonance).
+        res = self._structural_resonance()
+        if res is not None:
+            mid, nspeeds, n = res
             shaper = self._shaper_freq()
             gcmd.respond_info(
-                "Measured %s resonance: %.1f Hz (median of %d clean probes)%s"
-                % (self.test_axis.upper(), mid, len(modes),
+                "Measured %s resonance: %.1f Hz (recurs across %d speeds, "
+                "%d probes)%s"
+                % (self.test_axis.upper(), mid, nspeeds, n,
                    "" if not shaper
                    else " -- configured input shaper is %.1f Hz" % shaper)
             )
         # Fit shapers to the real-move spectrum and emit the input-shaper graph.
         self._emit_shaper_graph(gcmd)
+
+    def _structural_resonance(self, window=8.0):
+        """Resonance frequency by speed-consistency, returned as
+        (freq, n_speeds, n_probes) or None.
+
+        A structural mode is a property of the axis, so it recurs at the same
+        frequency across the whole speed range; artifacts are confined to a
+        regime (near-skip stutter at high accel; degenerate sub-mm impulse moves
+        at never-skip speeds where the search ran to accel_max). So the right
+        estimator isn't the median or an amplitude-weighted mean -- both of
+        which a loud but speed-localized artifact can hijack -- but the
+        frequency where the most DISTINCT speeds pile up. Pick that center
+        (tie-break by probe count), then report its cluster's median.
+        Per-probe modes are row col 8 (resid_fpeak; 0 when no clean mode).
+        """
+        pr = [(r[0], r[8]) for r in self.vibration_rows if r[8] > 0.0]
+        if not pr:
+            return None
+        best_center, best_score = None, (-1, -1)
+        for _, fc in pr:
+            inwin = [f for s, f in pr if abs(f - fc) <= window]
+            nspeeds = len(set(s for s, f in pr if abs(f - fc) <= window))
+            score = (nspeeds, len(inwin))
+            if score > best_score:
+                best_score, best_center = score, fc
+        cluster = sorted(f for s, f in pr if abs(f - best_center) <= window)
+        return (cluster[len(cluster) // 2], best_score[0], len(cluster))
 
     def _save_results(self, gcmd, results):
         """Save calibration results to CSV file."""
