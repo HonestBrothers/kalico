@@ -150,12 +150,35 @@ class TorqueCurveCalibrate:
         # max_jerk from the input_shaper frequency.
         self.apply_shaper = config.getboolean("apply_shaper", False)
 
+        # Resonance-extraction band + peak prominence. The structural mode is a
+        # fixed property of the axis, so a probe's dominant residual peak should
+        # land in this band and stand clearly above the rest of the spectrum.
+        # Degenerate probes (microscopically short or near-skip high-accel moves)
+        # produce a flat/edge spectrum with no real peak; requiring prominence
+        # and rejecting band-edge peaks keeps that junk -- which would otherwise
+        # default to the search-window floor (~20 Hz) and drag the recommended
+        # frequency low -- out of the summary and the shaper graph.
+        self.resonance_min_freq = config.getfloat(
+            "resonance_min_freq", 25.0, minval=1.0)
+        self.resonance_max_freq = config.getfloat(
+            "resonance_max_freq", 150.0, above=0.0)
+        self.resonance_prominence = config.getfloat(
+            "resonance_prominence", 4.0, minval=1.0)
+        # Only fold probes accelerating below this fraction of the speed's
+        # measured skip boundary into the resonance spectrum. Right at the skip
+        # threshold the motor stutters (a strong low-frequency lurch) that isn't
+        # a structural mode; excluding the near-skip band keeps it out of the
+        # max-accumulated PSD that feeds the shaper graph.
+        self.resonance_accel_frac = config.getfloat(
+            "resonance_accel_frac", 0.85, above=0.0, maxval=1.0)
+
         # Internal state
         self.calibration_running = False
         self.calibration_results = []
         self._skip_accel = {}
         self._recommended_shaper = None  # (name, freq) from the last sweep
         self._resume = False
+        self._speed_resid_buffer = []  # per-speed (accel, (t, resid)) buffer
         self.vibration_rows = []
         self._vib_file = None
         self._vib_path = None
@@ -507,6 +530,30 @@ class TorqueCurveCalibrate:
             return 0.0
         return float(freqs[int(np.argmax(np.where(band, spec, 0.0)))])
 
+    def _dominant_mode(self, np, freqs, spec):
+        """Frequency of the dominant residual peak, or 0.0 if there isn't a
+        clean one. A real structural mode is a sharp interior peak that stands
+        well above the rest of the band; a degenerate or near-skip probe gives
+        a flat/edge spectrum with no such peak. Rejecting band-edge maxima and
+        requiring the peak to exceed resonance_prominence x the band median
+        keeps that junk from defaulting to the search-window floor (~the lo
+        bound) and biasing the recommended frequency low."""
+        lo, hi = self.resonance_min_freq, self.resonance_max_freq
+        if freqs is None or spec is None or len(spec) < 2:
+            return 0.0
+        idx = np.where((freqs >= max(lo, freqs[1])) & (freqs <= hi))[0]
+        if len(idx) < 5:
+            return 0.0
+        sb = spec[idx]
+        k = int(np.argmax(sb))
+        # No real interior peak -> the maximum sits at the band edge.
+        if k == 0 or k == len(sb) - 1:
+            return 0.0
+        med = float(np.median(sb))
+        if med <= 0.0 or float(sb[k]) < self.resonance_prominence * med:
+            return 0.0
+        return float(freqs[idx[k]])
+
     def _commanded_axis_accel(self, np, times):
         """Commanded test-axis acceleration (mm/s^2) at each print_time.
 
@@ -573,7 +620,7 @@ class TorqueCurveCalibrate:
             % self._baseline["rms"]
         )
 
-    def _vibration_metrics(self, cap):
+    def _vibration_metrics(self, cap, lost=False):
         """Reduce a capture dict to noise-floor-corrected vibration metrics.
 
         Three views of the probe, all de-floored against the baseline by
@@ -582,9 +629,11 @@ class TorqueCurveCalibrate:
           raw_*   -- burst, commanded NOT removed (contaminated; for contrast)
           resid_* -- burst with the commanded accel subtracted (#3)
           rd_*    -- stationary ring-down (commanded == 0)
-        f_n is the input-shaper frequency; absent that, the dominant mode of the
-        residual spectrum (the during-motion ring shows it clearly), NOT the
-        noise-dominated ring-down peak.
+        f_n is the dominant mode of the residual spectrum when it's a clean,
+        prominent peak; otherwise 0 (no mode found) and the configured shaper
+        frequency is used only as a fallback for the a_fn measurement. A probe
+        that lost steps, or whose residual has no prominent interior peak, is
+        kept out of the resonance spectrum (it's near-skip/degenerate junk).
         """
         if not cap or not cap.get("burst"):
             return None
@@ -606,23 +655,27 @@ class TorqueCurveCalibrate:
         # Residual: subtract the trapq-aligned commanded accel.
         resid_rms = 0.0
         rfreqs = rspec = None
+        resid = None
         cmd = self._commanded_axis_accel(np, bt)
         if cmd is not None:
             resid = bsig - (cmd - cmd.mean())
             resid_rms = float(np.sqrt((resid * resid).mean()))
             rfreqs, rspec = self._spectrum(np, bt, resid)
-            # Fold this probe's structural ringing into the running resonance
-            # spectrum for the end-of-sweep input-shaper graph.
-            self._accumulate_psd(np, bt, resid)
 
         # The MEASURED dominant mode of the residual (commanded removed) is the
-        # truth; the configured shaper frequency is only a fallback when there's
-        # no residual spectrum. Measuring a_fn at this empirical peak -- rather
-        # than a possibly-mistuned shaper value -- is what makes the sweep a
-        # rigorous resonance measurement (and a better input-shaper target than
-        # the canonical pulse sweep, since it excites with real moves).
-        resid_fpeak = self._peak_freq(np, rfreqs, rspec, 20.0, 160.0)
+        # truth -- but only when it's a clean, prominent peak; a degenerate or
+        # near-skip probe has no real peak and returns 0. The configured shaper
+        # frequency is the fallback used purely to place the a_fn measurement.
+        resid_fpeak = self._dominant_mode(np, rfreqs, rspec)
         fn = resid_fpeak or self._shaper_freq() or 0.0
+
+        # Hand the clean residual back for deferred, accel-gated accumulation:
+        # only in-sync probes (not lost) with a prominent mode are eligible;
+        # the per-speed accel cap (applied once the skip boundary is known) then
+        # drops the near-skip stutter band before it reaches the shaper PSD.
+        clean_resid = ((bt, resid)
+                       if resid is not None and not lost and resid_fpeak > 0.0
+                       else None)
 
         rd_rms = 0.0
         rdfreqs = rdspec = None
@@ -648,6 +701,7 @@ class TorqueCurveCalibrate:
             "rd_rms": defloor(rd_rms),
             "rd_afn": defloor_line(self._mag_at(np, rdfreqs, rdspec, fn)),
             "fn": fn or 0.0, "base_rms": base_rms,
+            "_clean_resid": clean_resid,
         }
 
     def _shaper_calibrate(self):
@@ -691,6 +745,20 @@ class TorqueCurveCalibrate:
         except Exception:
             logging.exception(
                 "torque_curve_calibrate: PSD accumulation failed")
+
+    def _accumulate_speed_psd(self, last_good):
+        """Fold a completed speed's buffered clean residuals into the PSD,
+        dropping probes within the near-skip stutter band (accel above
+        resonance_accel_frac x the speed's skip boundary)."""
+        if not self._speed_resid_buffer:
+            return
+        import numpy as np
+        cap = (self.resonance_accel_frac * last_good
+               if last_good > 0.0 else float("inf"))
+        for accel, (bt, resid) in self._speed_resid_buffer:
+            if accel <= cap:
+                self._accumulate_psd(np, bt, resid)
+        self._speed_resid_buffer = []
 
     def _emit_shaper_graph(self, gcmd):
         """Fit shapers to the accumulated real-move spectrum and write the
@@ -993,6 +1061,7 @@ class TorqueCurveCalibrate:
         self.vibration_rows = []
         self._skip_accel = {}  # {speed: first accel that lost steps, or None}
         self._recommended_shaper = None
+        self._speed_resid_buffer = []
         self._vib_file = None
         self._progress_file = None
         self._vib_caldata = None
@@ -1174,6 +1243,7 @@ class TorqueCurveCalibrate:
                 skip_accel = None  # lowest accel known to skip (upper bound)
                 growth = self.accel_growth
                 test_accel = start_accel
+                self._speed_resid_buffer = []  # this speed's clean residuals
                 while self.calibration_running:
                     # Clamp: never above accel_max, never at/above a known skip.
                     if test_accel > self.accel_max:
@@ -1189,7 +1259,7 @@ class TorqueCurveCalibrate:
                     lost, diff = self._check_for_lost_steps(ref_home)
 
                     if self.measure_vibration:
-                        vm = self._vibration_metrics(cap)
+                        vm = self._vibration_metrics(cap, lost)
                         if vm is not None:
                             row = (
                                 test_speed, test_accel, 1 if lost else 0, diff,
@@ -1199,6 +1269,11 @@ class TorqueCurveCalibrate:
                             )
                             self.vibration_rows.append(row)
                             self._write_vibration_row(row)  # flushed to disk
+                            # Buffer the clean residual for deferred, accel-gated
+                            # accumulation once this speed's skip edge is known.
+                            cr = vm.get("_clean_resid")
+                            if cr is not None:
+                                self._speed_resid_buffer.append((test_accel, cr))
                             # a@fn is measured at the detected mode (resid_fpeak)
                             # -- the de-floored amplitude of the real resonance.
                             gcmd.respond_info(
@@ -1246,6 +1321,10 @@ class TorqueCurveCalibrate:
                 # never skipped) -- the measured upper bound the mode margins
                 # are derived against.
                 self._skip_accel[test_speed] = skip_accel
+                # Now the skip boundary is known: fold this speed's clean,
+                # sub-skip-threshold residuals into the resonance spectrum
+                # (drops the near-skip stutter band).
+                self._accumulate_speed_psd(last_good_accel)
                 # Checkpoint this speed (result + PSD) so an interruption only
                 # costs the in-progress speed, not the whole sweep.
                 self._write_progress_row(
@@ -1593,19 +1672,19 @@ class TorqueCurveCalibrate:
             "Vibration data -> %s (%d points)"
             % (self._vib_path, len(self.vibration_rows))
         )
-        # Amplitude-weighted measured resonance across the sweep: the dominant
-        # mode frequency, weighted by how strongly each probe excited it. This
-        # is the rigorous input-shaper target (measured under real moves), to
-        # compare against the configured shaper frequency.
-        # row = (..., 8:resid_fpeak, 9:resid_afn, ...)
-        wsum = sum(r[9] for r in self.vibration_rows if r[8] > 0.0)
-        if wsum > 0.0:
-            mode = sum(r[8] * r[9] for r in self.vibration_rows
-                       if r[8] > 0.0) / wsum
+        # Measured resonance across the sweep: the MEDIAN of each probe's clean
+        # dominant mode. Median, not amplitude-weighted -- the structural mode
+        # is speed/accel-invariant and recurs across probes, while artifacts
+        # (near-skip stutter, residual leakage) are sparse but can be high
+        # amplitude; a weighted mean lets a few loud outliers hijack the number,
+        # the median ignores them. row col 8 = resid_fpeak (0 when no clean mode).
+        modes = sorted(r[8] for r in self.vibration_rows if r[8] > 0.0)
+        if modes:
+            mid = modes[len(modes) // 2]
             shaper = self._shaper_freq()
             gcmd.respond_info(
-                "Measured %s resonance: %.1f Hz (amplitude-weighted)%s"
-                % (self.test_axis.upper(), mode,
+                "Measured %s resonance: %.1f Hz (median of %d clean probes)%s"
+                % (self.test_axis.upper(), mid, len(modes),
                    "" if not shaper
                    else " -- configured input shaper is %.1f Hz" % shaper)
             )
