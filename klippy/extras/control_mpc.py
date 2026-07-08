@@ -28,6 +28,7 @@ class ControlMPC:
         self.last_loss_filament = 0.0
         self.last_time = 0.0
         self.last_temp_time = 0.0
+        self._melt_updates = 0  # temp samples since (re)creation; governor settle
 
         self.printer = heater.printer
         self.toolhead = None
@@ -327,6 +328,30 @@ class ControlMPC:
         self.last_loss_ambient = loss_ambient
         self.last_loss_filament = loss_filament
         self.last_temp_time = read_time
+
+        # --- Phase-0 sustained-flow governor -----------------------------
+        # Empirically discover the sustainable volumetric flow from heater
+        # saturation + block-temp droop, and publish a cap for the planner.
+        # No melt-enthalpy model yet (that's Phase 1); this only trims flow
+        # when the hotend visibly can't keep up. Inert unless melt_flow_nominal
+        # is set. settle_samples skips the governor right after a control swap
+        # while state_block_temp reconverges (avoids a stale-sag lurch).
+        ml = self.heater.melt_limiter
+        if ml.nominal > 0.0 and target_temp > 0.0:
+            self._melt_updates += 1
+            if self._melt_updates > ml.settle_samples:
+                saturated = self.last_power >= 0.99 * self.heater_max_power
+                sag = target_temp - self.state_block_temp
+                if saturated and sag > ml.sag_tol:
+                    ml.scale -= ml.derate * dt
+                elif (not saturated) and sag < 0.5 * ml.sag_tol:
+                    ml.scale += ml.recover * dt
+                ml.scale = min(1.0, max(ml.scale_min, ml.scale))
+            ml.flow_limit = ml.scale * ml.nominal
+        else:
+            ml.flow_limit = None
+            self._melt_updates = 0
+
         self.heater.set_pwm(read_time, duty)
 
     def filament_temp(self, read_time, ambient_temp):
@@ -361,6 +386,8 @@ class ControlMPC:
             "power": self.last_power,
             "loss_ambient": self.last_loss_ambient,
             "loss_filament": self.last_loss_filament,
+            "melt_flow_limit": self.heater.melt_limiter.flow_limit,
+            "melt_scale": self.heater.melt_limiter.scale,
             "filament_temp": self.filament_temp_src,
             "filament_heat_capacity": self.const_filament_heat_capacity,
             "filament_density": self.const_filament_density,

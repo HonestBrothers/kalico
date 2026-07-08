@@ -36,6 +36,28 @@ PID_PROFILE_OPTIONS = {
 }
 
 
+class MeltLimiter:
+    # Phase-0 sustained-flow governor state. Owned by the (persistent) Heater so
+    # it survives ControlMPC swaps on MPC_CALIBRATE / profile reload -- if it
+    # lived on ControlMPC the integrator would reset mid-print and surge flow.
+    # Fed by ControlMPC._update, consumed by PrinterExtruder.check_move. Fully
+    # inert (flow_limit stays None) unless 'melt_flow_nominal' is configured and
+    # the heater is under MPC control.
+    def __init__(self, config):
+        self.flow_limit = None  # mm^3/s cap for the planner; None => no limit
+        self.scale = 1.0        # governor integrator state (persists across swaps)
+        self.nominal = config.getfloat("melt_flow_nominal", 0.0, minval=0.0)
+        self.sag_tol = config.getfloat("melt_sag_tol", 3.0, above=0.0)
+        self.derate = config.getfloat("melt_derate_rate", 0.5, above=0.0)
+        self.recover = config.getfloat("melt_recover_rate", 0.2, above=0.0)
+        self.scale_min = config.getfloat(
+            "melt_scale_min", 0.2, minval=0.0, below=1.0
+        )
+        self.settle_samples = config.getint(
+            "melt_settle_samples", 20, minval=0
+        )
+
+
 class Heater:
     def __init__(self, config, sensor):
         self.printer = config.get_printer()
@@ -100,6 +122,8 @@ class Heater:
         self.control = self.lookup_control(
             self.pmgr.init_default_profile(), True
         )
+        # Sustained-flow (melt) governor state; persists across control swaps.
+        self.melt_limiter = MeltLimiter(config)
         self.gcode.register_mux_command(
             "SET_HEATER_TEMPERATURE",
             "HEATER",

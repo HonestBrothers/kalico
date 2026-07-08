@@ -561,6 +561,17 @@ class PrinterExtruder:
                 "See the 'max_extrude_cross_section' config option for details"
                 % (area, self.max_extrude_ratio * self.filament_area)
             )
+        # Sustained-flow (melt) limit for printing moves: cap cruise velocity so
+        # v * cross_section <= flow_limit (mm^3/s) from the MPC-driven
+        # MeltLimiter. Graceful slowdown -- limit_speed() only ever lowers.
+        # Uses axis_r (deposited volume per travel), so extruder pressure-advance
+        # spikes don't falsely trip it. No-op when flow_limit is None.
+        if axis_r > 0.0 and (move.axes_d[0] or move.axes_d[1]):
+            flow_limit = self.heater.melt_limiter.flow_limit
+            if flow_limit is not None:
+                area = axis_r * self.filament_area
+                if area > 0.0:
+                    move.limit_speed(flow_limit / area, move.accel)
 
     def calc_junction(self, prev_move, move):
         diff_r = move.axes_r[3] - prev_move.axes_r[3]
