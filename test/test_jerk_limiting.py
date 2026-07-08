@@ -247,6 +247,42 @@ def test_phase2_run_clamps_unreachable_end_velocity():
     assert abs(jl.dist_jerk(0.0, v_end, A, J) - total_d) < 1e-2
 
 
+def test_phase2_decel_run_clamps_unreachable_end_velocity():
+    # Regression (mirror of the accel case above, for the decel direction).
+    # A coalesced collinear DECEL run whose per-move velocities imply a single
+    # ramp v0 -> vend that needs to shed more speed than the run length allows.
+    # The original _plan_run reach clamp only guarded the accel direction
+    # (vend**2 > reach), so a decel run left `covered` > total_d, the cruise
+    # filler was skipped, and distribute_slices() dumped the leftover into the
+    # final move -- overshooting its endpoint by many steps. On hardware that is
+    # a trapq position discontinuity the step compressor rejects ("Internal
+    # error in stepcompress"), reachable via bed_mesh splitting a decelerating
+    # move into short collinear sub-moves. Each move must emit exactly its own
+    # length and the run must conserve total distance.
+    th = _MockTH()
+    obj = _mk_jl()
+    vels = [(200.0, 160.0), (160.0, 100.0), (100.0, 0.0)]
+    move_d = 2.0
+    moves = []
+    x = 0.0
+    for sv, ev in vels:
+        m = _MockMove(th, (x, 0, 0, x), (x + move_d, 0, 0, x + move_d), 400)
+        m.start_v, m.cruise_v, m.end_v = sv, sv, ev
+        moves.append(m)
+        x += move_d
+    total_d = move_d * len(moves)
+    # Precondition: the single ramp 200 -> 0 genuinely needs more than the run.
+    assert jl.dist_jerk(0.0, 200.0, A, J) > total_d
+    out = obj.plan_moves(moves)
+    assert all(o for o in out)
+    # No move overshoots its own length...
+    for k, m in enumerate(moves):
+        assert abs(sum(s[6] for s in out[k]) - m.move_d) < 1e-3
+    # ...and the run conserves total distance exactly.
+    emitted = sum(s[6] for pm in out for s in pm)
+    assert abs(emitted - total_d) < 1e-3
+
+
 def test_phase3_round_corner_conserves_and_bounds():
     th = _MockTH()
     obj = _mk_jl()
