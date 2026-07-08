@@ -679,11 +679,13 @@ class TorqueCurveCalibrate:
 
         rd_rms = 0.0
         rdfreqs = rdspec = None
+        rd_fn = rd_zeta = 0.0
         rd = self._axis_ac(np, cap.get("ringdown"))
         if rd is not None:
             rdt, rdsig = rd
             rd_rms = float(np.sqrt((rdsig * rdsig).mean()))
             rdfreqs, rdspec = self._spectrum(np, rdt, rdsig)
+            rd_fn, rd_zeta, _ = self._ringdown_decay(np, rdt, rdsig, fn)
 
         # De-floor the spectral line at f_n (quadrature vs the baseline at f_n)
         # -- this is the mode-isolated, noise-corrected ring amplitude.
@@ -700,9 +702,49 @@ class TorqueCurveCalibrate:
             "resid_afn": defloor_line(self._mag_at(np, rfreqs, rspec, fn)),
             "rd_rms": defloor(rd_rms),
             "rd_afn": defloor_line(self._mag_at(np, rdfreqs, rdspec, fn)),
+            "rd_fn": rd_fn, "rd_zeta": rd_zeta,
             "fn": fn or 0.0, "base_rms": base_rms,
             "_clean_resid": clean_resid,
         }
+
+    def _ringdown_decay(self, np, rdt, rdsig, fn):
+        """Damping ratio + free-decay frequency from the stationary ring-down.
+
+        rdt, rdsig come straight from _axis_ac(cap["ringdown"]). Returns
+        (f_free, zeta, r2); zeta is 0.0 when there is no clean exponential decay
+        (fit rejected). Pure post-processing of samples already captured -- no
+        change to the probe motion or capture.
+        """
+        if rdt is None or len(rdsig) < 32 or not fn:
+            return 0.0, 0.0, 0.0
+        n = len(rdsig)                        # analytic-signal envelope (numpy-only Hilbert)
+        h = np.zeros(n)
+        if n % 2 == 0:
+            h[0] = h[n // 2] = 1.0
+            h[1:n // 2] = 2.0
+        else:
+            h[0] = 1.0
+            h[1:(n + 1) // 2] = 2.0
+        env = np.abs(np.fft.ifft(np.fft.fft(rdsig) * h))
+        floor = (self._baseline or {}).get("rms", 0.0)
+        m = env > max(env.max() * 0.1, floor)  # fit only above the noise floor
+        if m.sum() < 16:
+            return 0.0, 0.0, 0.0
+        t = rdt[m] - rdt[m][0]
+        y = np.log(env[m])
+        A = np.vstack([t, np.ones_like(t)]).T
+        coef = np.linalg.lstsq(A, y, rcond=None)[0]   # slope = -zeta*2*pi*fn (log-decrement)
+        zeta = float(-coef[0] / (2.0 * np.pi * fn))
+        zc = np.count_nonzero(np.diff(np.signbit(rdsig[m])))
+        dur = float(t[-1] - t[0])
+        f_free = float(zc / (2.0 * dur)) if dur > 0.0 else 0.0
+        yhat = A.dot(coef)
+        ss = float(((y - yhat) ** 2).sum())
+        tot = float(((y - y.mean()) ** 2).sum())
+        r2 = 1.0 - ss / tot if tot > 0.0 else 0.0
+        if not (0.0 < zeta < 0.5) or r2 < 0.8:
+            return f_free, 0.0, r2             # keep free-decay freq, flag zeta unreliable
+        return f_free, zeta, r2
 
     def _shaper_calibrate(self):
         """Lazily build a stock ShaperCalibrate helper (or None if missing)."""
@@ -1266,6 +1308,7 @@ class TorqueCurveCalibrate:
                                 vm["base_rms"], vm["raw_rms"], vm["raw_fpeak"],
                                 vm["resid_rms"], vm["resid_fpeak"],
                                 vm["resid_afn"], vm["rd_rms"], vm["rd_afn"],
+                                vm["rd_fn"], vm["rd_zeta"],
                             )
                             self.vibration_rows.append(row)
                             self._write_vibration_row(row)  # flushed to disk
@@ -1648,13 +1691,13 @@ class TorqueCurveCalibrate:
                 "*_afn = de-floored amplitude at that measured mode (the clean "
                 "numbers); raw_* shown for contrast.\n"
                 "speed,accel,lost,drift_mm,base_rms,raw_rms,raw_fpeak,"
-                "resid_rms,resid_fpeak,resid_afn,rd_rms,rd_afn\n"
+                "resid_rms,resid_fpeak,resid_afn,rd_rms,rd_afn,rd_fn,rd_zeta\n"
                 % (self.test_axis.upper(),
                    "OFF/raw" if self.vibration_shaper_off else "ON",
                    "%.1f" % fn if fn else "n/a")
             )
         self._vib_file.write(
-            "%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f,%.2f,%.4f,%.4f,%.4f\n"
+            "%.2f,%.2f,%d,%.4f,%.4f,%.4f,%.2f,%.4f,%.2f,%.4f,%.4f,%.4f,%.2f,%.4f\n"
             % row
         )
         self._vib_file.flush()
