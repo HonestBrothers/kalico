@@ -611,13 +611,43 @@ class JerkLimiting:
         # becomes a trapq position discontinuity -> stepcompress error. This
         # mirrors the peak_velocity() guard plan_segments() already applies to
         # single moves.
-        reach = reach_v2(v0 * v0, total_d, A, J,
-                         self.toolhead.max_velocity)
-        if vend * vend > reach:
-            vend = math.sqrt(max(reach, 0.0))
+        # The clamp must cover BOTH ramp directions. An accel run (vend > v0)
+        # can name an end velocity that is unreachable from v0 within total_d;
+        # a decel run (vend < v0) can name an end velocity so low that the
+        # single coalesced ramp v0 -> vend needs more distance to shed than the
+        # run provides. Either way `covered` exceeds total_d, distribute_slices()
+        # overflows the excess into the final move (k >= len-1), and that
+        # endpoint overshoot becomes a trapq position discontinuity ->
+        # stepcompress error. reach_v2() is symmetric (dist_jerk is), so it
+        # bounds the decel floor as well as the accel ceiling.
+        if vend >= v0:
+            reach = reach_v2(v0 * v0, total_d, A, J,
+                             self.toolhead.max_velocity)
+            if vend * vend > reach:
+                vend = math.sqrt(max(reach, 0.0))
+        elif dist_jerk(vend, v0, A, J) > total_d:
+            # Cannot shed v0 -> vend within total_d; raise vend to the reachable
+            # floor -- the lowest end velocity whose ramp from v0 still fits.
+            lo, hi = vend, v0
+            for _ in range(48):
+                mid = 0.5 * (lo + hi)
+                if dist_jerk(mid, v0, A, J) > total_d:
+                    lo = mid
+                else:
+                    hi = mid
+            vend = hi
         slices = ramp_slices(v0, vend, A, J, self.resolution)
         covered = sum(s[6] for s in slices)
         filler = total_d - covered
+        if filler < -1e-9:
+            # Defensive: the coalesced ramp still overruns total_d (e.g. a
+            # velocity clamp above could not fully absorb it). Never overshoot a
+            # move endpoint -- fall back to independent per-move plans, which
+            # conserve each endpoint exactly at the cost of the Phase-2 blend for
+            # this run only.
+            for k in range(i, j + 1):
+                out[k] = self.plan_move(moves[k])
+            return
         if filler > 1e-9 and vend > 1e-9:
             slices.append((0.0, filler / vend, 0.0, vend, vend, 0.0, filler))
         dlist = [moves[k].move_d for k in range(i, j + 1)]
