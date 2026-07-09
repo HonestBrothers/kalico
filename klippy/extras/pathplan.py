@@ -23,13 +23,20 @@ class Constraints:
     v_ceil     -> hard speed ceiling (mm/s), e.g. the curve's top speed or the
                  machine max_velocity; the reachability integration stops here.
     dv_slice   -> velocity step (mm/s) for the a_max(v) reachability quadrature.
+    max_jerk   -> max |da/dt| (mm/s^3). None/0 = no jerk limiting (sharp
+                 constant-accel ladders). When set, emit_profile ramps the
+                 acceleration (Stage 3, approach A) so a(t) is continuous.
+    jerk_dt    -> integration time step (s) for the jerk-limited ramp.
     """
 
-    def __init__(self, a_of_v=None, a_const=None, v_ceil=1e9, dv_slice=25.0):
+    def __init__(self, a_of_v=None, a_const=None, v_ceil=1e9, dv_slice=25.0,
+                 max_jerk=None, jerk_dt=0.001):
         self._a_of_v = a_of_v
         self.a_const = a_const
         self.v_ceil = v_ceil
         self.dv_slice = dv_slice
+        self.max_jerk = max_jerk
+        self.jerk_dt = jerk_dt
 
     def a_max(self, v):
         if self._a_of_v is not None:
@@ -137,6 +144,109 @@ def plan_batch(move_d, v_cap, v_junction, cons):
     return vs, vc, ve
 
 
+def _ramp_up_jerk(v0, v1, cons, collect=True):
+    # Jerk-limited acceleration ramp taking velocity v0 -> v1 (v1 >= v0). The
+    # acceleration starts at ~0, rises toward a_max(v) bounded by |da/dt| <=
+    # max_jerk, then falls back to ~0 landing on v1 -- so a(t) is continuous
+    # (no hard accel step). Integrated at fixed jerk_dt; the last slice lands
+    # exactly on v1 (velocity continuity is exact). Returns (slices, total_d);
+    # slices is None when collect=False (distance-only, for peak bisection).
+    #
+    # The taper is enforced by a "brake" cap a_brake = sqrt(2*J*(v1-v)): along
+    # it da/dt = -J exactly, so following min(a_curve, a_brake, a+J*dt)
+    # guarantees a bounded rise (a+J*dt) and a jerk-feasible fall to 0 at v1.
+    J = cons.max_jerk
+    dt0 = cons.jerk_dt
+    slices = [] if collect else None
+    total = 0.0
+    if v1 <= v0 + 1e-12 or J is None or J <= 0.0:
+        return slices, total
+    v = v0
+    a = 0.0
+    guard = 0
+    while v < v1 - 1e-9:
+        guard += 1
+        if guard > 500000:
+            break
+        rem = v1 - v
+        a_curve = cons.a_max(v)
+        if a_curve is None or a_curve <= 0.0:
+            a_curve = cons.a_const if cons.a_const else 1e30
+        a_brake = math.sqrt(2.0 * J * rem)
+        a_new = min(a_curve, a_brake, a + J * dt0)
+        if a_new <= 0.0:
+            a_new = min(a_curve, a_brake)
+            if a_new <= 0.0:
+                break
+        v_next = v + a_new * dt0
+        this_dt = dt0
+        if v_next >= v1:
+            v_next = v1
+            this_dt = (v1 - v) / a_new
+        dist = 0.5 * (v + v_next) * this_dt
+        if collect:
+            slices.append((this_dt, 0.0, 0.0, v, v_next, a_new, dist))
+        total += dist
+        v, a = v_next, a_new
+    return slices, total
+
+
+def _decel_from_accel(acc_slices):
+    # Time-reverse an increasing-velocity jerk ramp into a decel slice list:
+    # an accel slice (dt,0,0, v_lo, v_hi, a, dist) becomes decel
+    # (0,0,dt, v_hi, v_hi, a, dist) (velocity v_hi -> v_lo). Reversed order so
+    # the chain runs vc -> ve and stays velocity-continuous.
+    dec = []
+    for (at, ct, dt, sv, cv, a, dist) in reversed(acc_slices):
+        dec.append((0.0, 0.0, at, cv, cv, a, dist))
+    return dec
+
+
+def _peak_velocity_jerk(vs, ve, move_d, cons):
+    # Highest cruise a jerk-limited move can reach: bisection on the ramp
+    # distance (accel vs->vp plus decel vp->ve). Returns max(vs,ve) when even
+    # that connecting ramp overfills move_d (caller then falls back to sharp).
+    lo = max(vs, ve)
+    hi = cons.v_ceil
+    need_lo = (_ramp_up_jerk(vs, lo, cons, collect=False)[1]
+               + _ramp_up_jerk(ve, lo, cons, collect=False)[1])
+    if need_lo >= move_d:
+        return lo
+    for _ in range(32):
+        mid = 0.5 * (lo + hi)
+        need = (_ramp_up_jerk(vs, mid, cons, collect=False)[1]
+                + _ramp_up_jerk(ve, mid, cons, collect=False)[1])
+        if need > move_d:
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
+def _emit_jerk(vs, vc, ve, move_d, cons):
+    # Jerk-limited profile: ramp vs->vc, cruise, ramp vc->ve. Returns None when
+    # the move is too short to jerk-limit even at the connecting peak, so the
+    # caller falls back to the sharp emit (which uses full a_max and always fits
+    # what the lookahead already approved).
+    vc = max(vc, vs, ve)
+    acc, d_acc = _ramp_up_jerk(vs, vc, cons)
+    dec_acc, d_dec = _ramp_up_jerk(ve, vc, cons)
+    cruise_d = move_d - d_acc - d_dec
+    if cruise_d < -1e-9:
+        vc = max(_peak_velocity_jerk(vs, ve, move_d, cons), vs, ve)
+        acc, d_acc = _ramp_up_jerk(vs, vc, cons)
+        dec_acc, d_dec = _ramp_up_jerk(ve, vc, cons)
+        cruise_d = move_d - d_acc - d_dec
+        if cruise_d < -1e-6 * max(1.0, move_d):
+            return None
+        cruise_d = max(0.0, cruise_d)
+    segs = list(acc)
+    if cruise_d > 1e-9 and vc > 1e-9:
+        segs.append((0.0, cruise_d / vc, 0.0, vc, vc, 0.0, cruise_d))
+    segs.extend(_decel_from_accel(dec_acc))
+    return segs
+
+
 def emit_profile(vs, vc, ve, move_d, cons):
     """Emit ONE monotonic constant-accel segment list for a single move.
 
@@ -145,9 +255,19 @@ def emit_profile(vs, vc, ve, move_d, cons):
     construction: non-negative times/speeds, no decel past zero, per-segment
     trapq-implied distance == dist, inter-segment velocity continuity, and
     sum(dist) == move_d. (This is the jl-stepguard check made structural.)
+
+    When cons.max_jerk is set, the acceleration is ramped (Stage 3, approach A)
+    so a(t) is continuous; on a move too short to jerk-limit, it falls back to
+    the sharp constant-accel profile (which always fits what the a_max
+    lookahead approved).
     """
     if move_d <= 0.0:
         return []
+    if getattr(cons, "max_jerk", None):
+        segs = _emit_jerk(vs, vc, ve, move_d, cons)
+        if segs is not None:
+            return segs
+        # else: jerk-infeasible for this short move -> sharp fallback below
     vc = max(vc, vs, ve)
     d_acc = dist_change(vs, vc, cons)
     d_dec = dist_change(ve, vc, cons)

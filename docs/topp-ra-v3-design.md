@@ -92,13 +92,29 @@ Delivered as a tested pure-math library + `[model_inverse_ff]` Klipper object
 the C seam lands). The C seam (`ff_*_calc_position` in kin_shaper.c, smoothed
 v/a for continuity) is the next step and rides Stage 3.
 
-## Jerk (the honest wrinkle)
+## Jerk (the honest wrinkle) — approach (A) BUILT
 TOPP-RA is 2nd-order (`u`, `u'`); jerk is 3rd-order (`s⃛`). Options:
-- (A) approximate: curvature / rate limit on `u(s)` (cheap, in-plane; what the
-  smoothing already approaches).
-- (B) exact: 3rd-order reachability carrying `s̈` as a state (one extra dim,
-  more compute).
-Decide by required fidelity. Start with (A).
+- (A) approximate: rate-limit the acceleration inside the emitter (cheap,
+  in-plane). **CHOSEN + built.**
+- (B) exact: 3rd-order reachability carrying `s̈` as a state (one extra dim).
+
+Approach (A) in `pathplan._ramp_up_jerk`: integrate the accel phase at fixed
+`jerk_dt`, `a_new = min(a_max(v), a_brake, a_prev + J·dt)`. The brake cap
+`a_brake = sqrt(2J·(v1−v))` has `da/dt = −J` along it, so following it makes
+`a` rise ≤`J·dt` per step and taper to ~0 at the phase boundary — `a(t)` is
+continuous. Decel = time-reversed accel ramp. Feasibility stays a_max-based:
+a move too short to jerk-limit falls back per-move to the sharp profile (which
+always fits what the lookahead approved). `max_jerk=None` = byte-for-byte sharp.
+
+**Discrete taper floor & why it matters here:** the last brake slice lands with
+residual accel ≤ `2·J·dt0` (partial slice triggers at `rem ≤ a·dt0`
+⟹ `a ≤ 2J·dt0`). That residual is the *only* accel discontinuity left, and it
+is FF-safe by design: mapped through the FF accel coefficient `b2 = 1/ωₙ²`, the
+motor-position jump is `b2·2J·dt0` — measured **0.0008 mm** (vs a 0.0125 mm
+step) for the 77 Hz mode at `J=1e5, dt0=1ms`. So **Stage 3 is precisely the
+precondition that makes the Stage-4 accel term (`b2·a`) crash-safe**: it turns
+the hard trapezoid accel step (0.085 mm FF jump = crash) into a sub-step taper.
+Config: `[printer] unified_max_jerk` (0=off), `unified_jerk_dt` (default 1ms).
 
 ## Migration stages
 1. **Unify emission** — one feasible `u(s)` → one monotonic step pass; retire
