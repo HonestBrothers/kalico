@@ -56,11 +56,30 @@ x_motor(s) = y(s) + (2ζ/ωₙ)·y'(s)·ṡ + (1/ωₙ²)·[y'(s)·s̈ + y''(s)�
 
 ## Klipper insertion points
 - Emission seam: `toolhead.py _process_moves` (today loops jerk/topp slices →
-  `trapq_append`). Becomes: emit the single feasible profile.
-- FF seam: `kin_shaper.c` already modifies the stepper *kinematic position
-  function* (not a naive command convolution) — reuse that exact hook, replace
-  the impulse-sum with `x += (2ζ/ωₙ)·v + (1/ωₙ²)·a` from the trapq's pos/vel/
-  accel at time t. Cheap in the C hot path.
+  `trapq_append`). Becomes: emit the single feasible profile. **DONE** (Stage
+  1+2, `unified_planner` flag).
+- FF seam: `kin_shaper.c` modifies the stepper *kinematic position function*.
+  **DONE** (Stage 4 C): `ff_calc_axis` computes `y + c1·v + c2·a` from the
+  trapq move's pos/vel/accel at time t (v=start_v+2·half_accel·t, a=2·half_accel
+  — pointwise, no time shift), gated per axis behind `ff_x/ff_y.enabled`.
+  `input_shaper_set_ff_params(sk, axis, enabled, c1, c2)` sets it and clears any
+  pulses/smoother on that axis (FF replaces the shaper; step-gen window → 0).
+  `model_inverse_ff.py` wraps the steppers (same input_shaper struct) and pushes
+  the 2nd-order coeffs. Verified: `test/test_ff_seam.c` calls the compiled
+  `calc_position_cb` and matches `y+p1·v+p2·a` to 0.0 error.
+
+## FF realization: 2nd-order pointwise vs 4th-order (robustness)
+The C seam realizes the **2nd-order** exact inverse `x = y + p1·v + p2·a`
+(`p1=2ζ_eff/ωₙ`, `p2=1/ωₙ²`) because v and a are the only derivatives the
+constant-accel trapq exposes pointwise. Robustness widens the zero damping
+`ζ_eff = ζ + r·(ζ_wide−ζ)` — a clean, wider 2nd-order notch at ωₙ (notch depth
+on jω = 2ζ_eff), realizable from v,a alone. This does NOT give the ZVD
+frequency-insensitivity (`dF/dω|ωₙ=0`), which needs the 4th-order `b3·jerk +
+b4·snap` terms and hence a C³ trajectory carrying jerk & snap — deferred; ωₙ
+drift is instead handled by re-identifying the mode from ring-down. The
+4th-order `b1..b4` remain in FFParams as the analysis/target model.
+- Mutually exclusive with `[input_shaper]` on the same axis (FF replaces it).
+- Off by default (`freq_*`=0). Enabling wraps steppers + pushes coeffs.
 
 ## Robustness knob (Stage 4, built)
 `model_inverse_ff.py` `FFParams` interpolates the inverse between two forms:

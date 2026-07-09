@@ -114,6 +114,39 @@ def test_headroom_and_inflation():
           % (exc, jump))
 
 
+def test_pointwise_coeffs():
+    # The C seam applies the 2nd-order pointwise inverse x = y + p1*v + p2*a.
+    p = mff.FFParams(F0, Z0, robustness=0.0)
+    assert approx(p.p2, 1.0 / (WN0 * WN0))
+    assert approx(p.zeta_eff, Z0)
+    assert approx(p.p1, 2.0 * Z0 / WN0)  # == c1 at r=0 (exact cancellation)
+    # 2nd-order zero sits at wn with damping zeta_eff -> on the jw-axis the
+    # notch bottoms at 2*zeta_eff.
+    w = WN0
+    depth = abs(complex(1.0 - p.p2 * w * w, p.p1 * w))
+    assert approx(depth, 2.0 * p.zeta_eff, tol=1e-9)
+    print("  pointwise p1=2*zeta_eff/wn, p2=1/wn^2, notch depth=2*zeta_eff OK")
+
+
+def test_pointwise_robustness_widens_notch():
+    # Robustness widens the zero damping zeta_eff -> deeper-but-narrower (r=0)
+    # to wider-but-shallower (r=1). p1 grows, p2 fixed, notch depth grows.
+    lo = mff.FFParams(F0, Z0, robustness=0.0)
+    hi = mff.FFParams(F0, Z0, robustness=1.0, zeta_wide=0.15)
+    assert hi.zeta_eff > lo.zeta_eff
+    assert hi.p1 > lo.p1
+    assert approx(hi.p2, lo.p2)  # accel coeff unchanged
+    assert approx(hi.zeta_eff, 0.15)  # reaches the wide target at r=1
+    # monotonic
+    prev = -1.0
+    for r in (0.0, 0.25, 0.5, 0.75, 1.0):
+        pe = mff.FFParams(F0, Z0, robustness=r).zeta_eff
+        assert pe >= prev - 1e-15
+        prev = pe
+    print("  pointwise robustness widens zeta_eff %.4f->%.4f (p2 fixed) OK"
+          % (lo.zeta_eff, hi.zeta_eff))
+
+
 def test_augment_reduces_to_shift_at_constant_v():
     # At constant velocity (a=0) the FF is a pure position lead b1*v -- an
     # identity on constant-speed motion up to a fixed spatial offset, exactly
@@ -132,6 +165,8 @@ def main():
     test_robustness_monotone()
     test_robustness_flattens_sensitivity()
     test_headroom_and_inflation()
+    test_pointwise_coeffs()
+    test_pointwise_robustness_widens_notch()
     test_augment_reduces_to_shift_at_constant_v()
     print("ALL PASS")
 
