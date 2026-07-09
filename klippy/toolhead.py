@@ -8,6 +8,7 @@ import logging
 import math
 
 from . import chelper
+from .extras import pathplan
 from .extras.danger_options import get_danger_options
 from .kinematics import extruder
 
@@ -360,6 +361,12 @@ class ToolHead:
         self.square_corner_velocity = config.getfloat(
             "square_corner_velocity", 5.0, minval=0.0
         )
+        # topp-ra-v3 Stage 1+2: when set, _process_moves emits every kinematic
+        # move through the single unified phase-plane emitter (pathplan.
+        # emit_profile) instead of the jerk-slice / topp per-move chains. The
+        # emitter's monotonic invariant holds by construction, so it removes the
+        # stepcompress "Invalid sequence" family. Off by default (opt-in on v3).
+        self.unified_emit = config.getboolean("unified_planner", False)
         self.orig_cfg = {}
         self.orig_cfg["max_velocity"] = self.max_velocity
         self.orig_cfg["max_accel"] = self.max_accel
@@ -524,6 +531,26 @@ class ToolHead:
                 self.print_time,
             )
 
+    def _pathplan_cons(self, move):
+        # Build the pathplan.Constraints oracle for one move. When TOPP-RA is
+        # active the phase-plane a_max(v) is the torque curve (and reachability
+        # matches what the lookahead already solved via topp.reach); otherwise
+        # it is the move's constant accel, and a huge dv_slice makes
+        # emit_profile collapse to the stock single accel/cruise/decel
+        # trapezoid (identical geometry, one extra structural guarantee).
+        topp = getattr(self, "topp_ra", None)
+        if topp is not None and topp.active_for(move):
+            return pathplan.Constraints(
+                a_of_v=topp.get_max_accel_for_speed,
+                a_const=move.accel,
+                v_ceil=topp.speeds[-1],
+                dv_slice=topp.dv_slice,
+            )
+        v_ceil = max(move.cruise_v, move.start_v, move.end_v) + 1.0
+        return pathplan.Constraints(
+            a_of_v=None, a_const=move.accel, v_ceil=v_ceil, dv_slice=1e18
+        )
+
     def _process_moves(self, moves):
         # Resync print_time if necessary
         if self.special_queuing_state:
@@ -536,6 +563,11 @@ class ToolHead:
         next_move_time = self.print_time
         topp = getattr(self, "topp_ra", None)
         jl = getattr(self, "jerk_limiting", None)
+        # Unified phase-plane emitter (topp-ra-v3): one monotonic emit per move,
+        # replacing the jerk-slice / topp per-move chains. The lookahead has
+        # already solved the boundary velocities (move.start_v/cruise_v/end_v)
+        # honoring the same reachability; emit_profile just renders them.
+        unified = self.unified_emit
         # Jerk limiting plans the whole batch at once (it coalesces collinear
         # runs into single ramps); it returns None for any move it doesn't
         # reshape, which then falls back to TOPP-RA's per-move plan. Jerk rides
@@ -543,10 +575,20 @@ class ToolHead:
         # move. Both emit the identical (accel_t, cruise_t, decel_t, start_v,
         # cruise_v, accel, dist) slice tuple consumed below.
         seg_lists = (jl.plan_moves(moves)
-                     if (jl is not None and jl.retime_active()) else None)
+                     if (not unified and jl is not None and jl.retime_active())
+                     else None)
         for idx, move in enumerate(moves):
             move_dur = move.accel_t + move.cruise_t + move.decel_t
-            segs = seg_lists[idx] if seg_lists is not None else None
+            segs = None
+            if unified and move.is_kinematic_move:
+                # `or None` sends a degenerate empty profile back to the stock
+                # path rather than emitting a zero-duration move.
+                segs = pathplan.emit_profile(
+                    move.start_v, move.cruise_v, move.end_v,
+                    move.move_d, self._pathplan_cons(move)
+                ) or None
+            if segs is None and seg_lists is not None:
+                segs = seg_lists[idx]
             if segs is None and move.is_kinematic_move and topp is not None:
                 segs = topp.plan_move(move)
             if segs is not None:
