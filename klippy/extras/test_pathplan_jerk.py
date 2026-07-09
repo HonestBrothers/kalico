@@ -114,6 +114,58 @@ def test_disabled_matches_sharp():
     print("  max_jerk=None identical to sharp path OK")
 
 
+def test_ff_short_move_no_hard_step():
+    # Regression for the 2026-07-09 hardware crash: short print-junction moves
+    # (large velocity change over a short distance) fell back to a SHARP profile
+    # (hard accel step); the model-inverse FF's p2*a term turned that into a
+    # multi-step position jump -> stepcompress 'Invalid sequence'. With max_da
+    # set (FF active), the emitter must keep every accel step small enough that
+    # p2*da stays below one motor step, on every feasible move.
+    p2 = 1.0 / (2.0 * math.pi * 77.0) ** 2   # 77 Hz Y mode
+    step = 1.0 / 80.0
+    max_da = 0.3 * step / p2
+    cons = pathplan.Constraints(a_of_v=None, a_const=15000.0, v_ceil=500.0,
+                                dv_slice=1e18, max_jerk=1.0e5, jerk_dt=0.001,
+                                max_da=max_da)
+    worst = 0.0
+    n = 0
+    for d in (0.2, 0.4, 0.6, 1.0, 1.5, 2.0, 3.0):
+        for vs, ve, vc in [(10, 80, 200), (0, 120, 300), (5, 150, 250),
+                           (30, 30, 120), (80, 10, 200)]:
+            # skip inputs the lookahead could never emit (unreachable even at
+            # constant accel over the move length)
+            if abs(ve * ve - vs * vs) / (2.0 * 15000.0) > d + 1e-9:
+                continue
+            segs = pathplan.emit_profile(vs, vc, ve, d, cons)
+            check_segs(segs, d, vs, ve, "ffshort %g,%g,%g,%g" % (vs, vc, ve, d))
+            prev = 0.0
+            mda = 0.0
+            for s in segs:
+                mda = max(mda, abs(s[5] - prev))
+                prev = s[5]
+            mda = max(mda, prev)
+            ff_jump = p2 * mda
+            assert ff_jump < step, ("FF jump exceeds a step", vs, ve, d,
+                                    ff_jump, step)
+            worst = max(worst, ff_jump)
+            n += 1
+    print("  FF short-move: %d feasible moves, worst FF jump %.5fmm (<%.5f) OK"
+          % (n, worst, step))
+
+
+def test_maxda_off_matches_no_maxda():
+    # max_da=None must not change the profile (non-FF path unaffected).
+    base = pathplan.Constraints(a_of_v=None, a_const=8000.0, v_ceil=400.0,
+                                dv_slice=1e18, max_jerk=1.0e5, jerk_dt=0.001)
+    withn = pathplan.Constraints(a_of_v=None, a_const=8000.0, v_ceil=400.0,
+                                 dv_slice=1e18, max_jerk=1.0e5, jerk_dt=0.001,
+                                 max_da=None)
+    a = pathplan.emit_profile(0.0, 200.0, 50.0, 30.0, base)
+    b = pathplan.emit_profile(0.0, 200.0, 50.0, 30.0, withn)
+    assert a == b, "max_da=None changed the profile"
+    print("  max_da=None identical to unset OK")
+
+
 def main():
     for curve in (False, True):
         test_invariant_and_taper(make_cons(curve=curve),
@@ -121,6 +173,8 @@ def main():
     test_jerk_widens_ramp_vs_sharp()
     test_short_move_falls_back_to_sharp()
     test_disabled_matches_sharp()
+    test_ff_short_move_no_hard_step()
+    test_maxda_off_matches_no_maxda()
     print("ALL PASS")
 
 

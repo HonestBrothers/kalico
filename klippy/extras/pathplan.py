@@ -30,13 +30,21 @@ class Constraints:
     """
 
     def __init__(self, a_of_v=None, a_const=None, v_ceil=1e9, dv_slice=25.0,
-                 max_jerk=None, jerk_dt=0.001):
+                 max_jerk=None, jerk_dt=0.001, max_da=None):
         self._a_of_v = a_of_v
         self.a_const = a_const
         self.v_ceil = v_ceil
         self.dv_slice = dv_slice
         self.max_jerk = max_jerk
         self.jerk_dt = jerk_dt
+        # Hard cap on the acceleration CHANGE between consecutive emitted
+        # segments (mm/s^2). None = only the jerk*dt bound applies. When the
+        # model-inverse FF is active this MUST be set so that (FF accel coeff
+        # p2) * max_da stays below one motor step -- otherwise a large accel
+        # step becomes a multi-step position jump (stepcompress). It is honored
+        # even when the jerk is raised for a short move, by shrinking the slice
+        # dt (finer slices), so Δa <= max_da regardless of jerk.
+        self.max_da = max_da
 
     def a_max(self, v):
         if self._a_of_v is not None:
@@ -157,6 +165,10 @@ def _ramp_up_jerk(v0, v1, cons, collect=True):
     # guarantees a bounded rise (a+J*dt) and a jerk-feasible fall to 0 at v1.
     J = cons.max_jerk
     dt0 = cons.jerk_dt
+    # Cap the per-slice accel change at max_da by shrinking dt when the jerk is
+    # high (the short-move fallback raises J); Δa = J*dt <= max_da.
+    if cons.max_da is not None and J is not None and J > 0.0:
+        dt0 = min(dt0, cons.max_da / J)
     slices = [] if collect else None
     total = 0.0
     if v1 <= v0 + 1e-12 or J is None or J <= 0.0:
@@ -223,11 +235,18 @@ def _peak_velocity_jerk(vs, ve, move_d, cons):
     return lo
 
 
-def _emit_jerk(vs, vc, ve, move_d, cons):
-    # Jerk-limited profile: ramp vs->vc, cruise, ramp vc->ve. Returns None when
-    # the move is too short to jerk-limit even at the connecting peak, so the
-    # caller falls back to the sharp emit (which uses full a_max and always fits
-    # what the lookahead already approved).
+def _with_jerk(cons, J):
+    # Shallow copy of the constraints with a different jerk (for the fallback
+    # jerk-raising search). Shares the a_max oracle and other limits.
+    return Constraints(a_of_v=cons._a_of_v, a_const=cons.a_const,
+                       v_ceil=cons.v_ceil, dv_slice=cons.dv_slice,
+                       max_jerk=J, jerk_dt=cons.jerk_dt, max_da=cons.max_da)
+
+
+def _emit_jerk_core(vs, vc, ve, move_d, cons):
+    # One jerk-limited profile at cons.max_jerk: ramp vs->vc, cruise, ramp
+    # vc->ve. Returns None when the move can't be jerk-limited at this jerk
+    # (endpoints unreachable within move_d even at the connecting peak).
     vc = max(vc, vs, ve)
     acc, d_acc = _ramp_up_jerk(vs, vc, cons)
     dec_acc, d_dec = _ramp_up_jerk(ve, vc, cons)
@@ -245,6 +264,39 @@ def _emit_jerk(vs, vc, ve, move_d, cons):
         segs.append((0.0, cruise_d / vc, 0.0, vc, vc, 0.0, cruise_d))
     segs.extend(_decel_from_accel(dec_acc))
     return segs
+
+
+def _emit_jerk(vs, vc, ve, move_d, cons):
+    # Jerk-limited profile that NEVER emits a hard accel step. If the move is
+    # infeasible at the configured jerk, raise the jerk to the minimum value
+    # that fits and emit there -- acceleration stays continuous (bounded
+    # da = J'*dt), just ramps faster. This is what keeps the model-inverse FF's
+    # p2*a term (and pressure advance) crash-safe on short print-junction moves;
+    # a hard step would become a multi-step position jump -> stepcompress.
+    segs = _emit_jerk_core(vs, vc, ve, move_d, cons)
+    if segs is not None:
+        return segs
+    J0 = cons.max_jerk
+    hi = J0
+    feasible_hi = None
+    for _ in range(40):                 # expand until feasible
+        hi *= 2.0
+        s = _emit_jerk_core(vs, vc, ve, move_d, _with_jerk(cons, hi))
+        if s is not None:
+            feasible_hi = s
+            break
+    if feasible_hi is None:
+        return None                     # truly degenerate -> caller does sharp
+    lo = hi * 0.5                        # last infeasible jerk
+    best = feasible_hi
+    for _ in range(24):                 # bisection for the minimum feasible J'
+        mid = 0.5 * (lo + hi)
+        s = _emit_jerk_core(vs, vc, ve, move_d, _with_jerk(cons, mid))
+        if s is not None:
+            hi, best = mid, s
+        else:
+            lo = mid
+    return best
 
 
 def emit_profile(vs, vc, ve, move_d, cons):

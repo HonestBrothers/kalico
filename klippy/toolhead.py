@@ -549,6 +549,13 @@ class ToolHead:
         # trapezoid (identical geometry, one extra structural guarantee).
         jerk = self.unified_max_jerk or None
         jerk_dt = self.unified_jerk_dt
+        # When the model-inverse FF is active, cap the per-segment accel change
+        # so its p2*a term stays sub-step even on short jerk-infeasible moves
+        # (else the sharp fallback's hard accel step becomes a position jump ->
+        # stepcompress). None when the FF is off (bare steppers/PA don't need
+        # it), so non-FF behavior is unchanged.
+        ff = getattr(self, "model_inverse_ff", None)
+        max_da = ff.max_da if ff is not None else None
         topp = getattr(self, "topp_ra", None)
         if topp is not None and topp.active_for(move):
             return pathplan.Constraints(
@@ -558,11 +565,12 @@ class ToolHead:
                 dv_slice=topp.dv_slice,
                 max_jerk=jerk,
                 jerk_dt=jerk_dt,
+                max_da=max_da,
             )
         v_ceil = max(move.cruise_v, move.start_v, move.end_v) + 1.0
         return pathplan.Constraints(
             a_of_v=None, a_const=move.accel, v_ceil=v_ceil, dv_slice=1e18,
-            max_jerk=jerk, jerk_dt=jerk_dt,
+            max_jerk=jerk, jerk_dt=jerk_dt, max_da=max_da,
         )
 
     def _process_moves(self, moves):
