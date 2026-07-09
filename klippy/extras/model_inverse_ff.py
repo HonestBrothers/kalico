@@ -52,10 +52,13 @@ class FFParams:
         b4 = r (c2^2)
     """
 
-    def __init__(self, freq_hz, zeta, robustness=0.0):
+    def __init__(self, freq_hz, zeta, robustness=0.0, zeta_wide=0.15):
         self.freq_hz = float(freq_hz)
         self.zeta = float(zeta)
         self.robustness = min(1.0, max(0.0, float(robustness)))
+        # Target zero damping at robustness=1 for the pointwise (2nd-order)
+        # realization: a wider, shallower notch tolerant of parameter error.
+        self.zeta_wide = float(zeta_wide)
         self._update()
 
     def _update(self):
@@ -64,14 +67,27 @@ class FFParams:
             # Disabled mode: identity transform.
             self.c1 = self.c2 = 0.0
             self.b1 = self.b2 = self.b3 = self.b4 = 0.0
+            self.zeta_eff = self.zeta
+            self.p1 = self.p2 = 0.0
             return
         r = self.robustness
         c1 = self.c1 = 2.0 * self.zeta / self.wn
         c2 = self.c2 = 1.0 / (self.wn * self.wn)
+        # 4th-order derivative-matched (ZVD-style) inverse -- analysis / the
+        # target once a C^3 trajectory carries jerk & snap. F_r = (1-r)F1+r F2.
         self.b1 = c1 * (1.0 + r)
         self.b2 = c2 * (1.0 + r) + r * c1 * c1
         self.b3 = r * (2.0 * c1 * c2)
         self.b4 = r * (c2 * c2)
+        # 2nd-order pointwise inverse ACTUALLY applied in the C seam:
+        #   x = y + p1*v + p2*a,  p1 = 2*zeta_eff/wn,  p2 = 1/wn^2.
+        # Robustness widens the zero's damping zeta_eff (clean 2nd-order notch
+        # at wn, wider/shallower) -- realizable from v,a alone. It does NOT give
+        # the ZVD frequency-insensitivity (that needs b3,b4 == jerk,snap); wn
+        # drift is instead tracked by re-identifying the mode from ring-down.
+        self.zeta_eff = self.zeta + r * (self.zeta_wide - self.zeta)
+        self.p1 = 2.0 * self.zeta_eff / self.wn
+        self.p2 = c2
 
     # -- application -------------------------------------------------------
     def augment(self, pos, vel, accel, jerk=0.0, snap=0.0):
@@ -154,30 +170,30 @@ class ModelInverseFF:
 
     def __init__(self, config):
         self.printer = config.get_printer()
+        self.robustness = config.getfloat("robustness", 0.0,
+                                          minval=0.0, maxval=1.0)
+        self.zeta_wide = config.getfloat("robust_zeta", 0.15,
+                                         minval=0.0, maxval=0.5)
         self.axes = {}
         for axis in ("x", "y"):
             freq = config.getfloat("freq_" + axis, 0.0, minval=0.0)
             zeta = config.getfloat("damping_ratio_" + axis, 0.05,
                                    minval=0.0, maxval=0.5)
-            self.axes[axis] = FFParams(freq, zeta, self.robustness_default(config))
-        self.robustness = config.getfloat("robustness", 0.0,
-                                          minval=0.0, maxval=1.0)
+            self.axes[axis] = FFParams(freq, zeta, self.robustness,
+                                       self.zeta_wide)
         # a_max(v) fraction reserved for the FF correction on the motor
         # trajectory; consumed by the reachability adapter (plan against
         # (1-headroom)*a_max). Scales with robustness by default.
         self.headroom = config.getfloat("headroom", 0.15,
                                         minval=0.0, maxval=0.9)
-        for p in self.axes.values():
-            p.robustness = self.robustness
-            p._update()
-        self.enabled = True
+        # Enabled only when an axis actually has a mode frequency; off by
+        # default (freq defaults to 0) so a bare [model_inverse_ff] is inert.
+        self.enabled = config.getboolean("enabled", True)
+        self._wrapped = {}  # id(stepper) -> gc-held is_sk wrapper
         self.printer.register_event_handler("klippy:connect", self._connect)
         gcode = self.printer.lookup_object("gcode")
         gcode.register_command("SET_MODEL_FF", self.cmd_SET_MODEL_FF,
                                desc=self.cmd_SET_MODEL_FF_help)
-
-    def robustness_default(self, config):
-        return config.getfloat("robustness", 0.0, minval=0.0, maxval=1.0)
 
     def _connect(self):
         self._push()
@@ -192,27 +208,61 @@ class ModelInverseFF:
     def get_params(self, axis):
         return self.axes.get(axis)
 
-    def _push(self):
-        # Best-effort push to the C seam. Absent symbol -> planner-only mode.
+    def _get_ffi_setter(self):
         try:
             from klippy import chelper
             ffi_main, ffi_lib = chelper.get_ffi()
             setter = getattr(ffi_lib, "input_shaper_set_ff_params", None)
+            return ffi_main, ffi_lib, setter
         except Exception:
-            setter = None
+            return None, None, None
+
+    def _ensure_wrapped(self, stepper, ffi_main, ffi_lib):
+        # Wrap the stepper's kinematics with an input_shaper struct (the same
+        # wrapper the C FF lives in) exactly like [input_shaper] does, so the
+        # sk we push FF params into is guaranteed an input_shaper struct.
+        # Idempotent: once wrapped, get_stepper_kinematics() returns our is_sk.
+        # NOTE: mutually exclusive with [input_shaper] on the same axis -- the
+        # FF replaces the shaper. Do not configure both for one axis.
+        sk = stepper.get_stepper_kinematics()
+        prev = self._wrapped.get(id(stepper))
+        if prev is not None and prev == sk:
+            return sk
+        is_sk = ffi_main.gc(ffi_lib.input_shaper_alloc(), ffi_lib.free)
+        if ffi_lib.input_shaper_set_sk(is_sk, sk) < 0:
+            stepper.set_stepper_kinematics(sk)
+            return None
+        stepper.set_stepper_kinematics(is_sk)
+        self._wrapped[id(stepper)] = is_sk
+        return is_sk
+
+    def _push(self):
+        ffi_main, ffi_lib, setter = self._get_ffi_setter()
         if setter is None:
             logging.info("model_inverse_ff: C seam absent; planner-only mode "
                          "(coefficients+headroom active, no per-step FF)")
             return
+        active = self.enabled and any(p.wn > 0.0 for p in self.axes.values())
         toolhead = self.printer.lookup_object("toolhead")
+        toolhead.flush_step_generation()
+        if not active:
+            # Disable on anything we previously wrapped; never wrap just to off.
+            for is_sk in self._wrapped.values():
+                for axis in ("x", "y"):
+                    setter(is_sk, axis.encode(), 0, 0.0, 0.0)
+            return
         kin = toolhead.get_kinematics()
         for stepper in kin.get_steppers():
-            sk = stepper.get_stepper_kinematics()
+            if stepper.get_trapq() is None:
+                continue
+            is_sk = self._ensure_wrapped(stepper, ffi_main, ffi_lib)
+            if is_sk is None:
+                continue
             for axis in ("x", "y"):
                 p = self.axes[axis]
-                en = 1 if (self.enabled and p.wn > 0.0) else 0
-                setter(sk, axis.encode(), en,
-                       p.b1, p.b2, p.b3, p.b4)
+                en = 1 if p.wn > 0.0 else 0
+                # 2nd-order pointwise inverse: x = y + p1*v + p2*a
+                setter(is_sk, axis.encode(), en, p.p1, p.p2)
 
     cmd_SET_MODEL_FF_help = ("Tune model-inverse feedforward "
                              "(FREQ_X/Y, DAMPING_RATIO_X/Y, ROBUSTNESS, "
@@ -229,7 +279,8 @@ class ModelInverseFF:
             f = gcmd.get_float("FREQ_" + axis.upper(), p.freq_hz, minval=0.0)
             z = gcmd.get_float("DAMPING_RATIO_" + axis.upper(), p.zeta,
                                minval=0.0, maxval=0.5)
-            p.freq_hz, p.zeta, p.robustness = f, z, self.robustness
+            p.freq_hz, p.zeta = f, z
+            p.robustness, p.zeta_wide = self.robustness, self.zeta_wide
             p._update()
         self._push()
         gcmd.respond_info(self._status_str())
@@ -241,9 +292,9 @@ class ModelInverseFF:
                     self.plan_accel_scale())]
         for axis in ("x", "y"):
             p = self.axes[axis]
-            parts.append("  %s: f=%.1fHz zeta=%.4f b1=%.3e b2=%.3e "
-                         "b3=%.3e b4=%.3e" % (axis, p.freq_hz, p.zeta,
-                                              p.b1, p.b2, p.b3, p.b4))
+            parts.append("  %s: f=%.1fHz zeta=%.4f zeta_eff=%.4f  applied: "
+                         "p1=%.3e p2=%.3e" % (axis, p.freq_hz, p.zeta,
+                                              p.zeta_eff, p.p1, p.p2))
         return "\n".join(parts)
 
     def get_status(self, eventtime):
@@ -253,7 +304,7 @@ class ModelInverseFF:
         for axis in ("x", "y"):
             p = self.axes[axis]
             st[axis] = {"freq": p.freq_hz, "zeta": p.zeta,
-                        "b1": p.b1, "b2": p.b2, "b3": p.b3, "b4": p.b4}
+                        "zeta_eff": p.zeta_eff, "p1": p.p1, "p2": p.p2}
         return st
 
 

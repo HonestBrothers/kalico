@@ -173,13 +173,40 @@ smoother_calc_position(const struct move *m, int axis, double move_time
 
 #define DUMMY_T 500.0
 
+// Model-inverse feedforward (topp-ra-v3 Stage 4). Per axis, the 2nd-order
+// exact-inverse coefficients c1 = 2*zeta_eff/wn, c2 = 1/wn^2 applied pointwise:
+//   x_motor = y + c1*v + c2*a
+// where y, v, a are the axis position/velocity/acceleration read directly from
+// the current trapq move (no time shift, no convolution). Legal because the
+// planner is offline; crash-safe on the jerk-limited (Stage 3) trajectory
+// because a(t) is continuous there (residual accel step <= 2*J*dt0 -> sub-step
+// position jump). See model_inverse_ff.py / docs/topp-ra-v3-design.md.
+struct ff_axis {
+    int enabled;
+    double c1, c2;
+};
+
 struct input_shaper {
     struct stepper_kinematics sk;
     struct stepper_kinematics *orig_sk;
     struct move m;
     struct shaper_pulses sp_x, sp_y;
     struct smoother sm_x, sm_y;
+    struct ff_axis ff_x, ff_y;
 };
+
+// Model-inverse FF axis position: y + c1*v + c2*a, all along the move's axis.
+// v(t)=start_v+2*half_accel*t, a=2*half_accel (constant within a trapq move).
+static inline double
+ff_calc_axis(const struct move *m, int axis, double move_time
+             , const struct ff_axis *ff)
+{
+    double axis_r = m->axes_r.axis[axis - 'x'];
+    double dist = move_get_distance(m, move_time);
+    double v = m->start_v + 2. * m->half_accel * move_time;
+    double a = 2. * m->half_accel;
+    return m->start_pos.axis[axis - 'x'] + axis_r * (dist + ff->c1*v + ff->c2*a);
+}
 
 // Optimized calc_position when only x axis is needed
 static double
@@ -187,6 +214,10 @@ shaper_x_calc_position(struct stepper_kinematics *sk, struct move *m
                        , double move_time)
 {
     struct input_shaper *is = container_of(sk, struct input_shaper, sk);
+    if (is->ff_x.enabled) {
+        is->m.start_pos.x = ff_calc_axis(m, 'x', move_time, &is->ff_x);
+        return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
+    }
     if (!is->sp_x.num_pulses && !is->sm_x.hst)
         return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
     is->m.start_pos.x = is->sp_x.num_pulses
@@ -201,6 +232,10 @@ shaper_y_calc_position(struct stepper_kinematics *sk, struct move *m
                        , double move_time)
 {
     struct input_shaper *is = container_of(sk, struct input_shaper, sk);
+    if (is->ff_y.enabled) {
+        is->m.start_pos.y = ff_calc_axis(m, 'y', move_time, &is->ff_y);
+        return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
+    }
     if (!is->sp_y.num_pulses && !is->sm_y.hst)
         return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
     is->m.start_pos.y = is->sp_y.num_pulses
@@ -216,14 +251,19 @@ shaper_xy_calc_position(struct stepper_kinematics *sk, struct move *m
 {
     struct input_shaper *is = container_of(sk, struct input_shaper, sk);
     if (!is->sp_x.num_pulses && !is->sp_y.num_pulses
-            && !is->sm_x.hst && !is->sm_y.hst)
+            && !is->sm_x.hst && !is->sm_y.hst
+            && !is->ff_x.enabled && !is->ff_y.enabled)
         return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
     is->m.start_pos = move_get_coord(m, move_time);
-    if (is->sp_x.num_pulses || is->sm_x.hst)
+    if (is->ff_x.enabled)
+        is->m.start_pos.x = ff_calc_axis(m, 'x', move_time, &is->ff_x);
+    else if (is->sp_x.num_pulses || is->sm_x.hst)
         is->m.start_pos.x = is->sp_x.num_pulses
             ?   shaper_calc_position(m, 'x', move_time, &is->sp_x)
             : smoother_calc_position(m, 'x', move_time, &is->sm_x);
-    if (is->sp_y.num_pulses || is->sm_y.hst)
+    if (is->ff_y.enabled)
+        is->m.start_pos.y = ff_calc_axis(m, 'y', move_time, &is->ff_y);
+    else if (is->sp_y.num_pulses || is->sm_y.hst)
         is->m.start_pos.y = is->sp_y.num_pulses
             ?   shaper_calc_position(m, 'y', move_time, &is->sp_y)
             : smoother_calc_position(m, 'y', move_time, &is->sm_y);
@@ -309,6 +349,32 @@ input_shaper_set_shaper_params(struct stepper_kinematics *sk, char axis
         shaper_note_generation_time(is);
     }
     return status;
+}
+
+// Set (or clear) the model-inverse feedforward for one axis. Enabling it
+// clears any input shaper/smoother on that axis (FF replaces them) so the
+// step-generation window drops to 0 -- the FF is pointwise, no look-ahead.
+int __visible
+input_shaper_set_ff_params(struct stepper_kinematics *sk, char axis
+                           , int enabled, double c1, double c2)
+{
+    if (axis != 'x' && axis != 'y')
+        return -1;
+    struct input_shaper *is = container_of(sk, struct input_shaper, sk);
+    if (!(is->orig_sk->active_flags & (axis == 'x' ? AF_X : AF_Y)))
+        return 0;  // axis not active for this stepper; nothing to do
+    struct ff_axis *ff = axis == 'x' ? &is->ff_x : &is->ff_y;
+    struct shaper_pulses *sp = axis == 'x' ? &is->sp_x : &is->sp_y;
+    struct smoother *sm = axis == 'x' ? &is->sm_x : &is->sm_y;
+    ff->enabled = enabled;
+    ff->c1 = c1;
+    ff->c2 = c2;
+    if (enabled) {
+        sp->num_pulses = 0;
+        memset(sm, 0, sizeof(*sm));
+    }
+    shaper_note_generation_time(is);
+    return 0;
 }
 
 int __visible
