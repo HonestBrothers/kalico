@@ -367,6 +367,15 @@ class ToolHead:
         # emitter's monotonic invariant holds by construction, so it removes the
         # stepcompress "Invalid sequence" family. Off by default (opt-in on v3).
         self.unified_emit = config.getboolean("unified_planner", False)
+        # Stage 3 jerk limiting inside the unified emitter (approach A): ramps
+        # a(t) so it is continuous (precondition for the model-inverse FF accel
+        # term). 0 = off (sharp constant-accel ladders). Feasibility stays
+        # a_max-based; short moves that cannot be jerk-limited fall back to the
+        # sharp profile per-move.
+        self.unified_max_jerk = config.getfloat(
+            "unified_max_jerk", 0.0, minval=0.0)
+        self.unified_jerk_dt = config.getfloat(
+            "unified_jerk_dt", 0.001, above=0.0)
         self.orig_cfg = {}
         self.orig_cfg["max_velocity"] = self.max_velocity
         self.orig_cfg["max_accel"] = self.max_accel
@@ -538,6 +547,8 @@ class ToolHead:
         # it is the move's constant accel, and a huge dv_slice makes
         # emit_profile collapse to the stock single accel/cruise/decel
         # trapezoid (identical geometry, one extra structural guarantee).
+        jerk = self.unified_max_jerk or None
+        jerk_dt = self.unified_jerk_dt
         topp = getattr(self, "topp_ra", None)
         if topp is not None and topp.active_for(move):
             return pathplan.Constraints(
@@ -545,10 +556,13 @@ class ToolHead:
                 a_const=move.accel,
                 v_ceil=topp.speeds[-1],
                 dv_slice=topp.dv_slice,
+                max_jerk=jerk,
+                jerk_dt=jerk_dt,
             )
         v_ceil = max(move.cruise_v, move.start_v, move.end_v) + 1.0
         return pathplan.Constraints(
-            a_of_v=None, a_const=move.accel, v_ceil=v_ceil, dv_slice=1e18
+            a_of_v=None, a_const=move.accel, v_ceil=v_ceil, dv_slice=1e18,
+            max_jerk=jerk, jerk_dt=jerk_dt,
         )
 
     def _process_moves(self, moves):
