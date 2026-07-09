@@ -190,13 +190,40 @@ class ModelInverseFF:
         # default (freq defaults to 0) so a bare [model_inverse_ff] is inert.
         self.enabled = config.getboolean("enabled", True)
         self._wrapped = {}  # id(stepper) -> gc-held is_sk wrapper
+        self.max_da = None  # per-segment accel-change cap for the emitter
         self.printer.register_event_handler("klippy:connect", self._connect)
         gcode = self.printer.lookup_object("gcode")
         gcode.register_command("SET_MODEL_FF", self.cmd_SET_MODEL_FF,
                                desc=self.cmd_SET_MODEL_FF_help)
 
     def _connect(self):
+        # Expose ourselves to the toolhead so its pathplan adapter can read
+        # max_da (the per-segment accel-change cap that keeps our p2*a term
+        # sub-step) without a per-move lookup.
+        self.printer.lookup_object("toolhead").model_inverse_ff = self
         self._push()
+
+    # Safety factor vs one step: the emitter's discrete taper can leave up to
+    # ~2*max_da at a seam, so cap the FF position jump p2*(2*max_da) well under
+    # a step. 0.3 -> worst-case jump ~0.6 step.
+    _DA_SAFETY = 0.3
+
+    def _compute_max_da(self, kin):
+        # Tightest per-segment path accel-change (mm/s^2) that keeps p2*da below
+        # a fraction of a motor step on every FF-active axis. None if no axis is
+        # active (then the emitter is unconstrained -- bare steppers / PA are
+        # fine with velocity-continuous hard accel steps; only the FF isn't).
+        best = None
+        for stepper in kin.get_steppers():
+            nm = stepper.get_name()
+            for axis in ("x", "y"):
+                p = self.axes[axis]
+                if not (self.enabled and p.wn > 0.0 and p.p2 > 0.0):
+                    continue
+                if nm == "stepper_" + axis or nm.endswith("_" + axis):
+                    lim = self._DA_SAFETY * stepper.get_step_dist() / p.p2
+                    best = lim if best is None else min(best, lim)
+        return best
 
     def plan_accel_scale(self):
         """Fraction of a_max(v) the tool planner may use; the rest is FF
@@ -245,13 +272,16 @@ class ModelInverseFF:
         active = self.enabled and any(p.wn > 0.0 for p in self.axes.values())
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.flush_step_generation()
+        kin = toolhead.get_kinematics()
+        # Recompute the emitter's accel-change cap for the current coeffs. Set
+        # BEFORE any moves are planned so the pathplan adapter honors it.
+        self.max_da = self._compute_max_da(kin) if active else None
         if not active:
             # Disable on anything we previously wrapped; never wrap just to off.
             for is_sk in self._wrapped.values():
                 for axis in ("x", "y"):
                     setter(is_sk, axis.encode(), 0, 0.0, 0.0)
             return
-        kin = toolhead.get_kinematics()
         for stepper in kin.get_steppers():
             if stepper.get_trapq() is None:
                 continue
