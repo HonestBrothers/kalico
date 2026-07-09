@@ -62,6 +62,36 @@ x_motor(s) = y(s) + (2ζ/ωₙ)·y'(s)·ṡ + (1/ωₙ²)·[y'(s)·s̈ + y''(s)�
   the impulse-sum with `x += (2ζ/ωₙ)·v + (1/ωₙ²)·a` from the trapq's pos/vel/
   accel at time t. Cheap in the C hot path.
 
+## Robustness knob (Stage 4, built)
+`model_inverse_ff.py` `FFParams` interpolates the inverse between two forms:
+- `r=0`: exact single-zero cancellation `F1(s)=1+c1 s+c2 s^2`
+  (`c1=2ζ/ωₙ`, `c2=1/ωₙ²`) — deep but fragile ("pole peeks out" on ωₙ drift).
+- `r=1`: derivative-matched robust inverse `F2=F1²` — enforces `F(jωₙ)=0` AND
+  `dF/dω|ωₙ=0` (flat-bottomed notch, ZVD-style), tolerant to ωₙ error.
+
+`F_r=(1-r)F1+r F2` → `x = y + b1 y' + b2 y'' + b3 y''' + b4 y''''` with
+`b1=c1(1+r)`, `b2=c2(1+r)+r c1²`, `b3=2r c1 c2`, `b4=r c2²`. So `r>0`
+introduces jerk (`b3`) and snap (`b4`) content. Verified: worst-case residual
+over a ±15% ωₙ band falls 0.322→0.104 (r=0→1); on-axis notch depth = `2ζ`.
+
+**Ties to the acceleration constraint (why this is NOT the shaper's max_accel
+rule):** input_shaping derates `max_accel` to bound convolution smoothing. The
+FF does no smoothing (sharp features preserved), so that derate is dropped.
+Instead the torque-curve `a_max(v)` now bounds the *motor* trajectory
+`x=y+corrections`; the FF inflates motor accel by `b1·jerk+b2·snap+…`
+(`motor_accel_extra`). A `headroom` fraction reserves `a_max(v)` for this — the
+tool planner runs against `plan_accel_scale()·a_max(v)`. And the accel term is
+discontinuous on coarse trapq: an accel jump `Δa` makes an
+`b2·Δa` motor-position jump (measured 0.085 mm at 20000 mm/s² → stepcompress).
+Hence **the C application of the accel term (and all of `r>0`) requires the
+continuous-accel/C³ trajectory from Stage 3.** At `r=0`, only `b1·v` (velocity
+lead, continuous) + `b2·a` are used; `r=0` is safe once accel is continuous.
+
+Delivered as a tested pure-math library + `[model_inverse_ff]` Klipper object
+(SET_MODEL_FF live tuning, get_status, best-effort C push; planner-only until
+the C seam lands). The C seam (`ff_*_calc_position` in kin_shaper.c, smoothed
+v/a for continuity) is the next step and rides Stage 3.
+
 ## Jerk (the honest wrinkle)
 TOPP-RA is 2nd-order (`u`, `u'`); jerk is 3rd-order (`s⃛`). Options:
 - (A) approximate: curvature / rate limit on `u(s)` (cheap, in-plane; what the
