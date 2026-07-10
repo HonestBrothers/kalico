@@ -109,6 +109,47 @@ def test_chord_length_reasonable():
     print("  arc chords <= target chord_len OK")
 
 
+def test_blend_chain_conserves_extrusion():
+    prev_start = (0.0, 0.0, 0.0, 0.0)
+    vertex = (10.0, 0.0, 0.0)
+    move_end = (10.0, 10.0, 0.0, 0.0)
+    prev_e, move_e = 0.5, 0.5          # mm filament on each leg
+    prev_len, move_len = 10.0, 10.0
+    ch = cb.plan_blend_chain(prev_start, vertex, move_end, prev_e, move_e,
+                             prev_len, move_len, accel=15000.0, delta_max=0.1,
+                             blend_ratio=0.5, chord_len=0.1)
+    assert ch is not None
+    # extrusion conserved
+    assert abs(sum(ch["e_seg"]) - (prev_e + move_e)) < 1e-9, "E not conserved"
+    # one e_seg per segment
+    assert len(ch["e_seg"]) == len(ch["pts"]) - 1
+    assert len(ch["interior"]) == len(ch["e_seg"])
+    # endpoints preserved
+    assert _dist(ch["pts"][0], prev_start[:3]) < 1e-9
+    assert _dist(ch["pts"][-1], move_end[:3]) < 1e-9
+    # first and last segments are the straight bodies, middle are interior
+    assert ch["interior"][0] is False and ch["interior"][-1] is False
+    assert any(ch["interior"]), "no interior arc segments"
+    # centripetal cap = sqrt(a*r)
+    assert abs(ch["corner_v"] - math.sqrt(15000.0 * ch["r"])) < 1e-9
+    # extrusion is non-negative everywhere
+    assert all(e >= -1e-12 for e in ch["e_seg"])
+    print("  plan_blend_chain conserves E (%.4f), endpoints kept, corner_v=%.1f "
+          "mm/s OK" % (sum(ch["e_seg"]), ch["corner_v"]))
+
+
+def test_blend_chain_asymmetric_extrusion():
+    # unequal legs + unequal extrusion still conserves and stays non-negative
+    ch = cb.plan_blend_chain((0, 0, 0, 0), (5, 0, 0), (5, 20, 0, 0),
+                             prev_e=0.2, move_e=0.9, prev_len=5.0,
+                             move_len=20.0, accel=12000.0, delta_max=0.08,
+                             blend_ratio=0.4, chord_len=0.3)
+    assert ch is not None
+    assert abs(sum(ch["e_seg"]) - 1.1) < 1e-9
+    assert all(e >= -1e-12 for e in ch["e_seg"])
+    print("  plan_blend_chain asymmetric legs/extrusion conserves E OK")
+
+
 if __name__ == "__main__":
     test_bead_deviation()
     test_corner_geometry_angles()
@@ -117,4 +158,6 @@ if __name__ == "__main__":
     test_plan_corner_skips()
     test_trim_capped_by_leg()
     test_chord_length_reasonable()
+    test_blend_chain_conserves_extrusion()
+    test_blend_chain_asymmetric_extrusion()
     print("ALL PASS")
