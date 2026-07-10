@@ -408,6 +408,17 @@ class ToolHead:
             "unified_max_jerk", 0.0, minval=0.0)
         self.unified_jerk_dt = config.getfloat(
             "unified_jerk_dt", 0.001, above=0.0)
+        # Auto-derive unified_max_jerk from the model-inverse FF's mode
+        # frequency: a mode at f_n is not excited when the accel ramp lasts >=
+        # one period (a/J >= 1/f_n), i.e. J <= a*f_n. So set unified_max_jerk =
+        # ratio * a_axis * f_n, taking the MOST BINDING FF-active axis (min over
+        # axes). Ratio <= 1 = margin. Recomputed by the FF on connect and on
+        # every SET_MODEL_FF (freq change). Falls back to the configured jerk
+        # when no FF axis is active. Mirrors [jerk_limiting] auto_jerk but
+        # sourced from the FF (the input shaper is off when the FF replaces it).
+        self.unified_auto_jerk = config.getboolean("unified_auto_jerk", False)
+        self.unified_auto_jerk_ratio = config.getfloat(
+            "unified_auto_jerk_ratio", 1.0, above=0.0)
         self._ff_prev_sa = 0.0    # FF diagnostic: prev signed path accel
         self._ff_max_dsa = 0.0    # FF diagnostic: max signed-accel jump seen
         self.orig_cfg = {}
@@ -574,6 +585,33 @@ class ToolHead:
                 self.print_time,
             )
 
+    def apply_auto_jerk(self, ff):
+        # Derive unified_max_jerk from the FF's per-axis mode frequency:
+        # unified_max_jerk = ratio * a_axis * f_n, min over FF-active axes (the
+        # most binding mode). Called by the FF on connect and every SET_MODEL_FF.
+        # No-op unless unified_auto_jerk is set and some FF axis is active.
+        if not self.unified_auto_jerk or ff is None:
+            return
+        accels = getattr(self.get_kinematics(), "max_accels", None)
+        best = None
+        parts = []
+        for ax, idx in (("x", 0), ("y", 1), ("z", 2)):
+            p = ff.axes.get(ax) if hasattr(ff, "axes") else None
+            f = getattr(p, "freq_hz", 0.0) if p is not None else 0.0
+            wn = getattr(p, "wn", 0.0) if p is not None else 0.0
+            if not (getattr(ff, "enabled", False) and f > 0.0 and wn > 0.0):
+                continue
+            a = (accels[idx] if (accels is not None and idx < len(accels))
+                 else self.max_accel)
+            jv = self.unified_auto_jerk_ratio * a * f
+            best = jv if best is None else min(best, jv)
+            parts.append("%s(a=%.0f,f=%.1fHz)=%.0f" % (ax, a, f, jv))
+        if best is not None:
+            self.unified_max_jerk = best
+            logging.info(
+                "toolhead auto_jerk: %.2f*a*f_n -> unified_max_jerk=%.0f [%s]"
+                % (self.unified_auto_jerk_ratio, best, ", ".join(parts)))
+
     def _pathplan_cons(self, move):
         # Build the pathplan.Constraints oracle for one move. When TOPP-RA is
         # active the phase-plane a_max(v) is the torque curve (and reachability
@@ -669,7 +707,12 @@ class ToolHead:
                         self._ff_prev_sa = sa
                         if dsa > self._ff_max_dsa:
                             self._ff_max_dsa = dsa
-                            if dsa > 2.0 * ff_diag.max_da:
+                            # max_da = _DA_SAFETY(0.1) * step / p2, so a jump of
+                            # 10*max_da == one full motor step. The inherent
+                            # triangle-peak residual is ~4*max_da (sub-step, safe
+                            # by design); only flag jumps past half a step
+                            # (5*max_da) as genuinely FF-dangerous.
+                            if dsa > 5.0 * ff_diag.max_da:
                                 logging.info(
                                     "ff_diag: BIG signed-accel jump %.0f "
                                     "(max_da=%.0f) move vs=%.1f vc=%.1f ve=%.1f "

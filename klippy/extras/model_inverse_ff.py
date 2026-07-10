@@ -274,6 +274,10 @@ class ModelInverseFF:
         return is_sk
 
     def _push(self):
+        # Refresh the toolhead's auto-derived jerk from our current mode freq
+        # (no-op unless [printer] unified_auto_jerk is set). Runs on connect and
+        # every SET_MODEL_FF, in all paths, before any early return.
+        self.printer.lookup_object("toolhead").apply_auto_jerk(self)
         ffi_main, ffi_lib, setter = self._get_ffi_setter()
         if setter is None:
             logging.info("model_inverse_ff: C seam absent; planner-only mode "
