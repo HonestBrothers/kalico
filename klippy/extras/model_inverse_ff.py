@@ -191,10 +191,32 @@ class ModelInverseFF:
         self.enabled = config.getboolean("enabled", True)
         self._wrapped = {}  # id(stepper) -> gc-held is_sk wrapper
         self.max_da = None  # per-segment accel-change cap for the emitter
+        # Suspend the FF during homing. The FF adds p1*v + p2*a to the motor
+        # position; a homing move's accel step would become a multi-step jump
+        # (stepcompress crash), and even without a crash the offset would bias
+        # the endstop trigger position. Homing starts/ends at rest (v=a=0) where
+        # the offset is 0, so suspend/resume never jumps position. Depth-counted
+        # so nested/sequential home_rails calls pair correctly.
+        self._suspend_depth = 0
         self.printer.register_event_handler("klippy:connect", self._connect)
+        self.printer.register_event_handler(
+            "homing:home_rails_begin", self._on_home_begin)
+        self.printer.register_event_handler(
+            "homing:home_rails_end", self._on_home_end)
         gcode = self.printer.lookup_object("gcode")
         gcode.register_command("SET_MODEL_FF", self.cmd_SET_MODEL_FF,
                                desc=self.cmd_SET_MODEL_FF_help)
+
+    def _on_home_begin(self, *args):
+        self._suspend_depth += 1
+        if self._suspend_depth == 1:
+            self._push()   # active becomes False while suspended -> C seam zeroed
+
+    def _on_home_end(self, *args):
+        if self._suspend_depth > 0:
+            self._suspend_depth -= 1
+            if self._suspend_depth == 0:
+                self._push()   # restore the FF params
 
     def _connect(self):
         # Expose ourselves to the toolhead so its pathplan adapter can read
@@ -283,7 +305,8 @@ class ModelInverseFF:
             logging.info("model_inverse_ff: C seam absent; planner-only mode "
                          "(coefficients+headroom active, no per-step FF)")
             return
-        active = self.enabled and any(p.wn > 0.0 for p in self.axes.values())
+        active = (self.enabled and self._suspend_depth == 0
+                  and any(p.wn > 0.0 for p in self.axes.values()))
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.flush_step_generation()
         kin = toolhead.get_kinematics()
