@@ -139,3 +139,54 @@ def plan_corner(p_prev, p_corner, p_next, delta_max, blend_ratio=0.5,
                                      for i in range(3)))
     return {"p_in": p_in, "p_out": p_out, "pts": pts, "r": r, "t": t,
             "dev": dev, "phi": phi}
+
+
+def plan_blend_chain(prev_start, vertex, move_end, prev_e, move_e,
+                     prev_len, move_len, accel, delta_max, blend_ratio=0.5,
+                     min_turn_deg=8.0, max_turn_deg=150.0, chord_len=0.4):
+    """Plan the full blended move chain for the corner at `vertex` as PLAIN DATA
+    (no Move objects), so extrusion conservation and geometry are unit-testable.
+
+    prev_start/vertex/move_end -- (x,y,z) of the incoming move start, the shared
+        corner, and the outgoing move end.
+    prev_e/move_e              -- extruded filament (mm) on each original move.
+    prev_len/move_len          -- XYZ path length (mm) of each original move.
+    accel                      -- min accel of the two moves (for the centripetal
+        cap v_corner = sqrt(accel*r)).
+
+    Returns None to leave the corner sharp, else a dict:
+      pts      -- (n+1) chain points prev_start .. move_end (through p_in, arc,
+                  p_out); consecutive pairs are the new moves.
+      e_seg    -- per-segment extrusion (len n), sum == prev_e+move_e.
+      interior -- per-segment bool: True for the curved arc segments (get the
+                  centripetal cap), False for the two straight body legs.
+      corner_v -- centripetal speed cap (mm/s) for interior segments.
+      r, dev   -- arc radius and achieved deviation.
+    """
+    P = plan_corner(prev_start, vertex, move_end, delta_max, blend_ratio,
+                    min_turn_deg, max_turn_deg, chord_len)
+    if P is None:
+        return None
+    pts = [tuple(prev_start[:3]), P["p_in"]] + P["pts"] \
+        + [P["p_out"], tuple(move_end[:3])]
+    n = len(pts) - 1
+    seg_len = [math.sqrt(sum((pts[s + 1][k] - pts[s][k]) ** 2
+                             for k in range(3))) for s in range(n)]
+    # Body legs are the first (prev) and last (move) segments; everything between
+    # is the arc. Distribute each original move's extrusion over its share of the
+    # new chain by length so total filament is conserved and endpoints preserved.
+    prev_body_e = prev_e * (seg_len[0] / prev_len) if prev_len > 1e-12 else 0.0
+    move_body_e = move_e * (seg_len[-1] / move_len) if move_len > 1e-12 else 0.0
+    corner_e = (prev_e - prev_body_e) + (move_e - move_body_e)
+    corner_len = sum(seg_len[1:-1])
+    e_seg = [prev_body_e]
+    for s in range(1, n - 1):
+        frac = (seg_len[s] / corner_len) if corner_len > 1e-12 else 0.0
+        e_seg.append(corner_e * frac)
+    if n >= 2:
+        e_seg.append(move_body_e)
+    interior = [False] + [True] * (n - 2) + [False] if n >= 2 else [False]
+    corner_v = math.sqrt(max(0.0, accel) * P["r"])
+    return {"pts": pts, "e_seg": e_seg, "interior": interior,
+            "corner_v": corner_v, "r": P["r"], "dev": P["dev"],
+            "seg_len": seg_len}

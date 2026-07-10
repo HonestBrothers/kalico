@@ -9,6 +9,7 @@ import math
 
 from . import chelper
 from .extras import pathplan
+from .extras import cornerblend
 from .extras.danger_options import get_danger_options
 from .kinematics import extruder
 
@@ -300,7 +301,39 @@ class LookAheadQueue:
         # Remove processed moves from the queue
         del queue[:flush_count]
 
+    def _splice_corner_chain(self, chain):
+        # Replace queue[-1] (the sharp prev move) with chain[0] (trimmed) and
+        # append the arc + trimmed-move, running the same kinematic/extruder
+        # limit checks every queued move gets (these are synthesized here and
+        # never pass through ToolHead.move()).
+        kin = self.toolhead.kin
+        extruder = self.toolhead.extruder
+        for nm in chain:
+            if nm.is_kinematic_move:
+                kin.check_move(nm)
+            if nm.axes_d[3]:
+                extruder.check_move(nm)
+        self.queue[-1] = chain[0]
+        if len(self.queue) >= 2:
+            self.queue[-1].calc_junction(self.queue[-2])
+        for nm in chain[1:]:
+            self.queue.append(nm)
+            nm.calc_junction(self.queue[-2])
+            self.junction_flush -= nm.min_move_t
+        if self.junction_flush <= 0.0:
+            self.flush(lazy=True)
+
     def add_move(self, move):
+        # Bead-bounded corner blend (topp-ra-v3): round a sharp extruding corner
+        # into a tangent arc within the bead-derived deviation, rendered by the
+        # unified emitter. Falls through to the stock path when no blend applies.
+        if (self.toolhead.corner_blend and self.queue
+                and move.is_kinematic_move
+                and self.queue[-1].is_kinematic_move):
+            chain = self.toolhead.plan_corner_blend(self.queue[-1], move)
+            if chain is not None:
+                self._splice_corner_chain(chain)
+                return
         # Jerk limiting Phase 3: round a sharp corner by replacing the previous
         # queued move + this move with a trimmed-prev / blend / trimmed-move
         # chain. Falls back to the stock path when no blend applies.
@@ -419,6 +452,24 @@ class ToolHead:
         self.unified_auto_jerk = config.getboolean("unified_auto_jerk", False)
         self.unified_auto_jerk_ratio = config.getfloat(
             "unified_auto_jerk_ratio", 1.0, above=0.0)
+        # Bead-bounded corner blending (topp-ra-v3): replace a sharp EXTRUDING
+        # corner with a tangent arc whose deviation is bounded by the extruded
+        # bead (deviation = ratio * bead_width), rendered through the unified
+        # emitter. Keeps the tool moving (no PA blob, C1 for the FF) at a
+        # deviation invisible at the bead scale. Off by default.
+        self.corner_blend = config.getboolean("corner_blend", False)
+        self.corner_bead_width = config.getfloat(
+            "corner_bead_width", 0.45, above=0.0)
+        self.corner_deviation_ratio = config.getfloat(
+            "corner_deviation_ratio", 0.15, above=0.0, maxval=0.5)
+        self.corner_blend_ratio = config.getfloat(
+            "corner_blend_ratio", 0.4, above=0.0, maxval=0.5)
+        self.corner_min_turn = config.getfloat("corner_min_turn", 8.0,
+                                               minval=0.0, below=180.0)
+        self.corner_max_turn = config.getfloat("corner_max_turn", 150.0,
+                                               minval=0.0, below=180.0)
+        self.corner_chord_ratio = config.getfloat(
+            "corner_chord_ratio", 1.0, above=0.0)
         self._ff_prev_sa = 0.0    # FF diagnostic: prev signed path accel
         self._ff_max_dsa = 0.0    # FF diagnostic: max signed-accel jump seen
         self.orig_cfg = {}
@@ -611,6 +662,58 @@ class ToolHead:
             logging.info(
                 "toolhead auto_jerk: %.2f*a*f_n -> unified_max_jerk=%.0f [%s]"
                 % (self.unified_auto_jerk_ratio, best, ", ".join(parts)))
+
+    def plan_corner_blend(self, prev, move):
+        # Bead-bounded corner blend for the sharp EXTRUDING corner prev->move.
+        # Returns [trimmed_prev, *arc_moves, trimmed_move] (new Move objects) or
+        # None to leave it sharp. The arc moves are ordinary Move objects fed
+        # through the normal lookahead + unified emitter, so they get check_move,
+        # jerk-aware planning, FF safety and pressure advance -- unlike the old
+        # jerk_limiting round_corners constant-accel fallback.
+        if not (move.is_kinematic_move and prev.is_kinematic_move):
+            return None
+        # Only blend extruding corners (the bead bound is a print-geometry idea;
+        # travels/retractions keep the sharp path).
+        if not move.axes_d[3] or not prev.axes_d[3]:
+            return None
+        delta_max = cornerblend.bead_deviation(
+            self.corner_bead_width, self.corner_deviation_ratio)
+        ch = cornerblend.plan_blend_chain(
+            prev.start_pos, prev.end_pos[:3], move.end_pos,
+            prev.axes_d[3], move.axes_d[3], prev.move_d, move.move_d,
+            min(prev.accel, move.accel), delta_max,
+            blend_ratio=self.corner_blend_ratio,
+            min_turn_deg=self.corner_min_turn,
+            max_turn_deg=self.corner_max_turn,
+            chord_len=self.corner_chord_ratio * self.corner_bead_width)
+        if ch is None:
+            return None
+        Move = type(move)
+        pts, e_seg = ch["pts"], ch["e_seg"]
+        interior, seg_len = ch["interior"], ch["seg_len"]
+        corner_v = ch["corner_v"]
+        prev_speed = math.sqrt(prev.max_cruise_v2)
+        move_speed = math.sqrt(move.max_cruise_v2)
+        new_moves = []
+        e_abs = prev.start_pos[3]
+        for s in range(len(e_seg)):
+            if seg_len[s] <= 1e-9:
+                e_abs += e_seg[s]
+                continue
+            start = (pts[s][0], pts[s][1], pts[s][2], e_abs)
+            e_abs += e_seg[s]
+            end = (pts[s + 1][0], pts[s + 1][1], pts[s + 1][2], e_abs)
+            nm = Move(self, start, end, prev_speed if s == 0 else move_speed)
+            if interior[s]:
+                nm._corner_blend = True
+                # Centripetal cap so the velocity change stays in the straight
+                # legs, not the tiny arc chords.
+                if corner_v > 0.0 and corner_v * corner_v < nm.max_cruise_v2:
+                    nm.limit_speed(corner_v, nm.accel)
+            new_moves.append(nm)
+        if len(new_moves) < 2:
+            return None
+        return new_moves
 
     def _pathplan_cons(self, move):
         # Build the pathplan.Constraints oracle for one move. When TOPP-RA is
