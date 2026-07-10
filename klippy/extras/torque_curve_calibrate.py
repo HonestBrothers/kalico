@@ -345,20 +345,35 @@ class TorqueCurveCalibrate:
             saved["topp"] = tc
             tc.enabled = False
             gcmd.respond_info("Disabled TOPP-RA reshaping for calibration")
-        jl = getattr(self.toolhead, "jerk_limiting", None)
-        if jl is not None and getattr(jl, "enabled", False):
-            saved["jerk"] = jl
-            jl.enabled = False
-            gcmd.respond_info("Disabled jerk limiting for calibration")
-        # Optional raw-mode: drop input shaping so the accelerometer sees the
-        # unshaped resonance (default keeps shaping on = real-world vibration).
-        if (self.measure_vibration and self.vibration_shaper_off
-                and self.printer.lookup_object("input_shaper", None)):
-            self.gcode.run_script_from_command("DISABLE_INPUT_SHAPER")
-            saved["shaper"] = True
-            gcmd.respond_info(
-                "Input shaping disabled for raw vibration measurement"
-            )
+        # topp-ra-v3: the UNIFIED emitter's jerk limiting also replaces the raw
+        # trapezoid with an S-curve, so zero it for the sweep (0 = sharp
+        # constant-accel ladders). Restored (or re-derived by the FF) after.
+        if getattr(self.toolhead, "unified_max_jerk", 0.0):
+            saved["ujerk"] = self.toolhead.unified_max_jerk
+            self.toolhead.unified_max_jerk = 0.0
+            gcmd.respond_info("Zeroed unified_max_jerk for calibration")
+        # Optional raw-mode: drop the vibration reshapers so the accelerometer
+        # sees the UNSHAPED resonance (default keeps them on = real-world). On
+        # v3 the model-inverse FF is the active reshaper on Y (it replaced the
+        # input shaper); disabling it is what makes the ring-down measure the raw
+        # mode instead of the FF-canceled one.
+        if self.measure_vibration and self.vibration_shaper_off:
+            if self.printer.lookup_object("input_shaper", None):
+                self.gcode.run_script_from_command("DISABLE_INPUT_SHAPER")
+                saved["shaper"] = True
+                gcmd.respond_info(
+                    "Input shaping disabled for raw vibration measurement")
+            ff = getattr(self.toolhead, "model_inverse_ff", None)
+            if ff is not None and getattr(ff, "enabled", False):
+                saved["ff"] = ff
+                ff.enabled = False
+                try:
+                    ff._push()          # clear the C seam; max_da -> None
+                except Exception:
+                    logging.exception(
+                        "torque_curve_calibrate: FF disable push failed")
+                gcmd.respond_info(
+                    "Model-inverse FF disabled for raw vibration measurement")
         return saved
 
     def _restore_reshapers(self, saved, gcmd):
@@ -368,11 +383,22 @@ class TorqueCurveCalibrate:
         self.toolhead.flush_step_generation()
         if "topp" in saved:
             saved["topp"].enabled = True
-        if "jerk" in saved:
-            saved["jerk"].enabled = True
         if "shaper" in saved:
             self.gcode.run_script_from_command("ENABLE_INPUT_SHAPER")
-        gcmd.respond_info("Restored motion reshaping (TOPP-RA / jerk / shaper)")
+        if "ujerk" in saved:
+            self.toolhead.unified_max_jerk = saved["ujerk"]
+        if "ff" in saved:
+            saved["ff"].enabled = True
+            try:
+                # Re-push restores the C seam + max_da; if unified_auto_jerk is
+                # on, apply_auto_jerk here re-derives unified_max_jerk from the
+                # (possibly newly measured) FF frequency, overriding the restore.
+                saved["ff"]._push()
+            except Exception:
+                logging.exception(
+                    "torque_curve_calibrate: FF restore push failed")
+        gcmd.respond_info(
+            "Restored motion reshaping (unified jerk / FF / shaper)")
 
     def _get_current_position(self):
         """Get current position on test axis."""
@@ -875,14 +901,9 @@ class TorqueCurveCalibrate:
             "    applied shaper_type_%s=%s shaper_freq_%s=%.1f (live); run "
             "SAVE_CONFIG to persist."
             % (self.test_axis, best.name, self.test_axis, best.freq))
-        # Close the loop: re-derive auto_jerk from the freq we just applied.
-        jl = self.printer.lookup_object("jerk_limiting", None)
-        if jl is not None and getattr(jl, "auto_jerk", False):
-            try:
-                jl._apply_auto_jerk(gcmd)
-            except Exception:
-                logging.exception(
-                    "torque_curve_calibrate: auto_jerk recompute failed")
+        # (topp-ra-v3: the old [jerk_limiting] auto_jerk closer was removed with
+        # that module. The unified planner's auto_jerk is FF-driven and
+        # re-derives itself on SET_MODEL_FF -- see toolhead.apply_auto_jerk.)
 
     def _plot_shaper(self, cd, shapers, best, out_dir, stem):
         """Render a SHAPER_CALIBRATE-style PNG (PSD + shaper response curves).
