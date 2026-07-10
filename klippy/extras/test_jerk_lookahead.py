@@ -145,8 +145,63 @@ def test_jerk_reach_conservative_vs_emitter():
     print("  jerk_dist conservative vs emitter ramp (all cases) OK")
 
 
+def test_torque_curve_lookahead_emitter_consistent():
+    # With a torque curve (accel DECREASING with speed), the lookahead plans on
+    # the conservative constant a_of_v(v_top) while the emitter rides the full
+    # a_of_v(v). Because a_of_v(v) >= a_of_v(v_top) for v <= v_top, the emitter
+    # always has >= the accel the lookahead assumed -> it must never fall to the
+    # sharp/jerk-raise path (which would break the FF). This is the safety
+    # invariant of wiring the torque curve into the unified constraints.
+    import bisect
+    speeds = [0.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0]
+    accels = [20000.0, 18000.0, 15000.0, 12000.0, 9000.0, 6000.0, 4000.0]
+
+    def a_of_v(v):
+        v = abs(v)
+        if v <= speeds[0]:
+            return accels[0]
+        if v >= speeds[-1]:
+            return accels[-1]
+        i = bisect.bisect_right(speeds, v) - 1
+        f = (v - speeds[i]) / (speeds[i + 1] - speeds[i])
+        return accels[i] + f * (accels[i + 1] - accels[i])
+
+    J = 1155000.0
+    p2 = 1.0 / (2.0 * math.pi * 77.0) ** 2
+    step = 0.0125
+    cons = pp.Constraints(a_of_v=a_of_v, a_const=20000.0, v_ceil=300.0,
+                          dv_slice=25.0, max_jerk=J, jerk_dt=0.001,
+                          max_da=0.1 * step / p2)
+    n, cap = 30, 250.0
+    d = [1.0] * n
+    a_cons = a_of_v(cap)               # conservative constant (min over range)
+    vb = [0.0] * (n + 1)
+    vj = [0.0] + [cap] * (n - 1) + [0.0]
+    for k in range(n + 1):
+        vb[k] = vj[k]
+    for i in range(n - 1, -1, -1):
+        vb[i] = min(vb[i], math.sqrt(
+            pp.jerk_reach_v2(vb[i + 1] ** 2, d[i], a_cons, J, 300.0)))
+    for i in range(n):
+        vb[i + 1] = min(vb[i + 1], math.sqrt(
+            pp.jerk_reach_v2(vb[i] ** 2, d[i], a_cons, J, 300.0)))
+    vs = [vb[i] for i in range(n)]
+    ve = [vb[i + 1] for i in range(n)]
+    vc = [min(cap, math.sqrt(min(
+              pp.jerk_reach_v2(vs[i] ** 2, d[i], a_cons, J, 300.0),
+              pp.jerk_reach_v2(ve[i] ** 2, d[i], a_cons, J, 300.0))))
+          for i in range(n)]
+    raised = sum(1 for i in range(n)
+                 if pp._emit_jerk_core(vs[i], vc[i], ve[i], d[i], cons) is None)
+    assert raised == 0, "emitter fell to sharp/jerk-raise on %d moves" % raised
+    print("  torque-curve conservative-lookahead + a_of_v-emitter: 0 sharp "
+          "fallbacks (peak cruise %.1f mm/s, a_cons=%.0f) OK"
+          % (max(vc), a_cons))
+
+
 if __name__ == "__main__":
     test_jerk_reach_conservative_vs_emitter()
+    test_torque_curve_lookahead_emitter_consistent()
     test_stock_reach_would_have_crashed()
     test_polygon_circle_no_sharp_fallback()
     print("ALL PASS")

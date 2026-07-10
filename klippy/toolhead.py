@@ -90,7 +90,8 @@ class Move:
               if self.toolhead.unified_emit else 0.0)
         if uj > 0.0 and prev_move.is_kinematic_move:
             prev_reach_v2 = pathplan.jerk_reach_v2(
-                prev_move.max_start_v2, prev_move.move_d, prev_move.accel, uj,
+                prev_move.max_start_v2, prev_move.move_d,
+                self.toolhead._move_jerk_accel(prev_move), uj,
                 self.toolhead.max_velocity)
         else:
             prev_reach_v2 = prev_move.max_start_v2 + prev_move.delta_v2
@@ -194,9 +195,13 @@ class LookAheadQueue:
               if self.toolhead.unified_emit else 0.0)
         for i in range(flush_count - 1, -1, -1):
             move = queue[i]
+            # Jerk reach uses the conservative accel (torque-curve aware) so the
+            # plan never exceeds what the emitter's a_of_v can render.
+            m_accel = (self.toolhead._move_jerk_accel(move)
+                       if uj > 0.0 and move.is_kinematic_move else move.accel)
             if uj > 0.0 and move.is_kinematic_move:
                 reachable_start_v2 = pathplan.jerk_reach_v2(
-                    next_end_v2, move.move_d, move.accel, uj,
+                    next_end_v2, move.move_d, m_accel, uj,
                     self.toolhead.max_velocity)
             else:
                 reachable_start_v2 = next_end_v2 + move.delta_v2
@@ -241,10 +246,10 @@ class LookAheadQueue:
                         cruise_v2 = min(
                             cruise_v2,
                             pathplan.jerk_reach_v2(start_v2, move.move_d,
-                                                   move.accel, uj,
+                                                   m_accel, uj,
                                                    self.toolhead.max_velocity),
                             pathplan.jerk_reach_v2(next_end_v2, move.move_d,
-                                                   move.accel, uj,
+                                                   m_accel, uj,
                                                    self.toolhead.max_velocity),
                         )
                     move.set_junction(
@@ -376,6 +381,10 @@ class ToolHead:
             "unified_max_jerk", 0.0, minval=0.0)
         self.unified_jerk_dt = config.getfloat(
             "unified_jerk_dt", 0.001, above=0.0)
+        # Velocity quadrature step (mm/s) for the emitter's a_of_v reach when a
+        # torque curve feeds the unified constraints (velocity-dependent accel).
+        self.unified_torque_dv = config.getfloat(
+            "unified_torque_dv", 25.0, above=1.0)
         # Auto-derive unified_max_jerk from the model-inverse FF's mode
         # frequency: a mode at f_n is not excited when the accel ramp lasts >=
         # one period (a/J >= 1/f_n), i.e. J <= a*f_n. So set unified_max_jerk =
@@ -715,12 +724,39 @@ class ToolHead:
             return None
         return new_moves
 
+    def _active_torque_curve(self):
+        # The single enabled+loaded torque curve that feeds the unified
+        # constraints (velocity-dependent a_max(v)), or None -> motion uses the
+        # constant per-move accel. Independent of the retired enable_topp_ra
+        # flag; when no curve is loaded this returns None so behavior is
+        # byte-for-byte the constant-accel path.
+        for c in getattr(self, "torque_curves", ()):
+            if c.enabled and c.curve_loaded:
+                return c
+        return None
+
+    def _move_jerk_accel(self, move):
+        # Constant accel the jerk-aware LOOKAHEAD uses for `move`. With a torque
+        # curve active the emitter rides the full velocity-dependent a_of_v
+        # (higher at low speed); the lookahead must stay <= that everywhere so it
+        # never over-plans past what the emitter can render -- which would force
+        # the sharp fallback and break the model-inverse FF (a hard accel step ->
+        # multi-step position jump -> stepcompress). The curve decreases with
+        # speed, so a_of_v at the move's top speed is the min over its range, the
+        # safe conservative bound.
+        a = move.accel
+        tc = self._active_torque_curve()
+        if tc is not None:
+            ac = tc.get_max_accel_for_speed(math.sqrt(move.max_cruise_v2))
+            if ac is not None and ac > 0.0:
+                a = min(a, ac)
+        return a
+
     def _pathplan_cons(self, move):
-        # Build the pathplan.Constraints oracle for one move. When TOPP-RA is
-        # active the phase-plane a_max(v) is the torque curve (and reachability
-        # matches what the lookahead already solved via topp.reach); otherwise
-        # it is the move's constant accel, and a huge dv_slice makes
-        # emit_profile collapse to the stock single accel/cruise/decel
+        # Build the pathplan.Constraints oracle for one move. When a torque curve
+        # is loaded the phase-plane a_max(v) IS the curve (velocity-dependent
+        # accel); otherwise it is the move's constant accel and a huge dv_slice
+        # makes emit_profile collapse to the stock single accel/cruise/decel
         # trapezoid (identical geometry, one extra structural guarantee).
         jerk = self.unified_max_jerk or None
         jerk_dt = self.unified_jerk_dt
@@ -731,13 +767,15 @@ class ToolHead:
         # it), so non-FF behavior is unchanged.
         ff = getattr(self, "model_inverse_ff", None)
         max_da = ff.max_da if ff is not None else None
-        topp = getattr(self, "topp_ra", None)
-        if topp is not None and topp.active_for(move):
+        tc = self._active_torque_curve()
+        if tc is not None:
+            v_ceil = max(tc.speeds[-1], move.cruise_v, move.start_v,
+                         move.end_v) + 1.0
             return pathplan.Constraints(
-                a_of_v=topp.get_max_accel_for_speed,
+                a_of_v=tc.get_max_accel_for_speed,
                 a_const=move.accel,
-                v_ceil=topp.speeds[-1],
-                dv_slice=topp.dv_slice,
+                v_ceil=v_ceil,
+                dv_slice=self.unified_torque_dv,
                 max_jerk=jerk,
                 jerk_dt=jerk_dt,
                 max_da=max_da,
