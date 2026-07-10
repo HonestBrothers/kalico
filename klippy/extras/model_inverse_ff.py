@@ -203,17 +203,24 @@ class ModelInverseFF:
         self.printer.lookup_object("toolhead").model_inverse_ff = self
         self._push()
 
-    # Safety factor vs one step: the emitter's discrete taper can leave up to
-    # ~2*max_da at a seam, so cap the FF position jump p2*(2*max_da) well under
-    # a step. 0.3 -> worst-case jump ~0.6 step.
-    _DA_SAFETY = 0.3
+    # Safety factor vs one step. The worst accel jump the FF sees is ~4*max_da:
+    # at a TRIANGLE PEAK (accel ramp straight into a decel ramp, no cruise) the
+    # discrete taper floor (~2*max_da) on the accel side flips sign against the
+    # ~2*max_da on the decel side. So the FF position jump is p2*4*max_da; 0.1
+    # keeps it ~0.4 step with robust margin. (Only short fallback moves get the
+    # resulting finer slicing; normal moves are unaffected since max_da/J > dt.)
+    _DA_SAFETY = 0.1
 
     def _compute_max_da(self, kin):
         # Tightest per-segment path accel-change (mm/s^2) that keeps p2*da below
         # a fraction of a motor step on every FF-active axis. None if no axis is
         # active (then the emitter is unconstrained -- bare steppers / PA are
         # fine with velocity-continuous hard accel steps; only the FF isn't).
+        # Worst-case accel jump at a seam is ~4*max_da (a triangle-peak / corner
+        # where the accel taper floor (~2*max_da) flips sign), so _DA_SAFETY
+        # already accounts for the factor of 4.
         best = None
+        matched = []
         for stepper in kin.get_steppers():
             nm = stepper.get_name()
             for axis in ("x", "y"):
@@ -223,6 +230,9 @@ class ModelInverseFF:
                 if nm == "stepper_" + axis or nm.endswith("_" + axis):
                     lim = self._DA_SAFETY * stepper.get_step_dist() / p.p2
                     best = lim if best is None else min(best, lim)
+                    matched.append((nm, axis, stepper.get_step_dist()))
+        logging.info("model_inverse_ff: max_da=%s matched_steppers=%s"
+                     % (best, matched))
         return best
 
     def plan_accel_scale(self):
@@ -330,7 +340,8 @@ class ModelInverseFF:
     def get_status(self, eventtime):
         st = {"enabled": self.enabled, "robustness": self.robustness,
               "headroom": self.headroom,
-              "plan_accel_scale": self.plan_accel_scale()}
+              "plan_accel_scale": self.plan_accel_scale(),
+              "max_da": self.max_da}
         for axis in ("x", "y"):
             p = self.axes[axis]
             st[axis] = {"freq": p.freq_hz, "zeta": p.zeta,

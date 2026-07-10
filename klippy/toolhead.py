@@ -88,12 +88,19 @@ class Move:
         # TOPP-RA alone handles moves jerk doesn't claim (e.g. travel moves).
         jl = getattr(self.toolhead, "jerk_limiting", None)
         ptc = getattr(self.toolhead, "topp_ra", None)
+        uj = (self.toolhead.unified_max_jerk
+              if self.toolhead.unified_emit else 0.0)
         if jl is not None and jl.active_for(prev_move):
             prev_reach_v2 = jl.reach(
                 prev_move, prev_move.max_start_v2, prev_move.move_d
             )
         elif ptc is not None and ptc.active_for(prev_move):
             prev_reach_v2 = ptc.reach(prev_move.max_start_v2, prev_move.move_d)
+        elif uj > 0.0 and prev_move.is_kinematic_move:
+            # Jerk-aware reach across prev_move (matches the flush() lookahead).
+            prev_reach_v2 = pathplan.jerk_reach_v2(
+                prev_move.max_start_v2, prev_move.move_d, prev_move.accel, uj,
+                self.toolhead.max_velocity)
         else:
             prev_reach_v2 = prev_move.max_start_v2 + prev_move.delta_v2
         max_start_v2 = min(
@@ -188,6 +195,14 @@ class LookAheadQueue:
         next_end_v2 = next_smoothed_v2 = peak_cruise_v2 = 0.0
         tc = getattr(self.toolhead, "topp_ra", None)
         jl = getattr(self.toolhead, "jerk_limiting", None)
+        # Jerk-aware lookahead (topp-ra-v3): when the unified emitter renders
+        # moves jerk-limited, the reachable boundary speed is the jerk S-curve
+        # reach (slightly below the constant-accel reach), so every planned move
+        # is jerk-FEASIBLE and the emitter never falls to the sharp constant-accel
+        # fallback -- the precondition the model-inverse FF needs (a hard accel
+        # step would become a multi-step position jump -> stepcompress).
+        uj = (self.toolhead.unified_max_jerk
+              if self.toolhead.unified_emit else 0.0)
         for i in range(flush_count - 1, -1, -1):
             move = queue[i]
             # Jerk limiting (which rides the torque curve via accel_limit) takes
@@ -199,6 +214,10 @@ class LookAheadQueue:
                 reachable_start_v2 = mjl.reach(move, next_end_v2, move.move_d)
             elif mtc is not None:
                 reachable_start_v2 = mtc.reach(next_end_v2, move.move_d)
+            elif uj > 0.0 and move.is_kinematic_move:
+                reachable_start_v2 = pathplan.jerk_reach_v2(
+                    next_end_v2, move.move_d, move.accel, uj,
+                    self.toolhead.max_velocity)
             else:
                 reachable_start_v2 = next_end_v2 + move.delta_v2
             start_v2 = min(move.max_start_v2, reachable_start_v2)
@@ -250,6 +269,19 @@ class LookAheadQueue:
                             cruise_v2,
                             mtc.reach(start_v2, move.move_d),
                             mtc.reach(next_end_v2, move.move_d),
+                        )
+                    elif uj > 0.0 and move.is_kinematic_move:
+                        # Jerk S-curve peak is below the constant-accel midpoint;
+                        # clamp cruise to what is jerk-reachable from each end so
+                        # the emitted profile stays jerk-feasible (FF-safe).
+                        cruise_v2 = min(
+                            cruise_v2,
+                            pathplan.jerk_reach_v2(start_v2, move.move_d,
+                                                   move.accel, uj,
+                                                   self.toolhead.max_velocity),
+                            pathplan.jerk_reach_v2(next_end_v2, move.move_d,
+                                                   move.accel, uj,
+                                                   self.toolhead.max_velocity),
                         )
                     move.set_junction(
                         min(start_v2, cruise_v2),
@@ -376,6 +408,8 @@ class ToolHead:
             "unified_max_jerk", 0.0, minval=0.0)
         self.unified_jerk_dt = config.getfloat(
             "unified_jerk_dt", 0.001, above=0.0)
+        self._ff_prev_sa = 0.0    # FF diagnostic: prev signed path accel
+        self._ff_max_dsa = 0.0    # FF diagnostic: max signed-accel jump seen
         self.orig_cfg = {}
         self.orig_cfg["max_velocity"] = self.max_velocity
         self.orig_cfg["max_accel"] = self.max_accel
@@ -599,6 +633,13 @@ class ToolHead:
         seg_lists = (jl.plan_moves(moves)
                      if (not unified and jl is not None and jl.retime_active())
                      else None)
+        # FF crash diagnostic: track the largest SIGNED path-accel jump between
+        # consecutive emitted segments (within and across moves). The FF adds
+        # p2*a to the axis position, so this jump * p2 is the motor-position
+        # jump that can trip stepcompress. Active only when the FF is on.
+        ff_diag = getattr(self, "model_inverse_ff", None)
+        ff_diag = ff_diag if (unified and ff_diag is not None
+                              and getattr(ff_diag, "max_da", None)) else None
         for idx, move in enumerate(moves):
             move_dur = move.accel_t + move.cruise_t + move.decel_t
             segs = None
@@ -622,6 +663,21 @@ class ToolHead:
                 pos = 0.0
                 extruding = bool(move.axes_d[3])
                 for (at, ct, dt, sv, cv, a, dist) in segs:
+                    if ff_diag is not None:
+                        sa = (-a if dt > 0.0 else (a if at > 0.0 else 0.0))
+                        dsa = abs(sa - self._ff_prev_sa)
+                        self._ff_prev_sa = sa
+                        if dsa > self._ff_max_dsa:
+                            self._ff_max_dsa = dsa
+                            if dsa > 2.0 * ff_diag.max_da:
+                                logging.info(
+                                    "ff_diag: BIG signed-accel jump %.0f "
+                                    "(max_da=%.0f) move vs=%.1f vc=%.1f ve=%.1f "
+                                    "d=%.3f axr=(%.2f,%.2f) nseg=%d"
+                                    % (dsa, ff_diag.max_da, move.start_v,
+                                       move.cruise_v, move.end_v, move.move_d,
+                                       move.axes_r[0], move.axes_r[1],
+                                       len(segs)))
                     self.trapq_append(
                         self.trapq,
                         t,
