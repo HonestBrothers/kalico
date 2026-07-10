@@ -112,6 +112,53 @@ def peak_velocity(start_v, end_v, dist, cons):
     return lo
 
 
+def jerk_dist(v0, v1, accel, jerk):
+    # Path distance to change speed v0 -> v1 under a symmetric jerk-limited
+    # S-curve at constant max |accel| and max |jerk| (accel ramps 0 -> peak -> 0
+    # so a(t) is continuous). Closed form: distance = mean speed * duration,
+    # exact because a symmetric velocity S-curve's time-average speed is
+    # (v0+v1)/2. Serves accel and decel identically (uses |dv|). This is the
+    # analytic twin of _ramp_up_jerk's integrated distance -- used by the
+    # jerk-aware lookahead so it plans exactly the boundary speeds the jerk
+    # emitter can render (no move gets planned into the sharp fallback).
+    dv = abs(v1 - v0)
+    if dv <= 1e-12:
+        return 0.0
+    if jerk is None or jerk <= 0.0 or accel <= 0.0:
+        return abs(v1 * v1 - v0 * v0) / (2.0 * accel)
+    if dv <= accel * accel / jerk:
+        # Accel never saturates (triangular a(t)): T = 2*sqrt(dv/J).
+        t = 2.0 * math.sqrt(dv / jerk)
+    else:
+        # Accel saturates at `accel` (trapezoidal a(t)): T = dv/A + A/J.
+        t = dv / accel + accel / jerk
+    return 0.5 * (v0 + v1) * t
+
+
+def jerk_reach_v2(u0, dist, accel, jerk, v_ceil):
+    # Max u = v^2 reachable from v0=sqrt(u0) over path-distance `dist` under a
+    # jerk-limited S-curve (constant max accel/jerk). Jerk analog of reach_v2;
+    # direction-symmetric (forward accel == backward decel). Bisection on v1 over
+    # the O(1) closed-form jerk_dist -- cheap enough for the hot lookahead loop
+    # (no ramp integration). jerk None/0 -> stock constant-accel reach.
+    if dist <= 0.0:
+        return u0
+    if jerk is None or jerk <= 0.0 or accel <= 0.0:
+        return u0 + 2.0 * accel * dist
+    v0 = math.sqrt(max(u0, 0.0))
+    hi = max(v0, v_ceil)
+    if jerk_dist(v0, hi, accel, jerk) <= dist:
+        return hi * hi
+    lo = v0
+    for _ in range(48):
+        mid = 0.5 * (lo + hi)
+        if jerk_dist(v0, mid, accel, jerk) <= dist:
+            lo = mid
+        else:
+            hi = mid
+    return lo * lo
+
+
 def plan_batch(move_d, v_cap, v_junction, cons):
     """Solve feasible boundary velocities for a batch.
 
@@ -176,10 +223,18 @@ def _ramp_up_jerk(v0, v1, cons, collect=True):
     v = v0
     a = 0.0
     guard = 0
+    # Slice budget. When the jerk is raised for a short move, dt0 shrinks
+    # (dt0 = max_da/J) and a ramp can need more slices than any real move ever
+    # would. Hitting this cap means the ramp did NOT reach v1: the result would
+    # be a profile that exits at the wrong velocity with a large residual accel
+    # -- exactly the discontinuity the FF turns into a multi-step position jump
+    # (stepcompress). Treat that as INFEASIBLE (not a truncated-but-usable
+    # ramp) so the caller rejects this jerk and falls back cleanly.
     while v < v1 - 1e-9:
         guard += 1
         if guard > 500000:
-            break
+            # Did not converge to v1 -> signal infeasible, never emit.
+            return None, float("inf")
         rem = v1 - v
         a_curve = cons.a_max(v)
         if a_curve is None or a_curve <= 0.0:
@@ -189,7 +244,7 @@ def _ramp_up_jerk(v0, v1, cons, collect=True):
         if a_new <= 0.0:
             a_new = min(a_curve, a_brake)
             if a_new <= 0.0:
-                break
+                return None, float("inf")
         v_next = v + a_new * dt0
         this_dt = dt0
         if v_next >= v1:
@@ -250,11 +305,15 @@ def _emit_jerk_core(vs, vc, ve, move_d, cons):
     vc = max(vc, vs, ve)
     acc, d_acc = _ramp_up_jerk(vs, vc, cons)
     dec_acc, d_dec = _ramp_up_jerk(ve, vc, cons)
+    if acc is None or dec_acc is None:      # ramp did not converge -> reject
+        return None
     cruise_d = move_d - d_acc - d_dec
     if cruise_d < -1e-9:
         vc = max(_peak_velocity_jerk(vs, ve, move_d, cons), vs, ve)
         acc, d_acc = _ramp_up_jerk(vs, vc, cons)
         dec_acc, d_dec = _ramp_up_jerk(ve, vc, cons)
+        if acc is None or dec_acc is None:
+            return None
         cruise_d = move_d - d_acc - d_dec
         if cruise_d < -1e-6 * max(1.0, move_d):
             return None
