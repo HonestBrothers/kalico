@@ -578,21 +578,27 @@ stepcompress_find_past_position(struct stepcompress *sc, uint64_t clock)
             return hs->start_position + hs->step_count;
         int64_t ticks = clock - hs->first_clock;
         int64_t interval = hs->interval, add = hs->add, add2 = hs->add2;
-        int count = hs->step_count, shift = hs->shift;
+        // NOTE: count/left/right/cnt/offset are int64_t on purpose. The cubic
+        // terms below form cnt*(cnt-1)*(cnt-2), which overflows a 32-bit int
+        // for step counts above ~1290 -- signed overflow is undefined
+        // behaviour, and an optimizing build (-O3/-march=native) is entitled
+        // to miscompile around it. Keep this arithmetic 64-bit.
+        int64_t count = hs->step_count;
+        int shift = hs->shift;
         if (count < 0) count = -count;
         if (shift <= 0) {
-            int mul = 1 << -shift;
+            int64_t mul = (int64_t)1 << -shift;
             interval <<= -shift;
             add *= mul;
             add2 *= mul;
         } else {
-            ticks *= 1 << shift;
+            ticks *= (int64_t)1 << shift;
         }
         // When clock == hs->first_clock, offset == 1
         ticks += interval;
-        int left = 0, right = count;
+        int64_t left = 0, right = count;
         while (right - left > 1) {
-            int cnt = (left + right) / 2;
+            int64_t cnt = (left + right) / 2;
             int64_t step_clock = cnt * interval + cnt * (cnt-1) / 2 * add +
                 cnt * (cnt-1) * (cnt-2) / 6 * add2;
             if (step_clock <= ticks) left = cnt;
@@ -602,7 +608,7 @@ stepcompress_find_past_position(struct stepcompress *sc, uint64_t clock)
             left * (left-1) * (left-2) / 6 * add2;
         int64_t clock_right = right * interval + right * (right-1) / 2 * add +
             right * (right-1) * (right-2) / 6 * add2;
-        int offset = ticks - clock_left <= clock_right - ticks ? left : right;
+        int64_t offset = ticks - clock_left <= clock_right - ticks ? left : right;
         if (hs->step_count < 0)
             return hs->start_position - offset;
         return hs->start_position + offset;
