@@ -14,9 +14,13 @@ import cffi
 
 GCC_CMD = "gcc"
 COMPILE_ARGS = (
-    "-Wall -g -O3 -shared -fPIC"
-    " -flto -fwhole-program -fno-use-linker-plugin"
-    " -march=native -mcpu=native -mtune=native"
+    # NOTE: reverted to stock-safe flags. The previous set
+    #   -O3 -flto -fwhole-program -fno-use-linker-plugin -march=native ...
+    # miscompiled the (non-HP) step path and caused an intermittent host
+    # SIGSEGV during step generation. -fwhole-program is invalid for a .so,
+    # and -O3/-flto/-march=native exploited signed-overflow UB in
+    # stepcompress_find_past_position. See git history for the perf flags.
+    "-Wall -g -O2 -shared -fPIC"
     " -o %s %s"
 )
 SSE_FLAGS = "-mfpmath=sse -msse2"
