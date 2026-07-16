@@ -139,8 +139,27 @@ class TorqueCurveCalibrate:
         # sweep runs up to the theoretical back-EMF top speed (see below); when
         # given, it is still capped at that ceiling.
         self.speed_start = config.getfloat("speed_start", 50.0, above=0.0)
-        self.speed_end = config.getfloat("speed_end", None, above=0.0)
+        # Immutable config value. self.speed_end is the *per-run* working copy:
+        # _resolve_speed_end() writes the resolved ceiling back into it, and the
+        # PASS presets narrow it, so it must be restored from this at the start
+        # of every run or one run's resolution leaks into the next.
+        self._cfg_speed_end = config.getfloat("speed_end", None, above=0.0)
+        self.speed_end = self._cfg_speed_end
         self.speed_step = config.getfloat("speed_step", 25.0, above=0.0)
+
+        # Pass 1 (mode ID) sweeps only the RESONANCE-limited band; above it the
+        # axis is torque-limited (back-EMF) and the mode barely rings, so those
+        # bursts are low-SNR noise that drags the clustered f_n off the true
+        # mode. Measured on this machine: at 300mm/s the axis tolerates a mode
+        # amplitude of ~8800 at its accel limit (SNR 138-268, f_peak locked
+        # 74.2-74.9); by 500mm/s it skips at a@mode ~290 with SNR 30-39 and
+        # f_peak scattered 54-105Hz. The knee sits at ~400-450 (back-EMF is
+        # ~10.4V of the 24V rail there, and L/R=1.9ms swamps the 444us step
+        # period). So cap Pass 1 at the knee. Pass 2 (torque) still needs the
+        # full range -- that band IS the torque curve.
+        self.modeid_speed_end = config.getfloat(
+            "modeid_speed_end", 400.0, above=0.0
+        )
 
         # --- Theoretical top-speed model (optional) --------------------------
         # A stepper is a fixed-voltage device: past the speed where its back-EMF
@@ -2305,16 +2324,31 @@ class TorqueCurveCalibrate:
         if pass_name not in ("", "modeid", "torque", "ff"):
             raise gcmd.error("PASS must be modeid, torque, or ff")
         self._pass_name = pass_name
+        # Restore the per-run working copy from config BEFORE the presets touch
+        # it: _resolve_speed_end() writes its resolved ceiling back into
+        # self.speed_end, so without this an unset speed_end would stay pinned
+        # to the first run's theoretical max, and Pass 1's cap would leak into
+        # the torque/ff passes that follow it in CALIBRATE_Y_ALL.
+        self.speed_end = self._cfg_speed_end
         if pass_name == "modeid":
             self.measure_vibration = True
             self.vibration_shaper_off = True
             self.apply_shaper = True
+            # Only the resonance-limited band carries mode signal (see
+            # modeid_speed_end). Never widen a tighter configured speed_end.
+            if self.speed_end is None:
+                self.speed_end = self.modeid_speed_end
+            else:
+                self.speed_end = min(self.speed_end, self.modeid_speed_end)
             gcmd.respond_info(
-                "[PASS 1/3 MODE ID] Raw sweep, input shaper OFF so the axis "
-                "rings freely; cluster the resonance across speeds and set it "
-                "as the input-shaper frequency. Reason: that mode is what damps "
-                "the axis so Pass 2 can push accel to the real skip limit -- "
-                "undamped, the ringing trips skips far too early.")
+                "[PASS 1/3 MODE ID] Raw sweep to %.0f mm/s, input shaper OFF so "
+                "the axis rings freely; cluster the resonance across speeds and "
+                "set it as the input-shaper frequency. Reason: that mode is what "
+                "damps the axis so Pass 2 can push accel to the real skip limit "
+                "-- undamped, the ringing trips skips far too early. Capped at "
+                "the back-EMF knee: above it the axis is torque-limited, the "
+                "mode barely rings, and those low-SNR bursts drag f_n off the "
+                "true mode." % self.speed_end)
         elif pass_name == "torque":
             self.measure_vibration = False
             self.vibration_shaper_off = False
