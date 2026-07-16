@@ -14,11 +14,20 @@ import cffi
 
 GCC_CMD = "gcc"
 COMPILE_ARGS = (
-    "-Wall -g -O3 -shared -fPIC"
-    " -flto -fwhole-program -fno-use-linker-plugin"
+    # Reverted to stock-safe flags. Bleeding-edge built with
+    #   -O3 -flto -fwhole-program + NATIVE_FLAGS (-march=native),
+    # which miscompiled the (non-HP) step path and caused an intermittent
+    # host SIGSEGV during step generation (signed-overflow UB in
+    # stepcompress_find_past_position, and -fwhole-program is invalid for a
+    # .so). Keep plain -O2; NATIVE_FLAGS disabled below. See git history to
+    # restore perf flags once the source UB is fixed.
+    "-Wall -g -O2 -shared -fPIC"
     " -o %s %s"
 )
-NATIVE_FLAGS = "-march=native -mtune=native"
+# Was "-march=native -mtune=native"; disabled -- it re-introduces the
+# miscompile. Empty -> the gcc-option probe falls through to the safe
+# SSE/baseline path (x86-64 has SSE2 as baseline anyway).
+NATIVE_FLAGS = ""
 SSE_FLAGS = "-mfpmath=sse -msse2"
 NEON_FLAGS = "-mfpu=neon"
 SOURCE_FILES = [
