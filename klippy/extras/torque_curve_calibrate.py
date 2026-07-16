@@ -9,6 +9,122 @@ import os
 import subprocess
 
 
+class _ModeConvergence:
+    """Welch-averaged mode-frequency estimator with a per-burst SNR gate and a
+    running convergence test (Pass 1 of the unified calibration).
+
+    Fed one residual PSD per burst. Each burst is gated on its peak-to-median
+    ratio (SNR); accepted bursts are averaged onto a shared frequency grid, the
+    averaged peak is refit by parabolic interpolation, and the frequency is
+    declared converged once the last `window` refits all sit within `tol` Hz of
+    their mean. Pure and numpy-only (numpy handed in) so it can be exercised on
+    captured spectra with no hardware. See calibration_flow.md, Pass 1.
+    """
+
+    def __init__(self, snr_min, tol, window, max_bursts, band_lo, band_hi):
+        self.snr_min = snr_min
+        self.tol = tol
+        self.window = max(2, int(window))
+        self.max_bursts = max(1, int(max_bursts))
+        self.band_lo = band_lo
+        self.band_hi = band_hi
+        self._grid = None        # reference freq grid (first accepted burst)
+        self._psd_sum = None     # running sum of accepted PSDs, on _grid
+        self.n_accepted = 0
+        self.n_seen = 0          # total bursts fed (accepted + rejected)
+        self.per_burst = []      # single-burst peak fits (the convergence input)
+        self.history = []        # averaged-PSD peak after each accept (reported)
+        self.converged = False
+
+    def add_burst(self, np, freqs, spec):
+        """Fold one burst PSD (freqs, magnitude) in. Returns a status dict:
+        {accepted, snr, f_hat, f_burst, converged, n_accepted}.
+
+        Convergence is decided on the spread of the recent *single-burst* peaks
+        (do the individual measurements agree?), NOT on the averaged-PSD peak.
+        The averaged peak is 1/n-damped, so it stops moving from estimator
+        inertia alone -- a scattered mode (the ring-down failure this guards
+        against) would false-converge on it. The averaged peak is still the
+        reported f_n: lowest variance once the inputs are known to agree."""
+        self.n_seen += 1
+        band = (freqs >= self.band_lo) & (freqs <= self.band_hi)
+        snr = 0.0
+        if band.any():
+            sb = spec[band]
+            med = float(np.median(sb))
+            snr = float(sb.max()) / med if med > 0.0 else 0.0
+        if not band.any() or snr < self.snr_min:
+            return {"accepted": False, "snr": snr, "f_hat": self._last(),
+                    "f_burst": 0.0, "converged": self.converged,
+                    "n_accepted": self.n_accepted}
+        # Accepted. This burst's own peak feeds the convergence test...
+        f_burst = self._fit_peak(np, freqs, spec)
+        self.per_burst.append(f_burst)
+        # ...and its PSD averages (onto a shared grid; interp handles bursts of
+        # differing length) into the low-variance reported estimate.
+        if self._grid is None:
+            self._grid = freqs.copy()
+            self._psd_sum = spec.copy()
+        else:
+            self._psd_sum = self._psd_sum + np.interp(self._grid, freqs, spec)
+        self.n_accepted += 1
+        f_hat = self._fit_peak(np, self._grid, self._psd_sum / self.n_accepted)
+        self.history.append(f_hat)
+        # Converged when the last `window` single-burst peaks all sit within tol
+        # of their mean (they agree) AND the averaged estimate is consistent
+        # with them (no bimodal split hiding inside a tight window).
+        if len(self.per_burst) >= self.window:
+            win = self.per_burst[-self.window:]
+            m = sum(win) / len(win)
+            if (all(v > 0.0 and abs(v - m) <= self.tol for v in win)
+                    and f_hat > 0.0 and abs(f_hat - m) <= self.tol):
+                self.converged = True
+        return {"accepted": True, "snr": snr, "f_hat": f_hat,
+                "f_burst": f_burst, "converged": self.converged,
+                "n_accepted": self.n_accepted}
+
+    def _fit_peak(self, np, freqs, spec):
+        """Sub-bin peak of spec within the band by parabolic interpolation on
+        the log-magnitude around the max bin, or 0.0 if there's no usable peak."""
+        idx = np.where((freqs >= self.band_lo) & (freqs <= self.band_hi))[0]
+        if len(idx) < 3:
+            return 0.0
+        k = int(idx[int(np.argmax(spec[idx]))])
+        if k <= 0 or k >= len(spec) - 1:
+            return float(freqs[k])
+        y0 = math.log(max(float(spec[k - 1]), 1e-300))
+        y1 = math.log(max(float(spec[k]), 1e-300))
+        y2 = math.log(max(float(spec[k + 1]), 1e-300))
+        denom = y0 - 2.0 * y1 + y2
+        # denom >= 0 means the "peak" isn't concave (flat/edge) -> no sub-bin fit
+        delta = 0.5 * (y0 - y2) / denom if denom < 0.0 else 0.0
+        delta = max(-0.5, min(0.5, delta))
+        return float(freqs[k]) + delta * float(freqs[k + 1] - freqs[k])
+
+    def _last(self):
+        return self.history[-1] if self.history else 0.0
+
+    @property
+    def exhausted(self):
+        """True once the burst budget is spent without converging."""
+        return not self.converged and self.n_seen >= self.max_bursts
+
+    def verdict(self):
+        """(status, f_n, detail). status in
+        converged / not_converged / no_signal."""
+        if self.converged:
+            return ("converged", self._last(),
+                    "%d/%d bursts accepted; last %d refits within %.2f Hz"
+                    % (self.n_accepted, self.n_seen, self.window, self.tol))
+        if self.n_accepted == 0:
+            return ("no_signal", 0.0,
+                    "no burst cleared SNR>=%.1f (%d seen)"
+                    % (self.snr_min, self.n_seen))
+        return ("not_converged", self._last(),
+                "%d/%d bursts accepted; estimate still moving (last=%.1f Hz)"
+                % (self.n_accepted, self.n_seen, self._last()))
+
+
 class TorqueCurveCalibrate:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -78,6 +194,7 @@ class TorqueCurveCalibrate:
         # the real limit. 2.0 = double each step until the first skip.
         self.accel_growth = config.getfloat("accel_growth", 1.5, above=1.0)
 
+
         # Move distance for testing (mm). This caps the *largest* triangular
         # move (the low-accel end); each probe's actual distance is sized to
         # v^2/a so the profile is a pure accel/decel triangle with no cruise.
@@ -94,10 +211,40 @@ class TorqueCurveCalibrate:
             "min_move_distance", 2.0, above=0.0
         )
 
-        # Position tolerance for detecting lost steps (in mm)
-        self.position_tolerance = config.getfloat(
-            "position_tolerance", 0.1, above=0.0
+        # Lost-step detection threshold, expressed in FULL STEPS (not mm).
+        # A 2-phase hybrid only loses sync in whole electrical cycles (4 full
+        # steps), so a genuine skip lands >= ~4 full steps off at the verifying
+        # re-home. The endstop's own re-home scatter is ~1 full step and must
+        # NOT be flagged. Working in full steps puts the gate on that physics
+        # and auto-scales with rotation_distance / microsteps across machines.
+        # Default 2.5 sits between the ~1.4-step re-home phantom and the 4-step
+        # pole slip. See _lost_step_tol_mm().
+        self.position_tolerance_steps = config.getfloat(
+            "position_tolerance_steps", 2.5, above=0.0
         )
+        # Optional hard mm override. None -> derive the threshold from
+        # position_tolerance_steps * full-step distance (the default path).
+        self.position_tolerance = config.getfloat(
+            "position_tolerance", None, above=0.0
+        )
+        # Microsteps of the test-axis stepper, read from its own config section
+        # so we can convert the raw MCU step count (microsteps) into full steps.
+        self._axis_microsteps = None
+        try:
+            sec = config.getsection("stepper_" + self.test_axis)
+            self._axis_microsteps = sec.getint("microsteps", None, minval=1)
+        except Exception:
+            self._axis_microsteps = None
+
+        # Settle dwell held AFTER the stress burst, BEFORE the verification
+        # re-home. The FF is suspended for the sweep (raw trapezoids), so the
+        # lightly-damped Y mode rings freely after the burst; if the re-home
+        # fires while it is still oscillating, the endstop triggers at a
+        # displaced point and reports a phantom ~1-full-step "lost" drift that
+        # is NOT a real skip. Waiting ~5 mode time-constants (tau = 1/(zeta*wn),
+        # ~0.11s for red's 74.8Hz/zeta=0.019 -> ~0.55s) lets it ring down first
+        # so only genuine multi-mm stalls are flagged. 0 = disable.
+        self.settle_time = config.getfloat("settle_time", 0.6, minval=0.0)
 
         # Number of back-and-forth passes per (speed, accel) test. Each pass is
         # a hard apex slam; many passes accumulate winding heat (R rises ->
@@ -172,6 +319,32 @@ class TorqueCurveCalibrate:
         self.resonance_accel_frac = config.getfloat(
             "resonance_accel_frac", 0.85, above=0.0, maxval=1.0)
 
+        # --- Pass 1: mode-ID convergence test -------------------------------
+        # A single burst's PSD peak has real variance (this is what sank the
+        # ring-down -- its zero-crossings landed in the noise). So we Welch-
+        # average the residual PSD across bursts that clear an SNR gate, refit
+        # the averaged peak each time, and declare the frequency converged only
+        # once the running estimate stops moving. Runs passively alongside the
+        # sweep (each in-sync probe's clean residual is a burst); P1_ABORT=1
+        # raises if it never pins the mode down, so a bad mode ID can't quietly
+        # feed Pass 2. Band = [resonance_min_freq, resonance_max_freq].
+        self.p1_snr_min = config.getfloat("p1_snr_min", 6.0, minval=1.0)
+        # Convergence gate: the last p1_converge_window per-burst peaks must
+        # agree within this tol (Hz). Must be looser than the FFT bin (~0.78 Hz
+        # for a ~1.3 s / 1600 Hz capture) or independent burst peaks can never
+        # repeat tightly enough to latch. On red the mode locks in a ~0.4 Hz
+        # band while the pre-lock scatter jumps >4 Hz/burst, so 2 Hz sits in
+        # that gap: loose enough to latch, tight enough to reject a wanderer.
+        self.p1_converge_tol = config.getfloat(
+            "p1_converge_tol", 2.0, above=0.0)
+        self.p1_converge_window = config.getint(
+            "p1_converge_window", 3, minval=2)
+        self.p1_max_bursts = config.getint("p1_max_bursts", 20, minval=1)
+        # Default disposition of the abort gate; overridable per-run with
+        # P1_ABORT=. Passive (report-only) by default so it never fails a sweep
+        # that isn't being run as a dedicated Pass-1 mode ID.
+        self.p1_abort = config.getboolean("p1_abort", False)
+
         # Internal state
         self.calibration_running = False
         self.calibration_results = []
@@ -189,6 +362,12 @@ class TorqueCurveCalibrate:
         # the end of the sweep to produce the standard input-shaper graph.
         self._vib_caldata = None
         self._vib_sc = None
+        # Pass-1 convergence tracker (built lazily on the first fed burst) and
+        # its final verdict tuple (status, f_n, detail), set at finalization.
+        self._p1 = None
+        self._p1_verdict = None
+        # Which PASS preset the current run selected ("" = plain sweep).
+        self._pass_name = ""
 
         # Register event handler
         self.printer.register_event_handler(
@@ -352,28 +531,34 @@ class TorqueCurveCalibrate:
             saved["ujerk"] = self.toolhead.unified_max_jerk
             self.toolhead.unified_max_jerk = 0.0
             gcmd.respond_info("Zeroed unified_max_jerk for calibration")
-        # Optional raw-mode: drop the vibration reshapers so the accelerometer
-        # sees the UNSHAPED resonance (default keeps them on = real-world). On
-        # v3 the model-inverse FF is the active reshaper on Y (it replaced the
-        # input shaper); disabling it is what makes the ring-down measure the raw
-        # mode instead of the FF-canceled one.
+        # The model-inverse FF rewrites the trapezoid too: it adds p1*v + p2*a to
+        # the commanded position. It MUST be suspended for the sweep -- always,
+        # not just for raw-vibration capture -- for the SAME reason jerk limiting
+        # is zeroed above. With jerk limiting off the sweep commands raw
+        # trapezoids whose accel steps instantaneously; the FF's p2*a term then
+        # injects a p2*da position jump in that single step (at the sweep's
+        # extreme accels, p2=4.5e-6 * 10e6 = ~45mm) -> a step rate no MCU can
+        # emit -> "Timer too close" shutdown. It also biases the measured limit.
+        # Restored in _restore_reshapers.
+        ff = getattr(self.toolhead, "model_inverse_ff", None)
+        if ff is not None and getattr(ff, "enabled", False):
+            saved["ff"] = ff
+            ff.enabled = False
+            try:
+                ff._push()              # clear the C seam; max_da -> None
+            except Exception:
+                logging.exception(
+                    "torque_curve_calibrate: FF disable push failed")
+            gcmd.respond_info("Suspended model-inverse FF for calibration")
+        # Optional raw-mode: also drop the legacy INPUT SHAPER so the
+        # accelerometer sees the unshaped resonance (default keeps it on =
+        # real-world). The FF above is already unconditionally off.
         if self.measure_vibration and self.vibration_shaper_off:
             if self.printer.lookup_object("input_shaper", None):
                 self.gcode.run_script_from_command("DISABLE_INPUT_SHAPER")
                 saved["shaper"] = True
                 gcmd.respond_info(
                     "Input shaping disabled for raw vibration measurement")
-            ff = getattr(self.toolhead, "model_inverse_ff", None)
-            if ff is not None and getattr(ff, "enabled", False):
-                saved["ff"] = ff
-                ff.enabled = False
-                try:
-                    ff._push()          # clear the C seam; max_da -> None
-                except Exception:
-                    logging.exception(
-                        "torque_curve_calibrate: FF disable push failed")
-                gcmd.respond_info(
-                    "Model-inverse FF disabled for raw vibration measurement")
         return saved
 
     def _restore_reshapers(self, saved, gcmd):
@@ -828,6 +1013,35 @@ class TorqueCurveCalibrate:
                 self._accumulate_psd(np, bt, resid)
         self._speed_resid_buffer = []
 
+    def _p1_feed(self, np, bt, resid, gcmd):
+        """Feed one in-sync probe's clean residual to the Pass-1 convergence
+        tracker (built lazily). Reports the convergence transition once. The
+        SNR gate inside the tracker is a second, tunable quality filter on top
+        of the upstream clean-residual selection, so junk bursts that slip
+        through don't move the estimate."""
+        if bt is None or resid is None or len(bt) < 8:
+            return
+        freqs, spec = self._spectrum(np, bt, resid)
+        if freqs is None:
+            return
+        if self._p1 is None:
+            self._p1 = _ModeConvergence(
+                self.p1_snr_min, self.p1_converge_tol, self.p1_converge_window,
+                self.p1_max_bursts, self.resonance_min_freq,
+                self.resonance_max_freq)
+        was = self._p1.converged
+        st = self._p1.add_burst(np, freqs, spec)
+        if st["accepted"]:
+            # f_peak is this burst's own peak (what the convergence gate
+            # compares); f_n is the Welch-averaged peak (the reported estimate).
+            # Showing both makes a non-latch diagnosable: if f_n is steady but
+            # f_peak jitters wider than p1_converge_tol, the gate is starved.
+            gcmd.respond_info(
+                "    [P1] burst %d accepted (snr=%.1f) -> "
+                "f_peak=%.2f f_n=%.2f Hz%s"
+                % (st["n_accepted"], st["snr"], st["f_burst"], st["f_hat"],
+                   " CONVERGED" if st["converged"] and not was else ""))
+
     def _emit_shaper_graph(self, gcmd):
         """Fit shapers to the accumulated real-move spectrum and write the
         standard resonances CSV + a PNG graph (same as SHAPER_CALIBRATE)."""
@@ -904,6 +1118,55 @@ class TorqueCurveCalibrate:
         # (topp-ra-v3: the old [jerk_limiting] auto_jerk closer was removed with
         # that module. The unified planner's auto_jerk is FF-driven and
         # re-derives itself on SET_MODEL_FF -- see toolhead.apply_auto_jerk.)
+
+    def _learn_ff(self, gcmd):
+        """Pass 3: learn the model-inverse FF from the residual measured across
+        the skip test (input shaper on).
+
+        The residual's dominant mode across speeds (clustered resid_fpeak) is
+        the FF frequency; the ring-down fits near it give its damping ratio.
+        Set live via SET_MODEL_FF and staged into SAVE_CONFIG (freq_<ax> /
+        damping_ratio_<ax> in [model_inverse_ff]) so it persists.
+        """
+        res = self._structural_resonance()  # clusters resid_fpeak across speeds
+        if res is None:
+            gcmd.respond_info(
+                "  [FF] no clean residual mode across speeds; FF not set")
+            return
+        freq, nspeeds, nprobes = res
+        # zeta: median ring-down damping among clean fits near the residual mode
+        # (rd_fn = col 12, rd_zeta = col 13).
+        zetas = sorted(r[13] for r in self.vibration_rows
+                       if r[13] > 0.0 and r[12] > 0.0
+                       and abs(r[12] - freq) <= 8.0)
+        if not zetas:
+            zetas = sorted(r[13] for r in self.vibration_rows if r[13] > 0.0)
+        if not zetas:
+            gcmd.respond_info(
+                "  [FF] residual mode %.2f Hz found but no ring-down zeta; FF "
+                "not set (need clean ring-down data)" % freq)
+            return
+        zeta = zetas[len(zetas) // 2]
+        ax = self.test_axis
+        gcmd.respond_info(
+            "  [FF] residual mode %.2f Hz (clustered across %d speeds / %d "
+            "probes), zeta=%.4f (median of %d ring-downs)"
+            % (freq, nspeeds, nprobes, zeta, len(zetas)))
+        try:
+            self.gcode.run_script_from_command(
+                "SET_MODEL_FF FREQ_%s=%.3f DAMPING_RATIO_%s=%.4f ENABLE=1"
+                % (ax.upper(), freq, ax.upper(), zeta))
+            configfile = self.printer.lookup_object("configfile")
+            configfile.set("model_inverse_ff", "freq_" + ax, "%.3f" % freq)
+            configfile.set("model_inverse_ff", "damping_ratio_" + ax,
+                           "%.4f" % zeta)
+        except Exception:
+            logging.exception("torque_curve_calibrate: FF learn/apply failed")
+            gcmd.respond_info("  [FF] failed to set FF (see klippy.log)")
+            return
+        gcmd.respond_info(
+            "  [FF] model-inverse FF set live (freq_%s=%.2f damping_ratio_%s"
+            "=%.4f); run SAVE_CONFIG to persist." % (ax, freq, ax, zeta))
 
     def _plot_shaper(self, cd, shapers, best, out_dir, stem):
         """Render a SHAPER_CALIBRATE-style PNG (PSD + shaper response curves).
@@ -992,6 +1255,33 @@ class TorqueCurveCalibrate:
                     return stepper.get_step_dist()
         return None
 
+    def _full_step_dist(self):
+        """Belt travel (mm) per motor FULL step on the test axis.
+
+        get_step_dist() is mm per *micro*step; a full step is that times the
+        configured microsteps. Returns None if either is unknown.
+        """
+        sd = self._step_dist()
+        if not sd or not self._axis_microsteps:
+            return None
+        return sd * self._axis_microsteps
+
+    def _lost_step_tol_mm(self):
+        """Lost-step threshold in mm.
+
+        Derived from position_tolerance_steps (full steps) x the full-step
+        distance so the gate tracks the physics -- a real skip is a whole
+        electrical cycle (>= 4 full steps), re-home scatter is ~1 full step. An
+        explicit position_tolerance (mm) overrides. Falls back to a fixed mm if
+        the full-step size can't be resolved.
+        """
+        if self.position_tolerance is not None:
+            return self.position_tolerance
+        fs = self._full_step_dist()
+        if fs:
+            return self.position_tolerance_steps * fs
+        return 0.4
+
     def _home_and_measure(self):
         """Home the test axis and return the at-home stepper position.
 
@@ -1014,12 +1304,18 @@ class TorqueCurveCalibrate:
         an arbitrary position -- otherwise the difference is just the homing
         travel distance.
         """
+        # Let the freely-ringing (FF-suspended) mode decay before re-homing, so
+        # the endstop triggers at rest and we don't record a phantom ~1-step
+        # "loss" from homing mid-oscillation. See settle_time in __init__.
+        if self.settle_time > 0.0:
+            self.toolhead.dwell(self.settle_time)
+            self.toolhead.wait_moves()
         after = self._home_and_measure()
         if ref_home_pos is None or after is None:
             return False, 0.0
         step_dist = self._step_dist() or 0.0
         diff_mm = abs(after - ref_home_pos) * step_dist
-        return diff_mm > self.position_tolerance, diff_mm
+        return diff_mm > self._lost_step_tol_mm(), diff_mm
 
     def _axis_rotation_distance(self):
         """Belt travel per motor revolution (mm) for the test axis."""
@@ -1128,6 +1424,8 @@ class TorqueCurveCalibrate:
         self._vib_file = None
         self._progress_file = None
         self._vib_caldata = None
+        self._p1 = None
+        self._p1_verdict = None
 
         # Resume: reload completed speeds + the saved PSD; otherwise clear any
         # stale PSD checkpoint so a later RESUME can't pick up an old run's data.
@@ -1338,6 +1636,12 @@ class TorqueCurveCalibrate:
                             cr = vm.get("_clean_resid")
                             if cr is not None:
                                 self._speed_resid_buffer.append((test_accel, cr))
+                                # Pass-1 mode-ID convergence runs live off the
+                                # same in-sync residuals (SNR-gated + Welch-
+                                # averaged); an independent verdict from the raw
+                                # per-probe modes for a bad mode ID to trip on.
+                                import numpy as _np
+                                self._p1_feed(_np, cr[0], cr[1], gcmd)
                             # a@fn is measured at the detected mode (resid_fpeak)
                             # -- the de-floored amplitude of the real resonance.
                             gcmd.respond_info(
@@ -1430,6 +1734,24 @@ class TorqueCurveCalibrate:
             gcmd.respond_info(
                 "Calibration incomplete - not enough valid data points"
             )
+
+        # Pass 3: learn + set the model-inverse FF from the residual this run
+        # captured. Runs after all sweep outputs are written and motion is
+        # restored (via the finally block above).
+        if self._pass_name == "ff":
+            self._learn_ff(gcmd)
+
+        # Abort gate: only when this run is being treated as a dedicated Pass-1
+        # mode ID (P1_ABORT=1 / p1_abort). Raised last, after every output is
+        # written and motion is restored, so a failed mode ID can't silently
+        # feed Pass 2 but the operator keeps all captured data.
+        if self.p1_abort and self.measure_vibration:
+            status = (self._p1_verdict or ("no_signal", 0.0, ""))[0]
+            if status != "converged":
+                raise gcmd.error(
+                    "Pass-1 mode ID failed to converge (%s); aborting before "
+                    "the frequency is trusted. Loosen p1_converge_tol, raise "
+                    "p1_max_bursts, or lower p1_snr_min, then re-run." % status)
 
     def _compute_mode_margins(self, valid_results):
         """Mode SAFETY_MARGINs derived from the measured skip boundary.
@@ -1748,8 +2070,29 @@ class TorqueCurveCalibrate:
                    "" if not shaper
                    else " -- configured input shaper is %.1f Hz" % shaper)
             )
+        # Pass-1 convergence verdict (Welch-averaged, SNR-gated mode ID). This
+        # is the authoritative f_n for the FF/shaper; _structural_resonance
+        # above is a cross-check by speed-consistency.
+        self._report_p1_verdict(gcmd)
         # Fit shapers to the real-move spectrum and emit the input-shaper graph.
         self._emit_shaper_graph(gcmd)
+
+    def _report_p1_verdict(self, gcmd):
+        """Emit the Pass-1 convergence verdict; store it for the abort gate."""
+        if self._p1 is None:
+            self._p1_verdict = ("no_signal", 0.0, "no residual bursts captured")
+            return
+        self._p1_verdict = self._p1.verdict()
+        status, fn, detail = self._p1_verdict
+        if status == "converged":
+            gcmd.respond_info(
+                "Pass-1 mode ID CONVERGED: f_n = %.2f Hz (%s)"
+                % (fn, detail))
+        else:
+            gcmd.respond_info(
+                "Pass-1 mode ID did NOT converge [%s]: %s%s"
+                % (status, detail,
+                   "" if fn <= 0.0 else " -- best estimate %.1f Hz" % fn))
 
     def _structural_resonance(self, window=8.0):
         """Resonance frequency by speed-consistency, returned as
@@ -1790,7 +2133,9 @@ class TorqueCurveCalibrate:
             f.write("# Torque curve calibration results\n")
             f.write("# Axis: %s\n" % self.test_axis.upper())
             f.write("# Test distance: %.1f mm\n" % self.test_move_distance)
-            f.write("# Position tolerance: %.3f mm\n" % self.position_tolerance)
+            f.write("# Position tolerance: %.3f mm (%.2f full steps)\n"
+                    % (self._lost_step_tol_mm(),
+                       self._lost_step_tol_mm() / (self._full_step_dist() or 1.0)))
             f.write("speed,max_accel\n")
             for speed, accel in results:
                 f.write("%.2f,%.2f\n" % (speed, accel))
@@ -1858,6 +2203,51 @@ class TorqueCurveCalibrate:
         if self.calibration_running:
             raise gcmd.error("Calibration already in progress")
 
+        # PASS selector: preset the flag combo for one step of the three-pass
+        # flow. Each pass is the SAME sweep with different damping/capture, and
+        # every preset flag is still individually overridable below.
+        #   modeid  - raw ringing (shaper off): cluster the axis resonance and
+        #             apply it as the input-shaper freq. That mode is what damps
+        #             the axis for Pass 2 and parameterizes the FF for Pass 3.
+        #   torque  - input shaper ON (Pass-1 freq -> mode damped): the accel
+        #             search now reaches the REAL skip limits, not the resonance
+        #             floor an undamped axis trips super early.
+        #   ff      - (simple) enable the model-inverse FF at the identified mode
+        #             and report the residual it cancels.
+        # PASS omitted -> the plain configured sweep (back-compat).
+        pass_name = gcmd.get("PASS", "").strip().lower()
+        if pass_name not in ("", "modeid", "torque", "ff"):
+            raise gcmd.error("PASS must be modeid, torque, or ff")
+        self._pass_name = pass_name
+        if pass_name == "modeid":
+            self.measure_vibration = True
+            self.vibration_shaper_off = True
+            self.apply_shaper = True
+            gcmd.respond_info(
+                "[PASS 1/3 MODE ID] Raw sweep, input shaper OFF so the axis "
+                "rings freely; cluster the resonance across speeds and set it "
+                "as the input-shaper frequency. Reason: that mode is what damps "
+                "the axis so Pass 2 can push accel to the real skip limit -- "
+                "undamped, the ringing trips skips far too early.")
+        elif pass_name == "torque":
+            self.measure_vibration = False
+            self.vibration_shaper_off = False
+            self.apply_shaper = False
+            gcmd.respond_info(
+                "[PASS 2/3 TORQUE CURVE] Input shaper ON at the Pass-1 mode so "
+                "the axis is damped; run the accel search to the true skip "
+                "limit. Reason: with the resonance suppressed the measured "
+                "curve is the motor's real torque envelope, not a mode floor.")
+        elif pass_name == "ff":
+            self.measure_vibration = True
+            self.vibration_shaper_off = False
+            self.apply_shaper = False
+            gcmd.respond_info(
+                "[PASS 3/3 FF] Same skip test, input shaper ON, vibration "
+                "capture ON. Reason: measure the RESIDUAL the shaper leaves "
+                "behind across the full sweep, learn the FF mode(s) from it, "
+                "and set the model-inverse FF (FREQ_Y + DAMPING_RATIO_Y).")
+
         # Allow parameter overrides
         self.speed_start = gcmd.get_float(
             "SPEED_START", self.speed_start, above=0.0
@@ -1883,6 +2273,9 @@ class TorqueCurveCalibrate:
         self.test_cycles = gcmd.get_int(
             "TEST_CYCLES", self.test_cycles, minval=1
         )
+        self.position_tolerance_steps = gcmd.get_float(
+            "POSITION_TOLERANCE_STEPS", self.position_tolerance_steps, above=0.0
+        )
         self.output_file = gcmd.get("OUTPUT_FILE", self.output_file)
         self.measure_vibration = bool(gcmd.get_int(
             "MEASURE_VIBRATION", 1 if self.measure_vibration else 0,
@@ -1905,6 +2298,17 @@ class TorqueCurveCalibrate:
         # to <stem>_<axis>_progress.csv are skipped, their results + the saved
         # PSD accumulator are reloaded, and new data is appended.
         self._resume = bool(gcmd.get_int("RESUME", 0, minval=0, maxval=1))
+        # Pass-1 convergence overrides.
+        self.p1_snr_min = gcmd.get_float(
+            "P1_SNR_MIN", self.p1_snr_min, minval=1.0)
+        self.p1_converge_tol = gcmd.get_float(
+            "P1_CONVERGE_TOL", self.p1_converge_tol, above=0.0)
+        self.p1_converge_window = gcmd.get_int(
+            "P1_CONVERGE_WINDOW", self.p1_converge_window, minval=2)
+        self.p1_max_bursts = gcmd.get_int(
+            "P1_MAX_BURSTS", self.p1_max_bursts, minval=1)
+        self.p1_abort = bool(gcmd.get_int(
+            "P1_ABORT", 1 if self.p1_abort else 0, minval=0, maxval=1))
         # Resolve the accel chip if vibration was just enabled at runtime.
         if self.measure_vibration and self.accel_chip is None:
             self.accel_chip = self._lookup_accel_chip()
