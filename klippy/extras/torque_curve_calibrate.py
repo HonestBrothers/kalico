@@ -194,6 +194,28 @@ class TorqueCurveCalibrate:
         # the real limit. 2.0 = double each step until the first skip.
         self.accel_growth = config.getfloat("accel_growth", 1.5, above=1.0)
 
+        # Minimum length of the acceleration ramp, in MICROSTEPS. This is the
+        # real ceiling on a torque sweep -- accel_max is only a backstop.
+        #
+        # The ramp spans n = (v^2 / 2a) * steps_per_mm microsteps. Requiring
+        # n >= min_ramp_steps gives a per-speed accel ceiling
+        #     a_max(v) = v^2 * steps_per_mm / (2 * min_ramp_steps)
+        # Above it the "ramp" is shorter than a few microsteps, so:
+        #   * the motor never physically experiences the accel (it just starts
+        #     stepping at the cruise rate) -- it CANNOT skip, so the search
+        #     never brackets and climbs forever, and
+        #   * the commanded profile becomes a ~instantaneous velocity step,
+        #     which segfaults host step generation.
+        # e.g. 100mm/s @ 2.5e6 on a 80 step/mm axis = a 0.002mm / 0.16-microstep
+        # "ramp" -- that exact move killed the host.
+        #
+        # a_max grows as v^2 while the motor's skip accel falls with speed
+        # (back-EMF), so below their crossing speed the torque limit is simply
+        # not measurable -- the sweep now says so instead of crashing.
+        self.min_ramp_steps = config.getfloat(
+            "min_ramp_steps", 4.0, minval=0.0
+        )
+
 
         # Move distance for testing (mm). This caps the *largest* triangular
         # move (the low-accel end); each probe's actual distance is sized to
@@ -1266,6 +1288,34 @@ class TorqueCurveCalibrate:
             return None
         return sd * self._axis_microsteps
 
+    def _max_meaningful_accel(self, speed):
+        """Highest accel whose ramp still spans >= min_ramp_steps microsteps.
+
+        The accel phase covers d = v^2 / 2a mm, i.e.
+            n_ramp = (v^2 / 2a) * steps_per_mm   microsteps
+        Solving n_ramp >= min_ramp_steps for a:
+            a <= v^2 * steps_per_mm / (2 * min_ramp_steps)
+
+        Beyond this the ramp is sub-microstep: the motor never physically sees
+        the acceleration (so it can never skip -- the search would climb to
+        accel_max forever), and the commanded profile degenerates into a
+        velocity step that crashes host step generation.
+
+        Returns None when unknown/disabled (-> fall back to accel_max alone).
+        """
+        sd = self._step_dist()
+        if not sd or self.min_ramp_steps <= 0.0:
+            return None
+        steps_per_mm = 1.0 / sd
+        return (speed * speed * steps_per_mm) / (2.0 * self.min_ramp_steps)
+
+    def _ramp_steps(self, speed, accel):
+        """Microsteps spanned by the accel ramp (for reporting)."""
+        sd = self._step_dist()
+        if not sd or accel <= 0.0:
+            return 0.0
+        return (speed * speed) / (2.0 * accel) / sd
+
     def _lost_step_tol_mm(self):
         """Lost-step threshold in mm.
 
@@ -1573,11 +1623,32 @@ class TorqueCurveCalibrate:
                 min_accel_for_speed = (test_speed ** 2) / usable_distance
                 start_accel = max(self.accel_start, min_accel_for_speed)
 
-                if start_accel > self.accel_max:
-                    gcmd.respond_info(
-                        "  Speed %.0f mm/s requires accel > %.0f, skipping"
-                        % (test_speed, self.accel_max)
-                    )
+                # Per-speed ceiling: the accel above which the ramp spans fewer
+                # than min_ramp_steps microsteps and stops being a ramp at all.
+                # This -- not accel_max -- is what actually bounds the search;
+                # accel_max is just a backstop. Grows as v^2, so it only binds
+                # at low speed, exactly where the motor cannot skip anyway.
+                a_degen = self._max_meaningful_accel(test_speed)
+                accel_ceiling = self.accel_max
+                ceiling_is_degen = False
+                if a_degen is not None and a_degen < accel_ceiling:
+                    accel_ceiling = a_degen
+                    ceiling_is_degen = True
+
+                if start_accel > accel_ceiling:
+                    if ceiling_is_degen:
+                        gcmd.respond_info(
+                            "  Speed %.0f mm/s: not measurable -- even the "
+                            "starting accel %.0f gives a ramp under %.1f "
+                            "microsteps (ceiling %.0f); skipping"
+                            % (test_speed, start_accel, self.min_ramp_steps,
+                               accel_ceiling)
+                        )
+                    else:
+                        gcmd.respond_info(
+                            "  Speed %.0f mm/s requires accel > %.0f, skipping"
+                            % (test_speed, self.accel_max)
+                        )
                     continue
 
                 # Exponential-from-below search with refinement on overshoot.
@@ -1606,9 +1677,10 @@ class TorqueCurveCalibrate:
                 test_accel = start_accel
                 self._speed_resid_buffer = []  # this speed's clean residuals
                 while self.calibration_running:
-                    # Clamp: never above accel_max, never at/above a known skip.
-                    if test_accel > self.accel_max:
-                        test_accel = self.accel_max
+                    # Clamp: never above the ceiling (degeneracy or accel_max),
+                    # never at/above a known skip.
+                    if test_accel > accel_ceiling:
+                        test_accel = accel_ceiling
                     if skip_accel is not None and test_accel >= skip_accel:
                         test_accel = 0.5 * (last_good_accel + skip_accel)
 
@@ -1670,11 +1742,25 @@ class TorqueCurveCalibrate:
                     else:
                         gcmd.respond_info("  Accel %.0f: OK" % test_accel)
                         last_good_accel = test_accel
-                        if test_accel >= self.accel_max:
-                            gcmd.respond_info(
-                                "  Reached accel_max %.0f without skipping"
-                                % self.accel_max
-                            )
+                        if test_accel >= accel_ceiling:
+                            if ceiling_is_degen:
+                                # Not a torque limit -- we ran out of ramp. The
+                                # motor never saw the accel, so it could never
+                                # skip. Say so rather than reporting a number
+                                # that looks like a measurement.
+                                gcmd.respond_info(
+                                    "  No measurable torque limit at %.0f mm/s:"
+                                    " ramp degenerates first (accel %.0f spans"
+                                    " %.1f microsteps, min %.1f)"
+                                    % (test_speed, test_accel,
+                                       self._ramp_steps(test_speed, test_accel),
+                                       self.min_ramp_steps)
+                                )
+                            else:
+                                gcmd.respond_info(
+                                    "  Reached accel_max %.0f without skipping"
+                                    % self.accel_max
+                                )
                             break
                         test_accel = last_good_accel * growth
 
@@ -2269,6 +2355,11 @@ class TorqueCurveCalibrate:
         )
         self.accel_growth = gcmd.get_float(
             "ACCEL_GROWTH", self.accel_growth, above=1.0
+        )
+        # 0 disables the ramp-degeneracy ceiling (accel_max alone bounds the
+        # search again) -- only sane if you know the axis skips first.
+        self.min_ramp_steps = gcmd.get_float(
+            "MIN_RAMP_STEPS", self.min_ramp_steps, minval=0.0
         )
         self.test_cycles = gcmd.get_int(
             "TEST_CYCLES", self.test_cycles, minval=1
