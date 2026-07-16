@@ -409,6 +409,8 @@ class TorqueCurveCalibrate:
         self._p1_verdict = None
         # Which PASS preset the current run selected ("" = plain sweep).
         self._pass_name = ""
+        # Hann windows by length -- see _hann(): built once, elision-free.
+        self._hann_cache = {}
 
         # Register event handler
         self.printer.register_event_handler(
@@ -756,6 +758,39 @@ class TorqueCurveCalibrate:
         sig = np.asarray([s[idx] for s in samples], dtype=float)
         return t, sig - sig.mean()
 
+    def _hann(self, np, n):
+        """Hann window of length n: cached, and built WITHOUT tripping numpy's
+        temporary elision.
+
+        Do not use np.hanning() here. It evaluates 0.5 + 0.5*cos(pi*k/(M-1))
+        internally, and those big intermediates are refcount-1 temporaries, so
+        numpy tries to "elide" them (reuse the buffer in place). To prove that
+        is safe it calls check_callers() -> backtrace() to walk the C stack.
+        klippy runs gcode inside a greenlet, and greenlet copies a suspended
+        greenlet's C stack out to the heap and back on every switch -- so the
+        unwinder walks a stack that isn't where it thinks it is, reads unmapped
+        memory, and SIGSEGVs the whole klippy process. That is the intermittent
+        host crash: numpy 2.2.2 + greenlet 3.0.3, nothing to do with Kalico.
+
+        can_elide_temp() bails out when refcount != 1, and in-place ops / out=
+        never allocate an eliding temporary at all -- so the arithmetic below
+        can never reach backtrace(). Caching also means we build it once per
+        length instead of once per burst.
+        """
+        w = self._hann_cache.get(n)
+        if w is not None:
+            return w
+        if n < 2:
+            w = np.ones(max(n, 0), dtype=np.float64)
+        else:
+            w = np.arange(n, dtype=np.float64)
+            w *= 2.0 * np.pi / (n - 1)   # in-place scalar mul: no temp
+            np.cos(w, out=w)             # out=: no temp
+            w *= -0.5                    # in-place
+            w += 0.5                     # -> 0.5 - 0.5*cos(2*pi*k/(n-1))
+        self._hann_cache[n] = w
+        return w
+
     def _spectrum(self, np, times, sig):
         """(freqs, single-sided magnitude spectrum), or (None, None)."""
         if len(times) < 8:
@@ -763,8 +798,15 @@ class TorqueCurveCalibrate:
         dt = (times[-1] - times[0]) / (len(times) - 1)
         if dt <= 0:
             return None, None
-        win = np.hanning(len(sig))
-        spec = np.abs(np.fft.rfft(sig * win)) * (2.0 / win.sum())
+        win = self._hann(np, len(sig))
+        # Every intermediate is NAMED (refcount > 1 at the call) or written
+        # in-place. Chaining these -- np.abs(np.fft.rfft(sig * win)) * k --
+        # hands numpy refcount-1 temporaries and re-opens the elision ->
+        # backtrace -> greenlet-stack SIGSEGV path described in _hann().
+        windowed = sig * win
+        rfft = np.fft.rfft(windowed)
+        spec = np.abs(rfft)
+        spec *= 2.0 / win.sum()
         return np.fft.rfftfreq(len(sig), dt), spec
 
     def _mag_at(self, np, freqs, spec, fn):
@@ -977,7 +1019,14 @@ class TorqueCurveCalibrate:
         else:
             h[0] = 1.0
             h[1:(n + 1) // 2] = 2.0
-        env = np.abs(np.fft.ifft(np.fft.fft(rdsig) * h))
+        # Name every intermediate: chaining these hands numpy refcount-1
+        # temporaries, which re-opens the elision -> backtrace() -> greenlet-
+        # stack SIGSEGV path (see _hann()). Named operands have refcount > 1 at
+        # the call, so can_elide_temp() bails before it can unwind the stack.
+        spec_rd = np.fft.fft(rdsig)
+        spec_rd *= h                      # in-place: no eliding temp
+        analytic = np.fft.ifft(spec_rd)
+        env = np.abs(analytic)
         floor = (self._baseline or {}).get("rms", 0.0)
         m = env > max(env.max() * 0.1, floor)  # fit only above the noise floor
         if m.sum() < 16:
