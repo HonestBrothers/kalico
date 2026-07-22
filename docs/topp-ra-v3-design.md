@@ -50,23 +50,43 @@ x_motor(s) = y(s) + (2ζ/ωₙ)·y'(s)·ṡ + (1/ωₙ²)·[y'(s)·s̈ + y''(s)�
   problem; a fixed shaper's impulse timing is speed-independent.
 - Needs `y_des ∈ C²` → jerk limiting is what makes the FF well-posed (the two
   are the same programme, not separate features).
-- Structurally cannot cause the shaper crash: reads instantaneous v,a at the
-  *current* time, no time-shift/reordering. (May command small smooth reversals
-  to pre-cancel ringing — bounded by jerk-limited a; that's the physics.)
+- Structurally cannot cause the shaper crash: no time-shift or reordering of the
+  trajectory. (The `±hst` velocity difference is *symmetric* — it derives `a`, it
+  does not delay or re-order the output the way a convolution shaper does.) May
+  command small smooth reversals to pre-cancel ringing — bounded by jerk-limited
+  a; that's the physics.
 
 ## Klipper insertion points
 - Emission seam: `toolhead.py _process_moves` (today loops jerk/topp slices →
   `trapq_append`). Becomes: emit the single feasible profile. **DONE** (Stage
   1+2, `unified_planner` flag).
 - FF seam: `kin_shaper.c` modifies the stepper *kinematic position function*.
-  **DONE** (Stage 4 C): `ff_calc_axis` computes `y + c1·v + c2·a` from the
-  trapq move's pos/vel/accel at time t (v=start_v+2·half_accel·t, a=2·half_accel
-  — pointwise, no time shift), gated per axis behind `ff_x/ff_y.enabled`.
-  `input_shaper_set_ff_params(sk, axis, enabled, c1, c2)` sets it and clears any
-  pulses/smoother on that axis (FF replaces the shaper; step-gen window → 0).
+  **DONE** (Stage 4 C): `ff_calc_axis` computes `y + c1·v + c2·a` per axis, gated
+  behind `ff_x/ff_y.enabled`.
+  `input_shaper_set_ff_params(sk, axis, enabled, c1, c2, hst)` sets it and clears
+  any pulses/smoother on that axis (FF replaces the shaper).
   `model_inverse_ff.py` wraps the steppers (same input_shaper struct) and pushes
   the 2nd-order coeffs. Verified: `test/test_ff_seam.c` calls the compiled
-  `calc_position_cb` and matches `y+p1·v+p2·a` to 0.0 error.
+  `calc_position_cb` — legacy exactness, mid-move exactness, and boundary
+  continuity (jump raw 0.016 mm → smoothed 0.0).
+- **Accel is NOT read pointwise off the trapq (changed 2026-07-22).** The trapq
+  exposes `a = 2·half_accel`, a *piecewise-constant staircase*, so `c2·a` stepped
+  by `c2·Δa` at every move boundary — and because the jerk ramp is built from many
+  short constant-accel slices, at *every slice boundary*, with magnitude
+  `c2·J·dt₀`. Since `c2 = 1/ωₙ²` this explodes at low `freq_y`: 0.134 mm (~11
+  microsteps demanded instantaneously) at `freq_y=21` → `MCU shutdown: Timer too
+  close` (the MCU was *not* loaded — `mcu_awake=0.008`; it was an impossible
+  instantaneous step *rate*). `a` is now derived from a `±hst` **central
+  difference of velocity** (`ff_axis_velocity`, projected per-move — a neighbour
+  can have a different `axes_r`, so differencing raw scalar speeds across a corner
+  is silently wrong). Velocity is continuous across trapq boundaries, so the
+  result is continuous and each accel step becomes a linear ramp. Cost:
+  `sinc(ωₙ·hst)` attenuation at the cancelled mode (~0.3% at 21 Hz, hst=1 ms).
+  Config `smooth_time` (default 0.5 ms); `0` = legacy staircase, bit-for-bit.
+- **⚠️ Step-gen window is no longer 0.** Reading `v(t±hst)` crosses into
+  neighbouring moves, so `shaper_note_generation_time()` sets
+  `gen_steps_pre_active = gen_steps_post_active = hst`. Omit that and the
+  move-list walk touches *freed* moves → intermittent garbage/segfault.
 
 ## FF realization: 2nd-order pointwise vs 4th-order (robustness)
 The C seam realizes the **2nd-order** exact inverse `x = y + p1·v + p2·a`
@@ -99,17 +119,20 @@ FF does no smoothing (sharp features preserved), so that derate is dropped.
 Instead the torque-curve `a_max(v)` now bounds the *motor* trajectory
 `x=y+corrections`; the FF inflates motor accel by `b1·jerk+b2·snap+…`
 (`motor_accel_extra`). A `headroom` fraction reserves `a_max(v)` for this — the
-tool planner runs against `plan_accel_scale()·a_max(v)`. And the accel term is
-discontinuous on coarse trapq: an accel jump `Δa` makes an
-`b2·Δa` motor-position jump (measured 0.085 mm at 20000 mm/s² → stepcompress).
-Hence **the C application of the accel term (and all of `r>0`) requires the
-continuous-accel/C³ trajectory from Stage 3.** At `r=0`, only `b1·v` (velocity
-lead, continuous) + `b2·a` are used; `r=0` is safe once accel is continuous.
+tool planner runs against `plan_accel_scale()·a_max(v)`. The accel term *was*
+discontinuous on coarse trapq: an accel jump `Δa` made a `b2·Δa` motor-position
+jump (0.085 mm at 20000 mm/s² → stepcompress). **Superseded 2026-07-22:** the
+seam now derives `a` from smoothed velocity, so `c2·a` is continuous regardless
+of trapq granularity. The accel term therefore **no longer depends on Stage 3
+for crash-safety** — Stage 3 remains valuable for the physics (and for keeping
+the *commanded* motion sane), but it is no longer the precondition. `r>0` still
+requires the C³/C⁴ trajectory, because `b3·jerk + b4·snap` are derivatives the
+trapq does not carry at all.
 
 Delivered as a tested pure-math library + `[model_inverse_ff]` Klipper object
-(SET_MODEL_FF live tuning, get_status, best-effort C push; planner-only until
-the C seam lands). The C seam (`ff_*_calc_position` in kin_shaper.c, smoothed
-v/a for continuity) is the next step and rides Stage 3.
+(SET_MODEL_FF live tuning, get_status, C push; falls back to planner-only if the
+C symbol is absent). The C seam (`ff_calc_axis` in kin_shaper.c) is **BUILT**,
+including the smoothed-v/a continuity work it was waiting on.
 
 ## Jerk (the honest wrinkle) — approach (A) BUILT
 TOPP-RA is 2nd-order (`u`, `u'`); jerk is 3rd-order (`s⃛`). Options:
@@ -130,9 +153,18 @@ residual accel ≤ `2·J·dt0` (partial slice triggers at `rem ≤ a·dt0`
 ⟹ `a ≤ 2J·dt0`). That residual is the *only* accel discontinuity left, and it
 is FF-safe by design: mapped through the FF accel coefficient `b2 = 1/ωₙ²`, the
 motor-position jump is `b2·2J·dt0` — measured **0.0008 mm** (vs a 0.0125 mm
-step) for the 77 Hz mode at `J=1e5, dt0=1ms`. So **Stage 3 is precisely the
-precondition that makes the Stage-4 accel term (`b2·a`) crash-safe**: it turns
-the hard trapezoid accel step (0.085 mm FF jump = crash) into a sub-step taper.
+step) for the 77 Hz mode at `J=1e5, dt0=1ms`.
+
+**Correction 2026-07-22 — the claim above that the taper residual is the *only*
+accel discontinuity left is WRONG, and it misdirected a debugging session.** The
+jerk ramp is emitted as many short constant-accel slices, so accel steps by
+`J·dt₀` at *every slice boundary*, not just the final one; each was a `b2·J·dt₀`
+FF position jump. That is why shrinking `dt₀` appeared to "fix" things (it scales
+every jump linearly, pushing them under the one-microstep quantization floor)
+while the real defect was structural. The seam-level fix (smoothed accel, above)
+removes the whole class. Stage 3 is consequently **no longer the precondition**
+for a crash-safe Stage-4 accel term — useful for the motion physics, not load-
+bearing for stepcompress safety.
 Config: `[printer] unified_max_jerk` (0=off), `unified_jerk_dt` (default 1ms).
 
 ## Migration stages
