@@ -184,6 +184,9 @@ smoother_calc_position(const struct move *m, int axis, double move_time
 struct ff_axis {
     int enabled;
     double c1, c2;
+    // Half-width of the central difference used to derive a continuous
+    // acceleration from velocity. 0 = legacy raw (piecewise-constant) accel.
+    double hst;
 };
 
 struct input_shaper {
@@ -195,17 +198,58 @@ struct input_shaper {
     struct ff_axis ff_x, ff_y;
 };
 
-// Model-inverse FF axis position: y + c1*v + c2*a, all along the move's axis.
-// v(t)=start_v+2*half_accel*t, a=2*half_accel (constant within a trapq move).
+// Axis-projected velocity at a time offset from move m, walking the trapq move
+// list as needed. Velocity is CONTINUOUS across trapq boundaries (only the
+// acceleration steps there), so any finite difference of this is continuous.
+// Projecting per-move is required: a neighbouring move may have a different
+// direction vector, and differencing raw scalar speeds across a corner is wrong.
+static inline double
+ff_axis_velocity(const struct move *m, int axis, double t)
+{
+    while (unlikely(t < 0.)) {
+        m = list_prev_entry(m, node);
+        t += m->move_t;
+    }
+    while (unlikely(t > m->move_t)) {
+        t -= m->move_t;
+        m = list_next_entry(m, node);
+    }
+    return m->axes_r.axis[axis - 'x'] * (m->start_v + 2. * m->half_accel * t);
+}
+
+// Model-inverse FF axis position: y + c1*v + c2*a, per axis.
+//
+// The trapq exposes acceleration as a piecewise-constant staircase
+// (a = 2*half_accel, constant within a move), so reading it directly makes the
+// c2*a term step by c2*da at EVERY move boundary -> an instantaneous motor
+// position jump -> stepcompress / MCU "Timer too close". The jerk ramp is built
+// from many short constant-accel slices, so this fires at every slice boundary,
+// with magnitude c2*J*dt0; it scales as c2 = 1/wn^2 and thus explodes at low
+// freq_y (0.134mm ~ 11 microsteps at 21Hz was an MCU shutdown).
+//
+// Instead derive `a` from a central difference of velocity over +/-hst. Since v
+// is continuous across boundaries the result is continuous, and each accel step
+// becomes a linear ramp of width 2*hst -- the jump class is removed by
+// construction, independent of dt0, jerk or freq_y. Cost is an attenuation of
+// sinc(wn*hst) at the cancelled mode (~0.3% at 21Hz with hst=1ms).
 static inline double
 ff_calc_axis(const struct move *m, int axis, double move_time
              , const struct ff_axis *ff)
 {
-    double axis_r = m->axes_r.axis[axis - 'x'];
+    int i = axis - 'x';
+    double axis_r = m->axes_r.axis[i];
     double dist = move_get_distance(m, move_time);
-    double v = m->start_v + 2. * m->half_accel * move_time;
-    double a = 2. * m->half_accel;
-    return m->start_pos.axis[axis - 'x'] + axis_r * (dist + ff->c1*v + ff->c2*a);
+    double v = axis_r * (m->start_v + 2. * m->half_accel * move_time);
+    double a;
+    if (likely(ff->hst > 0.)) {
+        double h = ff->hst;
+        a = (ff_axis_velocity(m, axis, move_time + h)
+             - ff_axis_velocity(m, axis, move_time - h)) * (0.5 / h);
+    } else {
+        // Legacy raw staircase (bit-for-bit the previous behaviour).
+        a = axis_r * 2. * m->half_accel;
+    }
+    return m->start_pos.axis[i] + axis_r * dist + ff->c1 * v + ff->c2 * a;
 }
 
 // Optimized calc_position when only x axis is needed
@@ -328,6 +372,18 @@ shaper_note_generation_time(struct input_shaper *is)
         post_active = is->sm_y.hst - is->sm_y.t_offs > post_active
             ? is->sm_y.hst - is->sm_y.t_offs : post_active;
     }
+    // Model-inverse FF with smoothed accel reads velocity at +/-hst, crossing
+    // into neighbouring trapq moves. The trapq must therefore keep that much
+    // history AND future alive on both sides -- without this the walk in
+    // ff_axis_velocity() can touch freed moves (intermittent garbage/segfault).
+    if ((is->sk.active_flags & AF_X) && is->ff_x.enabled && is->ff_x.hst > 0.) {
+        if (is->ff_x.hst > pre_active) pre_active = is->ff_x.hst;
+        if (is->ff_x.hst > post_active) post_active = is->ff_x.hst;
+    }
+    if ((is->sk.active_flags & AF_Y) && is->ff_y.enabled && is->ff_y.hst > 0.) {
+        if (is->ff_y.hst > pre_active) pre_active = is->ff_y.hst;
+        if (is->ff_y.hst > post_active) post_active = is->ff_y.hst;
+    }
     is->sk.gen_steps_pre_active = pre_active;
     is->sk.gen_steps_post_active = post_active;
 }
@@ -352,11 +408,14 @@ input_shaper_set_shaper_params(struct stepper_kinematics *sk, char axis
 }
 
 // Set (or clear) the model-inverse feedforward for one axis. Enabling it
-// clears any input shaper/smoother on that axis (FF replaces them) so the
-// step-generation window drops to 0 -- the FF is pointwise, no look-ahead.
+// clears any input shaper/smoother on that axis (FF replaces them). With
+// hst > 0 the accel term is derived from a +/-hst central difference of
+// velocity, so the step-generation window becomes hst on BOTH sides (see
+// shaper_note_generation_time). hst = 0 keeps the legacy pointwise raw accel
+// and a zero window.
 int __visible
 input_shaper_set_ff_params(struct stepper_kinematics *sk, char axis
-                           , int enabled, double c1, double c2)
+                           , int enabled, double c1, double c2, double hst)
 {
     if (axis != 'x' && axis != 'y')
         return -1;
@@ -369,6 +428,7 @@ input_shaper_set_ff_params(struct stepper_kinematics *sk, char axis
     ff->enabled = enabled;
     ff->c1 = c1;
     ff->c2 = c2;
+    ff->hst = hst > 0. ? hst : 0.;
     if (enabled) {
         sp->num_pulses = 0;
         memset(sm, 0, sizeof(*sm));

@@ -189,6 +189,16 @@ class ModelInverseFF:
         # Enabled only when an axis actually has a mode frequency; off by
         # default (freq defaults to 0) so a bare [model_inverse_ff] is inert.
         self.enabled = config.getboolean("enabled", True)
+        # Half-width of the central difference the C seam uses to derive a
+        # CONTINUOUS acceleration from velocity for the p2*a term. The trapq
+        # exposes accel as a piecewise-constant staircase, so reading it raw
+        # makes p2*a jump by p2*da at every move boundary -> stepcompress /
+        # "Timer too close" (scales as 1/wn^2, so it explodes at low freq).
+        # Pick hst >= the jerk-ramp slice period (so consecutive slices blend)
+        # and << the mode period (so the FF still tracks real accel). Cost is
+        # sinc(wn*hst) attenuation at the cancelled mode: ~0.3% at 21Hz/1ms.
+        # 0 disables smoothing (legacy raw staircase).
+        self.smooth_time = config.getfloat("smooth_time", 0.0005, minval=0.0)
         self._wrapped = {}  # id(stepper) -> gc-held is_sk wrapper
         self.max_da = None  # per-segment accel-change cap for the emitter
         # Suspend the FF during homing. The FF adds p1*v + p2*a to the motor
@@ -317,7 +327,7 @@ class ModelInverseFF:
             # Disable on anything we previously wrapped; never wrap just to off.
             for is_sk in self._wrapped.values():
                 for axis in ("x", "y"):
-                    setter(is_sk, axis.encode(), 0, 0.0, 0.0)
+                    setter(is_sk, axis.encode(), 0, 0.0, 0.0, 0.0)
             return
         for stepper in kin.get_steppers():
             if stepper.get_trapq() is None:
@@ -328,8 +338,11 @@ class ModelInverseFF:
             for axis in ("x", "y"):
                 p = self.axes[axis]
                 en = 1 if p.wn > 0.0 else 0
-                # 2nd-order pointwise inverse: x = y + p1*v + p2*a
-                setter(is_sk, axis.encode(), en, p.p1, p.p2)
+                # 2nd-order inverse: x = y + p1*v + p2*a. p2*a is the jump
+                # source when `a` is the raw trapq staircase, so hand the C seam
+                # a smoothing half-width: it derives `a` from a +/-hst central
+                # difference of velocity (continuous) instead. 0 = legacy raw.
+                setter(is_sk, axis.encode(), en, p.p1, p.p2, self.smooth_time)
 
     cmd_SET_MODEL_FF_help = ("Tune model-inverse feedforward "
                              "(FREQ_X/Y, DAMPING_RATIO_X/Y, ROBUSTNESS, "

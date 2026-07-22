@@ -206,7 +206,7 @@ defs_kin_shaper = """
     int input_shaper_set_smoother_params(struct stepper_kinematics *sk
         , char axis, int n, double a[], double t_sm);
     int input_shaper_set_ff_params(struct stepper_kinematics *sk, char axis
-        , int enabled, double c1, double c2);
+        , int enabled, double c1, double c2, double hst);
     int input_shaper_set_sk(struct stepper_kinematics *sk
         , struct stepper_kinematics *orig_sk);
     struct stepper_kinematics * input_shaper_alloc(void);
