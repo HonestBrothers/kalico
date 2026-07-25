@@ -8,7 +8,7 @@ import logging
 import math
 
 from . import chelper
-from .extras import pathplan
+from .extras import cornerblend, pathplan
 from .extras.danger_options import get_danger_options
 from .kinematics import extruder
 
@@ -82,22 +82,12 @@ class Move:
             return
         # Allow extruder to calculate its maximum junction
         extruder_v2 = self.toolhead.extruder.calc_junction(prev_move, self)
-        # Reachability across prev_move is a reshaper's integral, not a
-        # constant-accel delta_v2, when one is active. Jerk limiting wraps the
-        # torque curve (its accel_limit rides a_max(v)), so it takes precedence;
-        # TOPP-RA alone handles moves jerk doesn't claim (e.g. travel moves).
-        jl = getattr(self.toolhead, "jerk_limiting", None)
-        ptc = getattr(self.toolhead, "topp_ra", None)
+        # Reachability across prev_move: the jerk-aware S-curve reach when the
+        # unified emitter renders moves jerk-limited (matches flush()), else the
+        # stock constant-accel delta_v2.
         uj = (self.toolhead.unified_max_jerk
               if self.toolhead.unified_emit else 0.0)
-        if jl is not None and jl.active_for(prev_move):
-            prev_reach_v2 = jl.reach(
-                prev_move, prev_move.max_start_v2, prev_move.move_d
-            )
-        elif ptc is not None and ptc.active_for(prev_move):
-            prev_reach_v2 = ptc.reach(prev_move.max_start_v2, prev_move.move_d)
-        elif uj > 0.0 and prev_move.is_kinematic_move:
-            # Jerk-aware reach across prev_move (matches the flush() lookahead).
+        if uj > 0.0 and prev_move.is_kinematic_move:
             prev_reach_v2 = pathplan.jerk_reach_v2(
                 prev_move.max_start_v2, prev_move.move_d, prev_move.accel, uj,
                 self.toolhead.max_velocity)
@@ -193,8 +183,6 @@ class LookAheadQueue:
         # after the last move.
         delayed = []
         next_end_v2 = next_smoothed_v2 = peak_cruise_v2 = 0.0
-        tc = getattr(self.toolhead, "topp_ra", None)
-        jl = getattr(self.toolhead, "jerk_limiting", None)
         # Jerk-aware lookahead (topp-ra-v3): when the unified emitter renders
         # moves jerk-limited, the reachable boundary speed is the jerk S-curve
         # reach (slightly below the constant-accel reach), so every planned move
@@ -205,16 +193,7 @@ class LookAheadQueue:
               if self.toolhead.unified_emit else 0.0)
         for i in range(flush_count - 1, -1, -1):
             move = queue[i]
-            # Jerk limiting (which rides the torque curve via accel_limit) takes
-            # precedence; TOPP-RA alone covers moves jerk doesn't claim.
-            mjl = jl if (jl is not None and jl.active_for(move)) else None
-            mtc = (tc if (mjl is None and tc is not None
-                          and tc.active_for(move)) else None)
-            if mjl is not None:
-                reachable_start_v2 = mjl.reach(move, next_end_v2, move.move_d)
-            elif mtc is not None:
-                reachable_start_v2 = mtc.reach(next_end_v2, move.move_d)
-            elif uj > 0.0 and move.is_kinematic_move:
+            if uj > 0.0 and move.is_kinematic_move:
                 reachable_start_v2 = pathplan.jerk_reach_v2(
                     next_end_v2, move.move_d, move.accel, uj,
                     self.toolhead.max_velocity)
@@ -254,23 +233,7 @@ class LookAheadQueue:
                         move.max_cruise_v2,
                         peak_cruise_v2,
                     )
-                    if mjl is not None:
-                        # The constant-accel midpoint isn't the triangle peak
-                        # under jerk + a velocity-dependent accel limit; clamp
-                        # to what is reachable from each end across the move.
-                        cruise_v2 = min(
-                            cruise_v2,
-                            mjl.reach(move, start_v2, move.move_d),
-                            mjl.reach(move, next_end_v2, move.move_d),
-                        )
-                    elif mtc is not None:
-                        # Same clamp for the TOPP-RA-only (no jerk) case.
-                        cruise_v2 = min(
-                            cruise_v2,
-                            mtc.reach(start_v2, move.move_d),
-                            mtc.reach(next_end_v2, move.move_d),
-                        )
-                    elif uj > 0.0 and move.is_kinematic_move:
+                    if uj > 0.0 and move.is_kinematic_move:
                         # Jerk S-curve peak is below the constant-accel midpoint;
                         # clamp cruise to what is jerk-reachable from each end so
                         # the emitted profile stays jerk-feasible (FF-safe).
@@ -300,38 +263,42 @@ class LookAheadQueue:
         # Remove processed moves from the queue
         del queue[:flush_count]
 
+    def _splice_corner_chain(self, chain):
+        # Replace queue[-1] (the sharp prev move) with chain[0] (trimmed) and
+        # append the arc + trimmed-move, running the same kinematic/extruder
+        # limit checks every queued move gets (these are synthesized here and
+        # never pass through ToolHead.move()).
+        kin = self.toolhead.kin
+        extruder = self.toolhead.extruder
+        for nm in chain:
+            if nm.is_kinematic_move:
+                kin.check_move(nm)
+            if nm.axes_d[3]:
+                extruder.check_move(nm)
+        self.queue[-1] = chain[0]
+        if len(self.queue) >= 2:
+            self.queue[-1].calc_junction(self.queue[-2])
+        for nm in chain[1:]:
+            self.queue.append(nm)
+            nm.calc_junction(self.queue[-2])
+            self.junction_flush -= nm.min_move_t
+        if self.junction_flush <= 0.0:
+            self.flush(lazy=True)
+
     def add_move(self, move):
-        # Jerk limiting Phase 3: round a sharp corner by replacing the previous
-        # queued move + this move with a trimmed-prev / blend / trimmed-move
-        # chain. Falls back to the stock path when no blend applies.
-        jl = getattr(self.toolhead, "jerk_limiting", None)
-        if (jl is not None and jl.corners_active() and self.queue
+        # Track layer height (for per-move extrusion-width inference) on every
+        # move before any corner splice reshapes the stream.
+        if self.toolhead.corner_blend:
+            self.toolhead.note_layer_height(move)
+        # Bead-bounded corner blend (topp-ra-v3): round a sharp extruding corner
+        # into a tangent arc within the bead-derived deviation, rendered by the
+        # unified emitter. Falls through to the stock path when no blend applies.
+        if (self.toolhead.corner_blend and self.queue
                 and move.is_kinematic_move
                 and self.queue[-1].is_kinematic_move):
-            chain = jl.round_corner(self.queue[-1], move)
+            chain = self.toolhead.plan_corner_blend(self.queue[-1], move)
             if chain is not None:
-                # These corner moves are synthesized here and never pass
-                # through ToolHead.move(), so apply the same kinematic and
-                # extruder limit checks every queued move normally gets.
-                # Without this they keep the global max_accel and unbounded
-                # extrusion; pressure advance then turns the corner into an
-                # extruder step-rate spike that overflows stepcompress.
-                kin = self.toolhead.kin
-                extruder = self.toolhead.extruder
-                for nm in chain:
-                    if nm.is_kinematic_move:
-                        kin.check_move(nm)
-                    if nm.axes_d[3]:
-                        extruder.check_move(nm)
-                self.queue[-1] = chain[0]
-                if len(self.queue) >= 2:
-                    self.queue[-1].calc_junction(self.queue[-2])
-                for nm in chain[1:]:
-                    self.queue.append(nm)
-                    nm.calc_junction(self.queue[-2])
-                    self.junction_flush -= nm.min_move_t
-                if self.junction_flush <= 0.0:
-                    self.flush(lazy=True)
+                self._splice_corner_chain(chain)
                 return
         self.queue.append(move)
         if len(self.queue) == 1:
@@ -419,6 +386,45 @@ class ToolHead:
         self.unified_auto_jerk = config.getboolean("unified_auto_jerk", False)
         self.unified_auto_jerk_ratio = config.getfloat(
             "unified_auto_jerk_ratio", 1.0, above=0.0)
+        # Bead-bounded corner blending (topp-ra-v3): replace a sharp EXTRUDING
+        # corner with a bounded-angle approximation of a tangent arc. Deviation
+        # is bounded by the extruded bead (ratio * bead_width), and the unified
+        # emitter renders every chord. Off by default.
+        self.corner_blend = config.getboolean("corner_blend", False)
+        # Bead width: 0 (default) derives it from the extruder nozzle_diameter *
+        # corner_bead_ratio at first use (typical extrusion width ~1.0-1.2x the
+        # nozzle). Set corner_bead_width > 0 to override with a literal width.
+        self.corner_bead_width = config.getfloat(
+            "corner_bead_width", 0.0, minval=0.0)
+        self.corner_bead_ratio = config.getfloat(
+            "corner_bead_ratio", 1.125, above=0.0)
+        self._corner_bead_w = None       # resolved lazily from the nozzle
+        # Layer height for per-move extrusion-width inference: 0 (default) =
+        # DERIVE it from the Z rise between extruding moves; set > 0 to pin it.
+        # With a layer height, each move's real bead width is computed from its
+        # own extrusion, width = filament_area*E/(move_d*h) -- so thin/gap-fill
+        # beads get a proportionally tighter deviation bound automatically.
+        self.corner_layer_height = config.getfloat(
+            "corner_layer_height", 0.0, minval=0.0)
+        self._layer_height = 0.0          # derived from the move stream
+        self._last_extrude_z = None
+        self.corner_deviation_ratio = config.getfloat(
+            "corner_deviation_ratio", 0.15, above=0.0, maxval=0.5)
+        self.corner_blend_ratio = config.getfloat(
+            "corner_blend_ratio", 0.4, above=0.0, maxval=0.5)
+        self.corner_min_turn = config.getfloat("corner_min_turn", 8.0,
+                                               minval=0.0, below=180.0)
+        self.corner_max_turn = config.getfloat("corner_max_turn", 150.0,
+                                               minval=0.0, below=180.0)
+        if self.corner_min_turn > self.corner_max_turn:
+            raise config.error(
+                "corner_min_turn must not exceed corner_max_turn")
+        self.corner_chord_ratio = config.getfloat(
+            "corner_chord_ratio", 1.0, above=0.0)
+        self.corner_max_chord_angle = config.getfloat(
+            "corner_max_chord_angle", 5.0, above=0.0, maxval=45.0)
+        self.corner_max_extrusion_scale = config.getfloat(
+            "corner_max_extrusion_scale", 1.35, minval=1.0)
         self._ff_prev_sa = 0.0    # FF diagnostic: prev signed path accel
         self._ff_max_dsa = 0.0    # FF diagnostic: max signed-accel jump seen
         self.orig_cfg = {}
@@ -612,6 +618,114 @@ class ToolHead:
                 "toolhead auto_jerk: %.2f*a*f_n -> unified_max_jerk=%.0f [%s]"
                 % (self.unified_auto_jerk_ratio, best, ", ".join(parts)))
 
+    def note_layer_height(self, move):
+        # Derive the layer height as the Z rise between EXTRUDING moves (Z-hops
+        # are travel moves -> naturally skipped). Runs per move from add_move.
+        if not (move.is_kinematic_move and move.axes_d[3]):
+            return
+        z = move.end_pos[2]
+        lz = self._last_extrude_z
+        if lz is not None and z > lz + 1e-6:
+            self._layer_height = z - lz
+        if lz is None or abs(z - lz) > 1e-6:
+            self._last_extrude_z = z
+
+    def _extrusion_width(self, move, h):
+        # Actual deposited bead width (mm) of an extruding move: cross-section
+        # area (filament_area * E / XY_len) divided by layer height h. None when
+        # the move doesn't carry usable extrusion.
+        e = move.axes_d[3]
+        if e <= 0.0 or move.move_d <= 1e-9 or h <= 0.0:
+            return None
+        fd = getattr(self.extruder, "filament_diameter", None)
+        if not fd:
+            return None
+        fil_area = math.pi * (fd * 0.5) ** 2
+        return fil_area * e / move.move_d / h
+
+    def _bead_width(self):
+        # Static fallback width (mm): the literal corner_bead_width if set, else
+        # nozzle_diameter * corner_bead_ratio read from the extruder once.
+        if self.corner_bead_width > 0.0:
+            return self.corner_bead_width
+        if self._corner_bead_w is None:
+            nd = getattr(self.extruder, "nozzle_diameter", None)
+            self._corner_bead_w = (nd * self.corner_bead_ratio if nd
+                                   else 0.45)
+            logging.info("corner_blend: static bead_width=%.3f (nozzle=%s*%.3f)"
+                         % (self._corner_bead_w, nd, self.corner_bead_ratio))
+        return self._corner_bead_w
+
+    def _corner_bead_width(self, prev, move):
+        # Effective bead width for the corner: per-move inferred from each leg's
+        # own extrusion (min of the two -> conservative) using the pinned or
+        # derived layer height; falls back to the static nozzle-based width.
+        h = self.corner_layer_height or self._layer_height
+        if h > 0.0:
+            ws = [w for w in (self._extrusion_width(prev, h),
+                              self._extrusion_width(move, h)) if w is not None]
+            if ws:
+                return min(ws)
+        return self._bead_width()
+
+    def plan_corner_blend(self, prev, move):
+        # Bead-bounded corner blend for the sharp EXTRUDING corner prev->move.
+        # Returns [trimmed_prev, *arc_moves, trimmed_move] (new Move objects) or
+        # None to leave it sharp. The arc moves are ordinary Move objects fed
+        # through the normal lookahead + unified emitter, so they get check_move,
+        # jerk-aware planning, FF safety and pressure advance -- unlike the old
+        # jerk_limiting round_corners constant-accel fallback.
+        if not (move.is_kinematic_move and prev.is_kinematic_move):
+            return None
+        # Only blend positive-extrusion corners. Travels, retracting wipes, and
+        # mixed extrusion transitions retain their original path.
+        if move.axes_d[3] <= 0.0 or prev.axes_d[3] <= 0.0:
+            return None
+        # A callback marks the original endpoint as a semantic boundary for a
+        # synchronized pin/fan/etc. change. Do not remove that endpoint.
+        if prev.timing_callbacks:
+            return None
+        delta_max = cornerblend.bead_deviation(
+            self._corner_bead_width(prev, move), self.corner_deviation_ratio)
+        ch = cornerblend.plan_blend_chain(
+            prev.start_pos, prev.end_pos[:3], move.end_pos,
+            prev.axes_d[3], move.axes_d[3], prev.move_d, move.move_d,
+            min(prev.accel, move.accel), delta_max,
+            blend_ratio=self.corner_blend_ratio,
+            min_turn_deg=self.corner_min_turn,
+            max_turn_deg=self.corner_max_turn,
+            chord_len=self.corner_chord_ratio * self.corner_bead_width,
+            max_chord_angle_deg=self.corner_max_chord_angle,
+            max_extrusion_scale=self.corner_max_extrusion_scale)
+        if ch is None:
+            return None
+        Move = type(move)
+        pts, e_seg = ch["pts"], ch["e_seg"]
+        interior, seg_len = ch["interior"], ch["seg_len"]
+        corner_v = ch["corner_v"]
+        prev_speed = math.sqrt(prev.max_cruise_v2)
+        move_speed = math.sqrt(move.max_cruise_v2)
+        new_moves = []
+        e_abs = prev.start_pos[3]
+        for s in range(len(e_seg)):
+            if seg_len[s] <= 1e-9:
+                e_abs += e_seg[s]
+                continue
+            start = (pts[s][0], pts[s][1], pts[s][2], e_abs)
+            e_abs += e_seg[s]
+            end = (pts[s + 1][0], pts[s + 1][1], pts[s + 1][2], e_abs)
+            nm = Move(self, start, end, prev_speed if s == 0 else move_speed)
+            if interior[s]:
+                nm._corner_blend = True
+                # Cap every chord to the circular path's centripetal speed.
+                # Junction handling applies the tighter polyline-turn limits.
+                if corner_v > 0.0 and corner_v * corner_v < nm.max_cruise_v2:
+                    nm.limit_speed(corner_v, nm.accel)
+            new_moves.append(nm)
+        if len(new_moves) < 2:
+            return None
+        return new_moves
+
     def _pathplan_cons(self, move):
         # Build the pathplan.Constraints oracle for one move. When TOPP-RA is
         # active the phase-plane a_max(v) is the torque curve (and reachability
@@ -655,22 +769,12 @@ class ToolHead:
             self._calc_print_time()
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
-        topp = getattr(self, "topp_ra", None)
-        jl = getattr(self, "jerk_limiting", None)
-        # Unified phase-plane emitter (topp-ra-v3): one monotonic emit per move,
-        # replacing the jerk-slice / topp per-move chains. The lookahead has
-        # already solved the boundary velocities (move.start_v/cruise_v/end_v)
-        # honoring the same reachability; emit_profile just renders them.
+        # Unified phase-plane emitter (topp-ra-v3): one monotonic emit per move.
+        # The lookahead has already solved the boundary velocities
+        # (move.start_v/cruise_v/end_v) honoring the same reachability;
+        # emit_profile just renders them. When unified is off, moves fall to the
+        # stock single accel/cruise/decel trapezoid (the `else` below).
         unified = self.unified_emit
-        # Jerk limiting plans the whole batch at once (it coalesces collinear
-        # runs into single ramps); it returns None for any move it doesn't
-        # reshape, which then falls back to TOPP-RA's per-move plan. Jerk rides
-        # the torque curve via accel_limit, so the two never reshape the same
-        # move. Both emit the identical (accel_t, cruise_t, decel_t, start_v,
-        # cruise_v, accel, dist) slice tuple consumed below.
-        seg_lists = (jl.plan_moves(moves)
-                     if (not unified and jl is not None and jl.retime_active())
-                     else None)
         # FF crash diagnostic: track the largest SIGNED path-accel jump between
         # consecutive emitted segments (within and across moves). The FF adds
         # p2*a to the axis position, so this jump * p2 is the motor-position
@@ -688,15 +792,10 @@ class ToolHead:
                     move.start_v, move.cruise_v, move.end_v,
                     move.move_d, self._pathplan_cons(move)
                 ) or None
-            if segs is None and seg_lists is not None:
-                segs = seg_lists[idx]
-            if segs is None and move.is_kinematic_move and topp is not None:
-                segs = topp.plan_move(move)
             if segs is not None:
-                # TOPP-RA: emit the velocity-dependent-accel profile as a chain
-                # of constant-accel slices, driving the toolhead trapq and the
-                # extruder trapq in lock-step so pressure advance integrates the
-                # real profile.
+                # Emit the profile as a chain of constant-accel slices, driving
+                # the toolhead trapq and the extruder trapq in lock-step so
+                # pressure advance integrates the real profile.
                 t = next_move_time
                 pos = 0.0
                 extruding = bool(move.axes_d[3])
