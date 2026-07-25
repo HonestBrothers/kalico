@@ -1,6 +1,7 @@
 # Bead-bounded corner blending geometry tests.
 # Run: /home/brandon/klippy-env/bin/python klippy/extras/test_cornerblend.py
 import math
+
 import cornerblend as cb
 
 
@@ -109,6 +110,13 @@ def test_chord_length_reasonable():
     print("  arc chords <= target chord_len OK")
 
 
+def test_chord_angle_bounded():
+    P = cb.plan_corner((0, 0, 0), (10, 0, 0), (10, 10, 0), 0.1,
+                       chord_len=10.0, max_chord_angle_deg=5.0)
+    assert len(P["pts"]) + 1 == 18
+    print("  arc subdivision also bounded by chord angle OK")
+
+
 def test_blend_chain_conserves_extrusion():
     prev_start = (0.0, 0.0, 0.0, 0.0)
     vertex = (10.0, 0.0, 0.0)
@@ -134,6 +142,7 @@ def test_blend_chain_conserves_extrusion():
     assert abs(ch["corner_v"] - math.sqrt(15000.0 * ch["r"])) < 1e-9
     # extrusion is non-negative everywhere
     assert all(e >= -1e-12 for e in ch["e_seg"])
+    assert ch["extrusion_scale"] <= 1.35
     print("  plan_blend_chain conserves E (%.4f), endpoints kept, corner_v=%.1f "
           "mm/s OK" % (sum(ch["e_seg"]), ch["corner_v"]))
 
@@ -150,6 +159,21 @@ def test_blend_chain_asymmetric_extrusion():
     print("  plan_blend_chain asymmetric legs/extrusion conserves E OK")
 
 
+def test_blend_chain_rejects_nonpositive_extrusion():
+    args = ((0, 0, 0, 0), (5, 0, 0), (5, 5, 0, 0))
+    assert cb.plan_blend_chain(*args, -0.2, -0.2, 5.0, 5.0, 1000.0, 0.1) is None
+    assert cb.plan_blend_chain(*args, 0.2, -0.2, 5.0, 5.0, 1000.0, 0.1) is None
+    print("  retracting and mixed-extrusion corners skipped OK")
+
+
+def test_blend_chain_bounds_extrusion_density():
+    args = ((0, 0, 0, 0), (10, 0, 0), (1.34, 5, 0, 0))
+    assert cb.plan_blend_chain(
+        *args, 0.5, 0.5, 10.0, 10.0, 1000.0, 0.1,
+        max_turn_deg=160.0, max_extrusion_scale=1.35) is None
+    print("  excessive corner extrusion density skipped OK")
+
+
 if __name__ == "__main__":
     test_bead_deviation()
     test_corner_geometry_angles()
@@ -158,6 +182,9 @@ if __name__ == "__main__":
     test_plan_corner_skips()
     test_trim_capped_by_leg()
     test_chord_length_reasonable()
+    test_chord_angle_bounded()
     test_blend_chain_conserves_extrusion()
     test_blend_chain_asymmetric_extrusion()
+    test_blend_chain_rejects_nonpositive_extrusion()
+    test_blend_chain_bounds_extrusion_density()
     print("ALL PASS")

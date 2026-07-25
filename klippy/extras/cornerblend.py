@@ -6,13 +6,13 @@
 # cross-track, height h) so a printed corner is already rounded at scale ~w/2;
 # a toolpath rounding whose deviation stays well under that is optically
 # indistinguishable from a true corner. Keeping the tool moving through the
-# corner (no velocity zero) also stops pressure advance decompress/recompress
-# blobs, and the arc is C1 in position so the model-inverse FF's v,a inputs
-# never step (the whole stepcompress-crash precondition).
+# corner (no velocity zero) also reduces pressure advance
+# decompress/recompress blobs. The target circle is tangent to both legs; the
+# emitted path is a bounded-angle polyline approximation because Move is linear.
 #
 # Pure (only `math`), toolhead-decoupled -> unit-testable in isolation. The
 # toolhead adapter splices the returned points into the move stream and lets the
-# UNIFIED emitter render them (so blend moves get jerk limiting + FF safety +
+# UNIFIED emitter render them (so blend moves get jerk limiting + FF handling +
 # pressure advance for free -- unlike the old jerk_limiting round_corners, which
 # fell back to a constant-accel path and bypassed check_move/PA).
 #
@@ -66,7 +66,8 @@ def blend_radius(cos_half, delta_max):
 
 
 def plan_corner(p_prev, p_corner, p_next, delta_max, blend_ratio=0.5,
-                min_turn_deg=8.0, max_turn_deg=150.0, chord_len=0.4):
+                min_turn_deg=8.0, max_turn_deg=150.0, chord_len=0.4,
+                max_chord_angle_deg=5.0):
     """Plan a bead-bounded arc blend for the corner at p_corner.
 
     delta_max   -- max path deviation from the vertex (mm), e.g. bead_deviation.
@@ -74,6 +75,7 @@ def plan_corner(p_prev, p_corner, p_next, delta_max, blend_ratio=0.5,
     min_turn_deg-- skip near-straight corners (nothing to round).
     max_turn_deg-- skip near-reversals (a real corner / seam -> keep the stop).
     chord_len   -- target arc chord length (mm), ~bead width, for discretization.
+    max_chord_angle_deg -- maximum direction change represented by one chord.
 
     Returns None to leave the corner sharp, else a dict:
       p_in   -- tangent point on the incoming leg (trim p_prev->p_corner here)
@@ -116,7 +118,9 @@ def plan_corner(p_prev, p_corner, p_next, delta_max, blend_ratio=0.5,
     # r*(1-cos(dpsi/2)), is bead-scale small and bounded by the assert-tested
     # invariant below.
     arc_len = r * phi
-    n = max(1, int(math.ceil(arc_len / max(chord_len, 1e-6))))
+    n_len = int(math.ceil(arc_len / max(chord_len, 1e-6)))
+    n_angle = int(math.ceil(turn_deg / max(max_chord_angle_deg, 1e-6)))
+    n = max(1, n_len, n_angle)
     pts = []
     if n > 1:
         # Rotate p_in about center C by k*phi/n. C is on the inward bisector at
@@ -143,7 +147,8 @@ def plan_corner(p_prev, p_corner, p_next, delta_max, blend_ratio=0.5,
 
 def plan_blend_chain(prev_start, vertex, move_end, prev_e, move_e,
                      prev_len, move_len, accel, delta_max, blend_ratio=0.5,
-                     min_turn_deg=8.0, max_turn_deg=150.0, chord_len=0.4):
+                     min_turn_deg=8.0, max_turn_deg=150.0, chord_len=0.4,
+                     max_chord_angle_deg=5.0, max_extrusion_scale=1.35):
     """Plan the full blended move chain for the corner at `vertex` as PLAIN DATA
     (no Move objects), so extrusion conservation and geometry are unit-testable.
 
@@ -163,8 +168,11 @@ def plan_blend_chain(prev_start, vertex, move_end, prev_e, move_e,
       corner_v -- centripetal speed cap (mm/s) for interior segments.
       r, dev   -- arc radius and achieved deviation.
     """
-    P = plan_corner(prev_start, vertex, move_end, delta_max, blend_ratio,
-                    min_turn_deg, max_turn_deg, chord_len)
+    if prev_e <= 0.0 or move_e <= 0.0:
+        return None
+    P = plan_corner(
+        prev_start, vertex, move_end, delta_max, blend_ratio,
+        min_turn_deg, max_turn_deg, chord_len, max_chord_angle_deg)
     if P is None:
         return None
     pts = [tuple(prev_start[:3]), P["p_in"]] + P["pts"] \
@@ -179,6 +187,14 @@ def plan_blend_chain(prev_start, vertex, move_end, prev_e, move_e,
     move_body_e = move_e * (seg_len[-1] / move_len) if move_len > 1e-12 else 0.0
     corner_e = (prev_e - prev_body_e) + (move_e - move_body_e)
     corner_len = sum(seg_len[1:-1])
+    prev_density = prev_e / prev_len if prev_len > 1e-12 else 0.0
+    move_density = move_e / move_len if move_len > 1e-12 else 0.0
+    source_density = max(prev_density, move_density)
+    corner_density = corner_e / corner_len if corner_len > 1e-12 else float("inf")
+    extrusion_scale = (
+        corner_density / source_density if source_density > 1e-12 else float("inf"))
+    if extrusion_scale > max_extrusion_scale:
+        return None
     e_seg = [prev_body_e]
     for s in range(1, n - 1):
         frac = (seg_len[s] / corner_len) if corner_len > 1e-12 else 0.0
@@ -189,4 +205,4 @@ def plan_blend_chain(prev_start, vertex, move_end, prev_e, move_e,
     corner_v = math.sqrt(max(0.0, accel) * P["r"])
     return {"pts": pts, "e_seg": e_seg, "interior": interior,
             "corner_v": corner_v, "r": P["r"], "dev": P["dev"],
-            "seg_len": seg_len}
+            "seg_len": seg_len, "extrusion_scale": extrusion_scale}

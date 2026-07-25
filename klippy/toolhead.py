@@ -8,8 +8,7 @@ import logging
 import math
 
 from . import chelper
-from .extras import pathplan
-from .extras import cornerblend
+from .extras import cornerblend, pathplan
 from .extras.danger_options import get_danger_options
 from .kinematics import extruder
 
@@ -388,10 +387,9 @@ class ToolHead:
         self.unified_auto_jerk_ratio = config.getfloat(
             "unified_auto_jerk_ratio", 1.0, above=0.0)
         # Bead-bounded corner blending (topp-ra-v3): replace a sharp EXTRUDING
-        # corner with a tangent arc whose deviation is bounded by the extruded
-        # bead (deviation = ratio * bead_width), rendered through the unified
-        # emitter. Keeps the tool moving (no PA blob, C1 for the FF) at a
-        # deviation invisible at the bead scale. Off by default.
+        # corner with a bounded-angle approximation of a tangent arc. Deviation
+        # is bounded by the extruded bead (ratio * bead_width), and the unified
+        # emitter renders every chord. Off by default.
         self.corner_blend = config.getboolean("corner_blend", False)
         # Bead width: 0 (default) derives it from the extruder nozzle_diameter *
         # corner_bead_ratio at first use (typical extrusion width ~1.0-1.2x the
@@ -418,8 +416,15 @@ class ToolHead:
                                                minval=0.0, below=180.0)
         self.corner_max_turn = config.getfloat("corner_max_turn", 150.0,
                                                minval=0.0, below=180.0)
+        if self.corner_min_turn > self.corner_max_turn:
+            raise config.error(
+                "corner_min_turn must not exceed corner_max_turn")
         self.corner_chord_ratio = config.getfloat(
             "corner_chord_ratio", 1.0, above=0.0)
+        self.corner_max_chord_angle = config.getfloat(
+            "corner_max_chord_angle", 5.0, above=0.0, maxval=45.0)
+        self.corner_max_extrusion_scale = config.getfloat(
+            "corner_max_extrusion_scale", 1.35, minval=1.0)
         self._ff_prev_sa = 0.0    # FF diagnostic: prev signed path accel
         self._ff_max_dsa = 0.0    # FF diagnostic: max signed-accel jump seen
         self.orig_cfg = {}
@@ -672,9 +677,13 @@ class ToolHead:
         # jerk_limiting round_corners constant-accel fallback.
         if not (move.is_kinematic_move and prev.is_kinematic_move):
             return None
-        # Only blend extruding corners (the bead bound is a print-geometry idea;
-        # travels/retractions keep the sharp path).
-        if not move.axes_d[3] or not prev.axes_d[3]:
+        # Only blend positive-extrusion corners. Travels, retracting wipes, and
+        # mixed extrusion transitions retain their original path.
+        if move.axes_d[3] <= 0.0 or prev.axes_d[3] <= 0.0:
+            return None
+        # A callback marks the original endpoint as a semantic boundary for a
+        # synchronized pin/fan/etc. change. Do not remove that endpoint.
+        if prev.timing_callbacks:
             return None
         delta_max = cornerblend.bead_deviation(
             self._corner_bead_width(prev, move), self.corner_deviation_ratio)
@@ -685,7 +694,9 @@ class ToolHead:
             blend_ratio=self.corner_blend_ratio,
             min_turn_deg=self.corner_min_turn,
             max_turn_deg=self.corner_max_turn,
-            chord_len=self.corner_chord_ratio * self.corner_bead_width)
+            chord_len=self.corner_chord_ratio * self.corner_bead_width,
+            max_chord_angle_deg=self.corner_max_chord_angle,
+            max_extrusion_scale=self.corner_max_extrusion_scale)
         if ch is None:
             return None
         Move = type(move)
@@ -706,8 +717,8 @@ class ToolHead:
             nm = Move(self, start, end, prev_speed if s == 0 else move_speed)
             if interior[s]:
                 nm._corner_blend = True
-                # Centripetal cap so the velocity change stays in the straight
-                # legs, not the tiny arc chords.
+                # Cap every chord to the circular path's centripetal speed.
+                # Junction handling applies the tighter polyline-turn limits.
                 if corner_v > 0.0 and corner_v * corner_v < nm.max_cruise_v2:
                     nm.limit_speed(corner_v, nm.accel)
             new_moves.append(nm)

@@ -135,6 +135,21 @@ precondition that makes the Stage-4 accel term (`b2·a`) crash-safe**: it turns
 the hard trapezoid accel step (0.085 mm FF jump = crash) into a sub-step taper.
 Config: `[printer] unified_max_jerk` (0=off), `unified_jerk_dt` (default 1ms).
 
+## Corner blending
+
+`corner_blend` replaces eligible positive-extrusion corners with a circular
+target path bounded by `corner_deviation_ratio * bead_width`. Since the current
+`Move` primitive is linear, the emitted path is a polyline approximation, not
+a mathematically C1 arc. `corner_max_chord_angle` (default 5 degrees) bounds
+each direction increment in addition to the bead-scaled chord-length limit.
+
+The shortcut is shorter than the two trimmed legs, while absolute E must still
+reach the slicer's commanded endpoint. This raises local extrusion density.
+`corner_max_extrusion_scale` (default 1.35) bounds that increase; corners that
+would exceed it remain sharp. Retracting or mixed-extrusion corners also remain
+sharp. A queued move carrying a lookahead timing callback is never replaced,
+because its original endpoint is a synchronization boundary.
+
 ## Migration stages
 1. **Unify emission** — one feasible `u(s)` → one monotonic step pass; retire
    the slice+shaper composition. Biggest structural win; kills the crash family.
