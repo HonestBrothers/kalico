@@ -21,11 +21,19 @@ class _ModeConvergence:
     captured spectra with no hardware. See calibration_flow.md, Pass 1.
     """
 
-    def __init__(self, snr_min, tol, window, max_bursts, band_lo, band_hi):
+    def __init__(self, snr_min, tol, window, max_bursts, band_lo, band_hi,
+                 min_speeds=1):
         self.snr_min = snr_min
         self.tol = tol
         self.window = max(2, int(window))
         self.max_bursts = max(1, int(max_bursts))
+        # Minimum number of DISTINCT test speeds that must be represented among
+        # the accepted bursts before convergence is allowed. This is what makes
+        # "speed-consistency" real: without it, a few agreeing bursts at a
+        # single (usually the lowest, weakest) speed satisfy the window test and
+        # the mode ID stops before ever sampling the speeds where the mode rings
+        # cleanest. 1 disables the requirement (legacy single-speed behaviour).
+        self.min_speeds = max(1, int(min_speeds))
         self.band_lo = band_lo
         self.band_hi = band_hi
         self._grid = None        # reference freq grid (first accepted burst)
@@ -33,10 +41,11 @@ class _ModeConvergence:
         self.n_accepted = 0
         self.n_seen = 0          # total bursts fed (accepted + rejected)
         self.per_burst = []      # single-burst peak fits (the convergence input)
+        self.per_burst_speed = []  # test speed each accepted burst came from
         self.history = []        # averaged-PSD peak after each accept (reported)
         self.converged = False
 
-    def add_burst(self, np, freqs, spec):
+    def add_burst(self, np, freqs, spec, speed=None):
         """Fold one burst PSD (freqs, magnitude) in. Returns a status dict:
         {accepted, snr, f_hat, f_burst, converged, n_accepted}.
 
@@ -60,6 +69,7 @@ class _ModeConvergence:
         # Accepted. This burst's own peak feeds the convergence test...
         f_burst = self._fit_peak(np, freqs, spec)
         self.per_burst.append(f_burst)
+        self.per_burst_speed.append(speed)
         # ...and its PSD averages (onto a shared grid; interp handles bursts of
         # differing length) into the low-variance reported estimate.
         if self._grid is None:
@@ -72,16 +82,41 @@ class _ModeConvergence:
         self.history.append(f_hat)
         # Converged when the last `window` single-burst peaks all sit within tol
         # of their mean (they agree) AND the averaged estimate is consistent
-        # with them (no bimodal split hiding inside a tight window).
+        # with them (no bimodal split hiding inside a tight window) AND the
+        # evidence spans enough distinct speeds (see min_speeds): agreement at a
+        # single speed is not "speed-consistency", it is one speed repeating.
         if len(self.per_burst) >= self.window:
             win = self.per_burst[-self.window:]
             m = sum(win) / len(win)
+            speeds_ok = self._speed_diversity_ok()
             if (all(v > 0.0 and abs(v - m) <= self.tol for v in win)
-                    and f_hat > 0.0 and abs(f_hat - m) <= self.tol):
+                    and f_hat > 0.0 and abs(f_hat - m) <= self.tol
+                    and speeds_ok):
                 self.converged = True
         return {"accepted": True, "snr": snr, "f_hat": f_hat,
                 "f_burst": f_burst, "converged": self.converged,
                 "n_accepted": self.n_accepted}
+
+    def _speed_diversity_ok(self):
+        """True if the accepted bursts span enough distinct speeds to trust a
+        convergence (see min_speeds). Back-compatible: if speeds were never
+        supplied (all None, e.g. offline unit tests), the requirement is
+        waived. When min_speeds >= 2 the trailing window must itself straddle
+        at least two speeds, so a run cannot latch on `window` repeats at a
+        single speed even once earlier speeds are on record."""
+        known = [s for s in self.per_burst_speed if s is not None]
+        if not known or len(known) < len(self.per_burst_speed):
+            return True  # speeds not tracked -> legacy single-speed behaviour
+        if self.min_speeds <= 1:
+            return True
+        n_distinct = len(set(known))
+        win_distinct = len(set(self.per_burst_speed[-self.window:]))
+        return n_distinct >= self.min_speeds and win_distinct >= 2
+
+    def distinct_speeds(self):
+        """Number of distinct speeds among accepted bursts (0 if untracked)."""
+        known = [s for s in self.per_burst_speed if s is not None]
+        return len(set(known))
 
     def _fit_peak(self, np, freqs, spec):
         """Sub-bin peak of spec within the band by parabolic interpolation on
@@ -114,8 +149,10 @@ class _ModeConvergence:
         converged / not_converged / no_signal."""
         if self.converged:
             return ("converged", self._last(),
-                    "%d/%d bursts accepted; last %d refits within %.2f Hz"
-                    % (self.n_accepted, self.n_seen, self.window, self.tol))
+                    "%d/%d bursts accepted across %d speeds; last %d refits "
+                    "within %.2f Hz"
+                    % (self.n_accepted, self.n_seen, self.distinct_speeds(),
+                       self.window, self.tol))
         if self.n_accepted == 0:
             return ("no_signal", 0.0,
                     "no burst cleared SNR>=%.1f (%d seen)"
@@ -380,7 +417,41 @@ class TorqueCurveCalibrate:
             "p1_converge_tol", 2.0, above=0.0)
         self.p1_converge_window = config.getint(
             "p1_converge_window", 3, minval=2)
-        self.p1_max_bursts = config.getint("p1_max_bursts", 20, minval=1)
+        # Total burst budget across the WHOLE sweep. With multi-speed
+        # convergence (p1_min_speeds) the estimate now has to visit several
+        # speeds before it can latch, so the budget must cover
+        # ~p1_bursts_per_speed * p1_min_speeds bursts with headroom -- the old
+        # default of 20 exhausted at the first speed and aborted the sweep.
+        self.p1_max_bursts = config.getint("p1_max_bursts", 40, minval=1)
+        # Convergence must draw on at least this many DISTINCT speeds (see
+        # _ModeConvergence.min_speeds). 1 = legacy single-speed behaviour.
+        self.p1_min_speeds = config.getint("p1_min_speeds", 3, minval=1)
+        # Cap on accepted bursts gathered at ONE speed before advancing to the
+        # next (without ending the sweep). This is what lets bursts accumulate
+        # ACROSS speeds: previously a speed that never converged consumed the
+        # whole budget and aborted, so the sweep could only ever see one speed.
+        self.p1_bursts_per_speed = config.getint(
+            "p1_bursts_per_speed", 5, minval=1)
+        # Half-width (Hz) of the band around the driven resonance used for the
+        # grey-box zeta fit. A few peak-widths wide but clear of nearby features
+        # (red has a ~94 Hz harmonic ~14 Hz off the 80 Hz mode).
+        self.zeta_fit_halfband = config.getfloat(
+            "zeta_fit_halfband", 10.0, above=0.0)
+        # Excitation floor (mm/s^2) below which a burst is NOT allowed to feed
+        # the mode estimate. 0 = auto: the printer's configured max_accel.
+        #
+        # This axis is amplitude-dependent: driven gently it rings ~42 Hz,
+        # driven at print accel it rings ~74.8 Hz (verified two ways -- the
+        # driven ring-down, and a stock TEST_RESONANCES at accel_per_hz=300,
+        # i.e. ~22.5k at the mode, which agreed to 0.1 Hz). Both are real
+        # measurements; only the second describes the machine while it prints.
+        #
+        # Without this floor the climb starts at accel_start and the first few
+        # low-accel bursts agree with each other inside p1_converge_tol, so the
+        # estimator converges on the soft mode and stops -- measuring something
+        # correctly that we have no use for. SNR says a burst is legible; this
+        # says it is relevant. Both must hold.
+        self.p1_min_accel = config.getfloat("p1_min_accel", 0.0, minval=0.0)
         # Default disposition of the abort gate; overridable per-run with
         # P1_ABORT=. Passive (report-only) by default so it never fails a sweep
         # that isn't being run as a dedicated Pass-1 mode ID.
@@ -403,6 +474,11 @@ class TorqueCurveCalibrate:
         # the end of the sweep to produce the standard input-shaper graph.
         self._vib_caldata = None
         self._vib_sc = None
+        # Grey-box damping (zeta) fit off the driven-residual PSD + its per-speed
+        # convergence trace. Replaces the free-decay ring-down for this axis's
+        # amplitude-dependent mode (no free ring-down exists at the driven f_n).
+        self._zeta_trace = []   # per-speed zeta refits (convergence evidence)
+        self._zeta_fit = None   # final (f0, zeta, sigma, r2, nbins) or None
         # Pass-1 convergence tracker (built lazily on the first fed burst) and
         # its final verdict tuple (status, f_n, detail), set at finalization.
         self._p1 = None
@@ -423,6 +499,11 @@ class TorqueCurveCalibrate:
             "TORQUE_CURVE_CALIBRATE", "NAME", self.name,
             self.cmd_TORQUE_CURVE_CALIBRATE,
             desc=self.cmd_TORQUE_CURVE_CALIBRATE_help,
+        )
+        gcode.register_mux_command(
+            "MEASURE_MODE_DAMPING", "NAME", self.name,
+            self.cmd_MEASURE_MODE_DAMPING,
+            desc=self.cmd_MEASURE_MODE_DAMPING_help,
         )
 
     def _handle_connect(self):
@@ -1102,25 +1183,56 @@ class TorqueCurveCalibrate:
             if accel <= cap:
                 self._accumulate_psd(np, bt, resid)
         self._speed_resid_buffer = []
+        # Refit zeta on the PSD accumulated SO FAR: the per-speed estimate should
+        # stabilize as speeds pile in (convergence evidence, like the f_n gate).
+        zf = self._zeta_from_vib_psd()
+        if zf is not None:
+            self._zeta_trace.append(zf[1])
 
-    def _p1_feed(self, np, bt, resid, gcmd):
+    def _p1_accel_floor(self):
+        """Minimum excitation accel for a burst to count toward the mode ID.
+        Defaults to the printer's own max_accel: the axis is nonlinear, so the
+        mode worth identifying is the one present at the accel it prints at."""
+        if self.p1_min_accel > 0.0:
+            return self.p1_min_accel
+        # Must come from [printer] in the config, NOT toolhead.get_status():
+        # the sweep raises the live max_accel via SET_VELOCITY_LIMIT, so the
+        # running value is this calibration's own ceiling, not the accel the
+        # machine actually prints at. Reading it back would make the floor
+        # chase the climb and never bind.
+        try:
+            cfg = self.printer.lookup_object("configfile")
+            return float(
+                cfg.get_status(None)["settings"]["printer"]["max_accel"])
+        except Exception:
+            return 0.0
+
+    def _p1_feed(self, np, bt, resid, gcmd, accel=None, speed=None):
         """Feed one in-sync probe's clean residual to the Pass-1 convergence
         tracker (built lazily). Reports the convergence transition once. The
         SNR gate inside the tracker is a second, tunable quality filter on top
         of the upstream clean-residual selection, so junk bursts that slip
-        through don't move the estimate."""
+        through don't move the estimate. Returns the add_burst status dict (or
+        None if the residual was unusable / gated out) so the caller can count
+        accepted bursts per speed."""
         if bt is None or resid is None or len(bt) < 8:
-            return
+            return None
+        # Relevance gate (see p1_min_accel): a burst driven below print accel
+        # measures the soft small-signal mode. Legible, real, and useless -- and
+        # worse, self-consistent enough to converge the estimator on it.
+        floor = self._p1_accel_floor()
+        if accel is not None and floor > 0.0 and accel < floor:
+            return None
         freqs, spec = self._spectrum(np, bt, resid)
         if freqs is None:
-            return
+            return None
         if self._p1 is None:
             self._p1 = _ModeConvergence(
                 self.p1_snr_min, self.p1_converge_tol, self.p1_converge_window,
                 self.p1_max_bursts, self.resonance_min_freq,
-                self.resonance_max_freq)
+                self.resonance_max_freq, self.p1_min_speeds)
         was = self._p1.converged
-        st = self._p1.add_burst(np, freqs, spec)
+        st = self._p1.add_burst(np, freqs, spec, speed=speed)
         if st["accepted"]:
             # f_peak is this burst's own peak (what the convergence gate
             # compares); f_n is the Welch-averaged peak (the reported estimate).
@@ -1131,6 +1243,7 @@ class TorqueCurveCalibrate:
                 "f_peak=%.2f f_n=%.2f Hz%s"
                 % (st["n_accepted"], st["snr"], st["f_burst"], st["f_hat"],
                    " CONVERGED" if st["converged"] and not was else ""))
+        return st
 
     def _emit_shaper_graph(self, gcmd):
         """Fit shapers to the accumulated real-move spectrum and write the
@@ -1209,6 +1322,132 @@ class TorqueCurveCalibrate:
         # that module. The unified planner's auto_jerk is FF-driven and
         # re-derives itself on SET_MODEL_FF -- see toolhead.apply_auto_jerk.)
 
+    def _fit_lorentzian_zeta(self, np, freqs, psd, f0_guess, halfband):
+        """Grey-box damping fit. Least-squares a single second-order (Lorentzian
+        power) peak  m(f) = b + A / (1 + ((f-f0)/g)^2)  to the driven-residual
+        PSD in a band around f0_guess. Returns (f0, zeta, sigma_zeta, r2, nbins)
+        or None.
+
+        zeta = g/f0: g is the half-power half-width (FWHM = 2g, so
+        zeta = Δf_-3dB / 2 f0 = 1/(2Q)). sigma_zeta is the 1-sigma from the
+        Gaussian (Laplace) covariance sigma^2 (J^T J)^-1 of the fit propagated
+        through zeta = g/f0 -- the honest "converged to zeta +/- sigma". This is
+        the amplitude-dependent DRIVEN mode's damping, the number the FF needs
+        and the one a free-decay ring-down cannot reach on this axis (the free
+        decay drops into the soft small-signal regime). numpy-only LM.
+        """
+        m = (freqs >= f0_guess - halfband) & (freqs <= f0_guess + halfband)
+        f = freqs[m].astype(float)
+        y = psd[m].astype(float)
+        n = len(f)
+        if n < 6:
+            return None
+        b = float(np.median(y))
+        A = float(y.max() - b)
+        if A <= 0.0:
+            return None
+        f0 = float(f[int(np.argmax(y))])
+        g = max(0.005 * f0, (f[-1] - f[0]) / 20.0)
+        p = np.array([A, f0, g, b], float)
+
+        def rss_at(q):
+            qA, qf0, qg, qb = q
+            qg = qg if abs(qg) > 1e-9 else 1e-9
+            u = (f - qf0) / qg
+            return float(((y - (qb + qA / (1.0 + u * u))) ** 2).sum())
+
+        lam = 1e-3
+        prev = None
+        for _ in range(200):
+            A, f0, g, b = p
+            g = g if abs(g) > 1e-9 else 1e-9
+            u = (f - f0) / g
+            den = 1.0 + u * u
+            r = y - (b + A / den)
+            rss = float(r @ r)
+            J = np.empty((n, 4))
+            J[:, 0] = 1.0 / den
+            J[:, 1] = A * 2.0 * u / (g * den * den)
+            J[:, 2] = A * 2.0 * u * u / (g * den * den)
+            J[:, 3] = 1.0
+            try:
+                step = np.linalg.solve(
+                    J.T @ J + lam * np.diag(np.diag(J.T @ J)), J.T @ r)
+            except Exception:
+                break
+            pn = p + step
+            rssn = rss_at(pn)
+            if rssn < rss:
+                p = pn
+                lam = max(lam * 0.5, 1e-9)
+                if prev is not None and (prev - rssn) <= 1e-10 * (1.0 + rssn):
+                    prev = rssn
+                    break
+                prev = rssn
+            else:
+                lam = min(lam * 4.0, 1e8)
+                if lam >= 1e8:
+                    break
+        A, f0, g, b = p
+        g = abs(g)
+        if f0 <= 0.0 or g <= 0.0:
+            return None
+        zeta = g / f0
+        u = (f - f0) / g
+        den = 1.0 + u * u
+        r = y - (b + A / den)
+        dof = max(n - 4, 1)
+        s2 = float(r @ r) / dof
+        tss = float(((y - y.mean()) ** 2).sum()) or 1.0
+        r2 = 1.0 - float(r @ r) / tss
+        J = np.empty((n, 4))
+        J[:, 0] = 1.0 / den
+        J[:, 1] = A * 2.0 * u / (g * den * den)
+        J[:, 2] = A * 2.0 * u * u / (g * den * den)
+        J[:, 3] = 1.0
+        try:
+            cov = s2 * np.linalg.inv(J.T @ J)
+        except Exception:
+            return None
+        dz_df0 = -g / (f0 * f0)   # zeta = g/f0
+        dz_dg = 1.0 / f0
+        var_z = (dz_dg * dz_dg * cov[2, 2]
+                 + dz_df0 * dz_df0 * cov[1, 1]
+                 + 2.0 * dz_dg * dz_df0 * cov[1, 2])
+        sigma_z = float(np.sqrt(var_z)) if var_z > 0.0 else 0.0
+        if not (0.0 < zeta < 0.5) or r2 < 0.5:
+            return None
+        return (float(f0), float(zeta), sigma_z, float(r2), n)
+
+    def _zeta_from_vib_psd(self, f_center=None):
+        """Fit the driven-mode damping from the accumulated residual PSD
+        (self._vib_caldata, the same Welch spectrum the f_n cluster uses).
+        f_center defaults to the speed-consistency resonance (or the in-band PSD
+        peak). Returns (f0, zeta, sigma_zeta, r2, nbins) or None."""
+        cd = self._vib_caldata
+        if cd is None:
+            return None
+        import numpy as np
+        try:
+            freqs = np.asarray(cd.freq_bins, dtype=float)
+            psd = np.asarray(getattr(cd, "psd_" + self.test_axis), dtype=float)
+        except Exception:
+            return None
+        if freqs.size < 6 or psd.size != freqs.size:
+            return None
+        if f_center is None:
+            res = self._structural_resonance()
+            if res is not None:
+                f_center = res[0]
+        if f_center is None:
+            band = ((freqs >= self.resonance_min_freq)
+                    & (freqs <= self.resonance_max_freq))
+            if not band.any():
+                return None
+            f_center = float(freqs[band][int(np.argmax(psd[band]))])
+        return self._fit_lorentzian_zeta(
+            np, freqs, psd, f_center, self.zeta_fit_halfband)
+
     def _learn_ff(self, gcmd):
         """Pass 3: learn the model-inverse FF from the residual measured across
         the skip test (input shaper on).
@@ -1224,24 +1463,37 @@ class TorqueCurveCalibrate:
                 "  [FF] no clean residual mode across speeds; FF not set")
             return
         freq, nspeeds, nprobes = res
-        # zeta: median ring-down damping among clean fits near the residual mode
-        # (rd_fn = col 12, rd_zeta = col 13).
-        zetas = sorted(r[13] for r in self.vibration_rows
-                       if r[13] > 0.0 and r[12] > 0.0
-                       and abs(r[12] - freq) <= 8.0)
-        if not zetas:
-            zetas = sorted(r[13] for r in self.vibration_rows if r[13] > 0.0)
-        if not zetas:
-            gcmd.respond_info(
-                "  [FF] residual mode %.2f Hz found but no ring-down zeta; FF "
-                "not set (need clean ring-down data)" % freq)
-            return
-        zeta = zetas[len(zetas) // 2]
         ax = self.test_axis
-        gcmd.respond_info(
-            "  [FF] residual mode %.2f Hz (clustered across %d speeds / %d "
-            "probes), zeta=%.4f (median of %d ring-downs)"
-            % (freq, nspeeds, nprobes, zeta, len(zetas)))
+        # zeta: grey-box second-order fit to the driven-residual PSD peak (half-
+        # power width -> zeta) with a Gaussian (Laplace) sigma. The free-decay
+        # ring-down cannot measure this amplitude-dependent mode (rd_zeta is dead
+        # on this axis), so it is only a fallback if the fit fails.
+        sigma_z = 0.0
+        zf = self._zeta_from_vib_psd(f_center=freq)
+        if zf is not None:
+            _f0z, zeta, sigma_z, r2, nb = zf
+            gcmd.respond_info(
+                "  [FF] residual mode %.2f Hz (across %d speeds / %d probes), "
+                "zeta=%.4f +/- %.4f (grey-box SDOF fit, %d bins, r2=%.2f)"
+                % (freq, nspeeds, nprobes, zeta, sigma_z, nb, r2))
+        else:
+            zetas = sorted(r[13] for r in self.vibration_rows
+                           if r[13] > 0.0 and r[12] > 0.0
+                           and abs(r[12] - freq) <= 8.0)
+            if not zetas:
+                zetas = sorted(r[13] for r in self.vibration_rows
+                               if r[13] > 0.0)
+            if not zetas:
+                gcmd.respond_info(
+                    "  [FF] residual mode %.2f Hz found but damping unmeasurable "
+                    "(SDOF fit failed and no clean ring-down); FF not set"
+                    % freq)
+                return
+            zeta = zetas[len(zetas) // 2]
+            gcmd.respond_info(
+                "  [FF] residual mode %.2f Hz (across %d speeds / %d probes), "
+                "zeta=%.4f (median of %d ring-downs; SDOF fit failed)"
+                % (freq, nspeeds, nprobes, zeta, len(zetas)))
         try:
             self.gcode.run_script_from_command(
                 "SET_MODEL_FF FREQ_%s=%.3f DAMPING_RATIO_%s=%.4f ENABLE=1"
@@ -1542,6 +1794,8 @@ class TorqueCurveCalibrate:
         self._vib_file = None
         self._progress_file = None
         self._vib_caldata = None
+        self._zeta_trace = []
+        self._zeta_fit = None
         self._p1 = None
         self._p1_verdict = None
 
@@ -1703,6 +1957,29 @@ class TorqueCurveCalibrate:
                     accel_ceiling = a_degen
                     ceiling_is_degen = True
 
+                # Pass 1 has no reason to go above print accel: the mode is
+                # amplitude-dependent, so driving harder than the machine ever
+                # prints would identify a regime that never occurs in service --
+                # and every mm/s^2 past it is belt wear for nothing. Cap the
+                # climb there and hold, gathering bursts until convergence.
+                if self._pass_name == "modeid":
+                    p1_floor = self._p1_accel_floor()
+                    if p1_floor > 0.0:
+                        if p1_floor > accel_ceiling:
+                            # Cannot reach print accel here without the ramp
+                            # degenerating, so no burst at this speed could ever
+                            # clear the relevance gate. Moving the axis would be
+                            # pure wear.
+                            gcmd.respond_info(
+                                "  [P1] %.0f mm/s: cannot reach print accel "
+                                "%.0f (ramp ceiling %.0f) -- no burst here "
+                                "could count; skipping"
+                                % (test_speed, p1_floor, accel_ceiling)
+                            )
+                            continue
+                        accel_ceiling = p1_floor
+                        ceiling_is_degen = False
+
                 if start_accel > accel_ceiling:
                     if ceiling_is_degen:
                         gcmd.respond_info(
@@ -1744,6 +2021,12 @@ class TorqueCurveCalibrate:
                 growth = self.accel_growth
                 test_accel = start_accel
                 self._speed_resid_buffer = []  # this speed's clean residuals
+                # PASS 1 climbs for signal, not for a skip: set once the mode
+                # estimate converges (or the burst budget is spent), which ends
+                # both this accel climb and the whole speed sweep.
+                modeid_done = False
+                hold_probes = 0  # repeats at the print-accel cap (see below)
+                p1_speed_bursts = 0  # accepted P1 bursts at THIS speed
                 while self.calibration_running:
                     # Clamp: never above the ceiling (degeneracy or accel_max),
                     # never at/above a known skip.
@@ -1781,7 +2064,11 @@ class TorqueCurveCalibrate:
                                 # averaged); an independent verdict from the raw
                                 # per-probe modes for a bad mode ID to trip on.
                                 import numpy as _np
-                                self._p1_feed(_np, cr[0], cr[1], gcmd)
+                                _st = self._p1_feed(_np, cr[0], cr[1], gcmd,
+                                                    accel=test_accel,
+                                                    speed=test_speed)
+                                if _st is not None and _st.get("accepted"):
+                                    p1_speed_bursts += 1
                             # a@fn is measured at the detected mode (resid_fpeak)
                             # -- the de-floored amplitude of the real resonance.
                             gcmd.respond_info(
@@ -1790,6 +2077,41 @@ class TorqueCurveCalibrate:
                                 % (vm["resid_fpeak"], vm["resid_afn"],
                                    vm["rd_afn"], vm["resid_rms"], vm["base_rms"])
                             )
+                            # Pass 1's exit condition. The accel climb is only a
+                            # way to raise excitation until the mode peak clears
+                            # the SNR gate and successive refits agree; past
+                            # that, more accel buys nothing -- every lost probe
+                            # is discarded upstream (see _vibration_metrics:
+                            # clean_resid requires `not lost`), so climbing on
+                            # to a skip would beat the belt for data that never
+                            # gets used.
+                            if self._pass_name == "modeid" and self._p1:
+                                if self._p1.converged:
+                                    modeid_done = True
+                                    break
+                                if self._p1.exhausted:
+                                    gcmd.respond_info(
+                                        "    [P1] burst budget spent (%d) "
+                                        "without converging -- stopping rather "
+                                        "than escalating into a skip"
+                                        % self._p1.n_seen)
+                                    modeid_done = True
+                                    break
+                                # This speed has given enough bursts but the
+                                # GLOBAL estimate hasn't converged yet -- move on
+                                # to the next speed so evidence accumulates
+                                # across speeds (the whole point of Pass 1).
+                                # modeid_done stays False: advance, don't stop.
+                                if p1_speed_bursts >= self.p1_bursts_per_speed:
+                                    gcmd.respond_info(
+                                        "    [P1] %d bursts at %.0f mm/s, mode "
+                                        "not yet converged (%d/%d distinct "
+                                        "speeds so far) -- advancing to the next "
+                                        "speed"
+                                        % (p1_speed_bursts, test_speed,
+                                           self._p1.distinct_speeds(),
+                                           self.p1_min_speeds))
+                                    break
 
                     if lost:
                         skip_accel = test_accel
@@ -1797,6 +2119,25 @@ class TorqueCurveCalibrate:
                             "  Accel %.0f: FAILED (lost %.3f mm)"
                             % (test_accel, diff)
                         )
+                        if self._pass_name == "modeid":
+                            # Pass 1 never hunts the skip edge. Reaching one
+                            # means the axis could not hold print accel here, so
+                            # the residual is discarded anyway (clean_resid
+                            # requires `not lost`) and refining the bracket
+                            # would be pure belt damage for nothing.
+                            # Abandon this speed, but not the sweep: bursts
+                            # accumulate across speeds, so the next one may
+                            # still converge the estimate. Crucially we do NOT
+                            # refine the bracket -- that is what turned one
+                            # skip into dozens and destroyed the belt. At most
+                            # one lost probe per speed now.
+                            gcmd.respond_info(
+                                "  [P1] skipped at accel %.0f before the mode "
+                                "converged -- abandoning %.0f mm/s (Pass 1 does "
+                                "not seek the skip edge)"
+                                % (test_accel, test_speed)
+                            )
+                            break
                         if last_good_accel <= 0.0:
                             gcmd.respond_info(
                                 "  Skipped at the starting accel -- real limit "
@@ -1811,6 +2152,31 @@ class TorqueCurveCalibrate:
                         gcmd.respond_info("  Accel %.0f: OK" % test_accel)
                         last_good_accel = test_accel
                         if test_accel >= accel_ceiling:
+                            if self._pass_name == "modeid":
+                                # At print accel. Don't stop and don't climb --
+                                # repeat here. What Pass 1 needs now is more
+                                # bursts at this amplitude, not a bigger one.
+                                # modeid_done (converged / budget spent) is what
+                                # normally ends this loop.
+                                hold_probes += 1
+                                if hold_probes > 2 * self.p1_max_bursts:
+                                    # Backstop: modeid_done is driven by the
+                                    # burst tracker, which only exists once a
+                                    # burst is actually fed. If the capture is
+                                    # yielding nothing usable (dead chip, all
+                                    # bursts under the SNR gate), nothing would
+                                    # ever end this loop and the axis would
+                                    # shake at print accel indefinitely.
+                                    gcmd.respond_info(
+                                        "  [P1] %d probes at accel %.0f "
+                                        "produced no usable burst -- giving up "
+                                        "on %.0f mm/s (check the accelerometer "
+                                        "and p1_snr_min)"
+                                        % (hold_probes, test_accel, test_speed)
+                                    )
+                                    break
+                                test_accel = accel_ceiling
+                                continue
                             if ceiling_is_degen:
                                 # Not a torque limit -- we ran out of ramp. The
                                 # motor never saw the accel, so it could never
@@ -1856,6 +2222,20 @@ class TorqueCurveCalibrate:
                     "  Result: %.0f mm/s -> max accel %.0f mm/s^2"
                     % (test_speed, last_good_accel)
                 )
+
+                # Pass 1 is done the moment the mode is identified -- the
+                # remaining speeds would only re-measure a frequency we already
+                # have to within p1_converge_tol.
+                if modeid_done:
+                    status, f_n, detail = self._p1.verdict()
+                    gcmd.respond_info(
+                        "\n[PASS 1/3 MODE ID] %s: f_n=%.2f Hz (%s)\n"
+                        "  Stopped at %.0f mm/s / accel %.0f without seeking a "
+                        "skip; %d of %d speeds untouched."
+                        % (status, f_n, detail, test_speed, last_good_accel,
+                           len(speeds) - (speed_idx + 1), len(speeds))
+                    )
+                    break
 
         finally:
             # Restore original settings
@@ -2224,6 +2604,28 @@ class TorqueCurveCalibrate:
                    "" if not shaper
                    else " -- configured input shaper is %.1f Hz" % shaper)
             )
+        # Grey-box damping fit off the same driven-residual PSD: zeta +/- sigma
+        # (Gaussian/Laplace) at the resonance. This is the FF's damping_ratio for
+        # this amplitude-dependent mode -- the ring-down cannot reach it.
+        zf = self._zeta_from_vib_psd(f_center=(res[0] if res else None))
+        if zf is not None:
+            f0z, zeta, sig, r2, nb = zf
+            self._zeta_fit = zf
+            tr = self._zeta_trace
+            conv = ""
+            if len(tr) >= 3:
+                w = tr[-3:]
+                mm = sum(w) / len(w)
+                if mm > 0.0 and all(abs(v - mm) <= 0.15 * mm for v in w):
+                    conv = " -- converged (last 3 per-speed within 15%)"
+            gcmd.respond_info(
+                "Driven-mode damping (grey-box SDOF fit): zeta=%.4f +/- %.4f "
+                "(%.2f%%), r2=%.2f, %d bins at %.1f Hz%s"
+                % (zeta, sig, 100.0 * zeta, r2, nb, f0z, conv))
+            if tr:
+                gcmd.respond_info(
+                    "  [zeta] per-speed trace: %s"
+                    % ", ".join("%.4f" % v for v in tr))
         # Pass-1 convergence verdict (Welch-averaged, SNR-gated mode ID). This
         # is the authoritative f_n for the FF/shaper; _structural_resonance
         # above is a cross-check by speed-consistency.
@@ -2455,6 +2857,18 @@ class TorqueCurveCalibrate:
             "MEASURE_VIBRATION", 1 if self.measure_vibration else 0,
             minval=0, maxval=1
         ))
+        if pass_name == "modeid" and not self.measure_vibration:
+            # Pass 1's only stop condition is mode convergence, which is fed
+            # from the vibration capture. With no capture the accel climb has
+            # nothing to converge on and would run to a skip at every speed --
+            # the exact behaviour that broke a belt. Refuse rather than silently
+            # doing the destructive thing.
+            raise gcmd.error(
+                "PASS=modeid requires MEASURE_VIBRATION=1: the mode-ID sweep "
+                "stops when the resonance estimate converges, and without the "
+                "accelerometer capture there is no convergence signal -- the "
+                "accel climb would escalate to lost steps at every speed."
+            )
         self.vibration_shaper_off = bool(gcmd.get_int(
             "VIBRATION_SHAPER_OFF", 1 if self.vibration_shaper_off else 0,
             minval=0, maxval=1
@@ -2481,6 +2895,12 @@ class TorqueCurveCalibrate:
             "P1_CONVERGE_WINDOW", self.p1_converge_window, minval=2)
         self.p1_max_bursts = gcmd.get_int(
             "P1_MAX_BURSTS", self.p1_max_bursts, minval=1)
+        self.p1_min_speeds = gcmd.get_int(
+            "P1_MIN_SPEEDS", self.p1_min_speeds, minval=1)
+        self.p1_bursts_per_speed = gcmd.get_int(
+            "P1_BURSTS_PER_SPEED", self.p1_bursts_per_speed, minval=1)
+        self.zeta_fit_halfband = gcmd.get_float(
+            "ZETA_FIT_HALFBAND", self.zeta_fit_halfband, above=0.0)
         self.p1_abort = bool(gcmd.get_int(
             "P1_ABORT", 1 if self.p1_abort else 0, minval=0, maxval=1))
         # Resolve the accel chip if vibration was just enabled at runtime.
@@ -2493,6 +2913,435 @@ class TorqueCurveCalibrate:
                 )
 
         self._run_calibration(gcmd)
+
+
+    # ----- Dwell-release modal damping (Hilbert / FREEVIB) ------------------
+    # The axis mode is amplitude-dependent and lightly damped: a free-decay
+    # ring-down measures the soft small-signal mode, a driven PSD is width-
+    # limited by the 0.5s Welch window, and a swept sine smears the mode with
+    # its neighbours. The clean route: DWELL at the resonance to pump a large,
+    # single-mode oscillation at a controlled amplitude (starving neighbours
+    # like the 94 Hz feature), RELEASE, and read zeta(A) from the Hilbert
+    # envelope of the free decay -- at the operating amplitude, at the decay's
+    # instantaneous resolution rather than a fixed FFT bin.
+
+    def _ff_freq_default(self):
+        """Resonance guess for the dwell: the model-inverse FF's freq_<axis> if
+        configured, else 80 Hz."""
+        try:
+            cfg = self.printer.lookup_object("configfile")
+            s = cfg.get_status(None)["settings"].get("model_inverse_ff", {})
+            v = s.get("freq_" + self.test_axis) or s.get("freq")
+            if v:
+                return float(v)
+        except Exception:
+            pass
+        return 80.0
+
+    def _build_dwell_seq(self, freq, accel_amp, dwell_time):
+        """Constant-frequency oscillation as a resonance_tester test_seq
+        [(time, +/-accel, freq), ...], sized to ~dwell_time seconds -- pumps
+        energy into the mode at `freq` to build a clean single-mode oscillation.
+        Same quarter-period alternating-accel form as VibrationPulseTestGenerator
+        but with the frequency held fixed (a dwell, not a sweep)."""
+        t_seg = 0.25 / freq
+        n_iter = max(1, int(round(dwell_time / (2.0 * t_seg))))
+        seq = []
+        sign = 1.0
+        t = 0.0
+        for _ in range(n_iter):
+            t += t_seg
+            seq.append((t, sign * accel_amp, freq))
+            t += t_seg
+            seq.append((t, -sign * accel_amp, freq))
+            sign = -sign
+        return seq
+
+    def _hilbert_analytic(self, np, x):
+        """Analytic signal z = x + i*Hilbert(x) via FFT (scipy-free)."""
+        n = len(x)
+        X = np.fft.fft(x)
+        h = np.zeros(n)
+        if n % 2 == 0:
+            h[0] = h[n // 2] = 1.0
+            h[1:n // 2] = 2.0
+        else:
+            h[0] = 1.0
+            h[1:(n + 1) // 2] = 2.0
+        return np.fft.ifft(X * h)
+
+    def _hilbert_backbone(self, np, t, sig, f_hint, band, gcmd):
+        """Read instantaneous f(A) and zeta(A) along a free decay (FREEVIB).
+        Band-passes around f_hint to isolate the mode, forms the analytic
+        signal, then zeta(t) = -(d ln A/dt)/(2*pi*f_inst(t)) along the decay.
+        Reports the high-amplitude (operating-regime) f_n and zeta."""
+        n = len(sig)
+        if n < 128 or t[-1] <= t[0]:
+            gcmd.respond_info("[dwell-release] too few samples to analyze")
+            return None
+        fs = (n - 1) / (t[-1] - t[0])
+        X = np.fft.rfft(sig)
+        f = np.fft.rfftfreq(n, 1.0 / fs)
+        lo, hi = max(1.0, f_hint - band), f_hint + band
+        X[(f < lo) | (f > hi)] = 0.0
+        xb = np.fft.irfft(X, n)
+        z = self._hilbert_analytic(np, xb)
+        A = np.abs(z)
+        ph = np.unwrap(np.angle(z))
+        w = max(3, int(fs * 0.02))  # ~20 ms smoothing
+        kern = np.ones(w) / w
+        As = np.convolve(A, kern, "same")
+        finst = np.convolve(np.gradient(ph, 1.0 / fs) / (2.0 * np.pi), kern, "same")
+        # Decay window: from just after the envelope peak (release) to the end,
+        # trimming smoothing/Hilbert edge transients.
+        k = int(np.argmax(As))
+        e = w
+        i0 = min(k + e, n - 1)
+        i1 = n - e
+        if i1 - i0 < 64:
+            gcmd.respond_info("[dwell-release] decay window too short "
+                              "(raise DECAY or DWELL)")
+            return None
+        Ad, fd = As[i0:i1], finst[i0:i1]
+        peak = Ad[0] if Ad[0] > 0 else Ad.max()
+        # Pointwise instantaneous zeta(A) for the backbone SHAPE (noisy, but
+        # shows the amplitude dependence).
+        dlnA = np.gradient(np.log(np.maximum(Ad, 1e-12)), 1.0 / fs)
+        zeta_pt = -dlnA / (2.0 * np.pi * np.maximum(fd, 1e-6))
+        gcmd.respond_info("[dwell-release] backbone   ampl%   f(Hz)    zeta")
+        for frac in (0.9, 0.7, 0.5, 0.3):
+            j = int(np.argmin(np.abs(Ad - frac * peak)))
+            gcmd.respond_info("               %5.0f   %6.2f   %.4f (%.2f%%)"
+                              % (100 * Ad[j] / peak, fd[j], zeta_pt[j],
+                                 100 * zeta_pt[j]))
+        # Reported operating-regime value: a robust log-decrement over the
+        # high-amplitude decade (0.85*peak -> 0.35*peak), skipping the release
+        # transient. ln A(t) has slope -zeta*2*pi*f_n, so it averages out the
+        # pointwise-derivative noise.
+        s = np.where(Ad <= 0.85 * peak)[0]
+        if len(s) < 20:
+            return None
+        s = int(s[0])
+        below = np.where(Ad[s:] < 0.35 * peak)[0]
+        en = s + (int(below[0]) if len(below) else len(Ad) - s - 1)
+        if en - s < 20:
+            return None
+        tt = np.arange(s, en) / fs
+        slope = np.polyfit(tt, np.log(np.maximum(Ad[s:en], 1e-12)), 1)[0]
+        fz = float(np.median(fd[s:en]))
+        zz = float(-slope / (2.0 * np.pi * max(fz, 1e-6)))
+        ax = self.test_axis.upper()
+        gcmd.respond_info(
+            "[dwell-release] HIGH-amplitude (operating regime): f_n = %.2f Hz, "
+            "zeta = %.4f (%.2f%%)" % (fz, zz, 100 * zz))
+        gcmd.respond_info(
+            "  -> apply: SET_MODEL_FF FREQ_%s=%.2f DAMPING_RATIO_%s=%.4f"
+            % (ax, fz, ax, zz))
+        return (fz, zz)
+
+    def _write_capture_csv(self, samples, tag):
+        out_dir, stem = self._output_dir_stem()
+        path = os.path.join(out_dir, "%s_%s_%s.csv"
+                            % (stem, self.test_axis, tag))
+        with open(path, "w") as fh:
+            fh.write("#time,accel_x,accel_y,accel_z\n")
+            for s in samples:
+                fh.write("%.6f,%.6f,%.6f,%.6f\n"
+                         % (s[0], s[1], s[2], s[3]))
+        return path
+
+    def _dwell_release_capture(self, rt, axis, freq, accel_per_hz,
+                               dwell_time, decay_time, chip, toolhead, gcmd):
+        """One dwell-release: pump the axis at `freq` for dwell_time, release,
+        and record the free decay for decay_time. Returns the raw samples."""
+        aclient = chip.start_internal_client()
+        toolhead.dwell(0.05)  # short baseline
+        seq = self._build_dwell_seq(freq, accel_per_hz * freq, dwell_time)
+        try:
+            rt.executor.run_test(seq, axis, freq, accel_per_hz, gcmd)
+            toolhead.wait_moves()
+            toolhead.dwell(decay_time)
+            toolhead.wait_moves()
+        finally:
+            aclient.finish_measurements()
+        return aclient.get_samples()
+
+    def _decay_zeta(self, np, dec, fs, fc, band):
+        """Log-decrement zeta of a decay segment `dec` around centre fc (Hz).
+        Returns zeta or 0.0 if it can't fit a clean decaying envelope."""
+        n = len(dec)
+        if n < 128 or fc <= 0.0:
+            return 0.0
+        X = np.fft.rfft(dec)
+        f = np.fft.rfftfreq(n, 1.0 / fs)
+        X[(f < max(1.0, fc - band)) | (f > fc + band)] = 0.0
+        z = self._hilbert_analytic(np, np.fft.irfft(X, n))
+        A = np.abs(z)
+        w = max(3, int(fs * 0.02))
+        As = np.convolve(A, np.ones(w) / w, "same")[w:n - w]
+        if len(As) < 40:
+            return 0.0
+        peak = As.max()
+        s = np.where(As <= 0.85 * peak)[0]
+        if len(s) < 20:
+            return 0.0
+        s = int(s[0])
+        below = np.where(As[s:] < 0.35 * peak)[0]
+        en = s + (int(below[0]) if len(below) else len(As) - s - 1)
+        if en - s < 20:
+            return 0.0
+        tt = np.arange(s, en) / fs
+        slope = np.polyfit(tt, np.log(np.maximum(As[s:en], 1e-12)), 1)[0]
+        return float(-slope / (2.0 * np.pi * fc))
+
+    def _band_rms(self, np, x, fs, fc, band):
+        """RMS of x within [fc-band, fc+band] Hz (zero elsewhere)."""
+        n = len(x)
+        if n < 16 or fc <= 0.0:
+            return 0.0
+        X = np.fft.rfft(x)
+        f = np.fft.rfftfreq(n, 1.0 / fs)
+        X[(f < max(1.0, fc - band)) | (f > fc + band)] = 0.0
+        xb = np.fft.irfft(X, n)
+        return float(np.sqrt(np.mean(xb * xb)))
+
+    def _analyze_decay(self, np, t, sig, f_drive, band, drive_amp):
+        """Split a dwell-release capture into drive vs free-decay and return
+        {f_drive, f_meas, frf, decay_amp, zeta}:
+          f_meas    = the dominant frequency actually present in the steady
+                      drive. An ACHIEVED-FREQUENCY GUARD: if the toolhead can't
+                      reciprocate at the commanded rate (it collapses to a low
+                      lurch + harmonics), f_meas won't match f_drive and every
+                      other number here is meaningless. Caller must check it.
+          frf       = steady response AT the drive freq / drive accel, measured
+                      over a FIXED late-drive window (last 40% of the driven
+                      phase) so it is not contaminated by the baseline, the
+                      build-up transient, or the decay -- a true stepped-sine
+                      FRF point (peak across freqs = the resonance).
+          decay_amp = ring-down amplitude AT the drive freq (small => the mode
+                      does not freely ring there; the decay is some other mode).
+          zeta      = log-decrement of the decay band-passed around f_drive, so
+                      it measures the mode we excited, not a fixed mount ring."""
+        n = len(sig)
+        if n < 256 or t[-1] <= t[0]:
+            return None
+        fs = (n - 1) / (t[-1] - t[0])
+        absx = np.abs(sig)
+        w = max(3, int(fs * 0.01))
+        env = np.convolve(absx, np.ones(w) / w, "same")
+        pk = float(env.max())
+        kpk = int(np.argmax(env))
+        # Release: first drop below 35% of the envelope peak after that peak.
+        rel = n - 1
+        for i in range(kpk, n):
+            if env[i] < 0.35 * pk:
+                rel = i
+                break
+        # Drive onset: first rise above 50% of peak (skips the 0.05 s baseline).
+        drive_start = 0
+        for i in range(0, kpk + 1):
+            if env[i] >= 0.5 * pk:
+                drive_start = i
+                break
+        # Steady FRF window = last 40% of the driven phase only.
+        lo = drive_start + int(0.6 * max(rel - drive_start, 1))
+        drv = sig[lo:max(rel, lo + 1)]
+        # Achieved-frequency guard: dominant frequency actually in the drive.
+        f_meas = 0.0
+        if len(drv) >= 32:
+            Xd = np.abs(np.fft.rfft(drv * np.hanning(len(drv))))
+            fdax = np.fft.rfftfreq(len(drv), 1.0 / fs)
+            msk = (fdax >= 5.0) & (fdax <= min(0.5 * fs, 300.0))
+            if msk.any():
+                f_meas = float(fdax[msk][int(np.argmax(Xd[msk]))])
+        frf = self._band_rms(np, drv, fs, f_drive, band) / max(drive_amp, 1e-6)
+        dec = sig[rel:]
+        decay_amp, zeta = 0.0, 0.0
+        if len(dec) >= 128:
+            decay_amp = self._band_rms(np, dec, fs, f_drive, band)
+            zeta = self._decay_zeta(np, dec, fs, f_drive, band)
+        return {"f_drive": f_drive, "f_meas": f_meas, "frf": frf,
+                "decay_amp": decay_amp, "zeta": zeta}
+
+    cmd_MEASURE_MODE_DAMPING_help = (
+        "Stepped-sine dwell-release modal analysis: pump the axis at each drive "
+        "frequency, release, and record the driven response (FRF) + free-decay "
+        "zeta. Single freq with FREQ=, or a stepped sweep with FREQ_START/"
+        "FREQ_END/FREQ_STEP. The driven-response peak is the true resonance."
+    )
+
+    def cmd_MEASURE_MODE_DAMPING(self, gcmd):
+        import numpy as np
+        try:
+            from .resonance_tester import TestAxis
+        except Exception:
+            raise gcmd.error("[resonance_tester] module is required")
+        rt = self.printer.lookup_object("resonance_tester", None)
+        if rt is None or not getattr(rt, "probe_points", None):
+            raise gcmd.error("[resonance_tester] with probe_points is required")
+        ax = gcmd.get("AXIS", self.test_axis).lower()
+        if ax not in ("x", "y"):
+            raise gcmd.error("AXIS must be x or y")
+        axis = TestAxis(axis=ax)
+        accel_per_hz = gcmd.get_float("ACCEL_PER_HZ", 250.0, above=0.0)
+        dwell_time = gcmd.get_float("DWELL", 0.8, above=0.05, maxval=5.0)
+        decay_time = gcmd.get_float("DECAY", 0.5, above=0.05, maxval=5.0)
+        band = gcmd.get_float("BAND", 8.0, above=1.0)
+        # Frequency plan: stepped sweep if FREQ_END given, else single FREQ.
+        f_end = gcmd.get_float("FREQ_END", 0.0, minval=0.0)
+        if f_end > 0.0:
+            f0 = gcmd.get_float("FREQ_START", 60.0, minval=5.0, maxval=300.0)
+            fstep = gcmd.get_float("FREQ_STEP", 3.0, above=0.1)
+            if f_end < f0:
+                raise gcmd.error("FREQ_END (%.1f) must be >= FREQ_START (%.1f)"
+                                 % (f_end, f0))
+            freqs, ff = [], f0
+            while ff <= f_end + 1e-6:
+                freqs.append(round(ff, 2))
+                ff += fstep
+        else:
+            freqs = [gcmd.get_float("FREQ", self._ff_freq_default(),
+                                    minval=5.0, maxval=300.0)]
+        chip = self.accel_chip or self._lookup_accel_chip()
+        if chip is None:
+            raise gcmd.error("no accelerometer found (set accel_chip)")
+        self.accel_chip = chip
+        self.test_axis = ax
+        toolhead = self.printer.lookup_object("toolhead")
+        reactor = self.printer.get_reactor()
+        homed = toolhead.get_status(reactor.monotonic())["homed_axes"]
+        # manual_move below targets a full XYZ probe point, so all three axes
+        # must be homed -- not just the test axis and Z.
+        if not all(a in homed for a in ("x", "y", "z")):
+            self.gcode.run_script_from_command("G28")
+        toolhead.manual_move(list(rt.probe_points[0]), rt.move_speed)
+        toolhead.wait_moves()
+        toolhead.dwell(0.3)
+        # Disable the model FF during the capture, but remember its prior state
+        # so we restore EXACTLY that afterwards (don't force-enable a FF the
+        # user had intentionally turned off). Unknown state -> default to on.
+        mff = self.printer.lookup_object("model_inverse_ff", None)
+        ff_was_enabled = getattr(mff, "enabled", None) if mff is not None else None
+        ff_off = False
+        try:
+            self.gcode.run_script_from_command("SET_MODEL_FF ENABLE=0")
+            ff_off = True
+        except Exception:
+            pass
+        stepped = len(freqs) > 1
+        gcmd.respond_info(
+            "[dwell-release] %s %s at accel_per_hz=%.0f, dwell=%.2fs decay=%.2fs"
+            % (("stepped %d freqs %.0f-%.0f Hz"
+                % (len(freqs), freqs[0], freqs[-1])) if stepped
+               else "single freq %.1f Hz" % freqs[0],
+               ax.upper(), accel_per_hz, dwell_time, decay_time))
+        results, last = [], None
+        try:
+            if stepped:
+                gcmd.respond_info(
+                    "  drive_Hz  meas_Hz  FRF(resp/drive)  decay_amp  "
+                    "zeta        ok")
+            for freq in freqs:
+                samples = self._dwell_release_capture(
+                    rt, axis, freq, accel_per_hz, dwell_time, decay_time,
+                    chip, toolhead, gcmd)
+                ac = self._axis_ac(np, samples)
+                if ac is None:
+                    continue
+                last = (freq, samples, ac)
+                r = self._analyze_decay(np, ac[0], ac[1], freq, band,
+                                        accel_per_hz * freq)
+                if r is None:
+                    continue
+                # Achieved-frequency guard: the drive must actually be at the
+                # commanded frequency for the FRF/zeta to mean anything.
+                tol = max(5.0, 0.1 * r["f_drive"])
+                r["achieved"] = abs(r["f_meas"] - r["f_drive"]) <= tol
+                results.append(r)
+                self._write_capture_csv(samples, "mode_damping_%03.0f" % freq)
+                if stepped:
+                    gcmd.respond_info(
+                        "  %7.1f  %7.1f  %13.4f  %9.0f  %.4f(%.2f%%)  %s"
+                        % (r["f_drive"], r["f_meas"], r["frf"], r["decay_amp"],
+                           r["zeta"], 100 * r["zeta"],
+                           "ok" if r["achieved"] else "BAD"))
+        finally:
+            if ff_off:
+                # Restore the pre-test state (unknown -> re-enable, as before).
+                want = 0 if ff_was_enabled is False else 1
+                try:
+                    self.gcode.run_script_from_command(
+                        "SET_MODEL_FF ENABLE=%d" % want)
+                except Exception:
+                    pass
+        if not results:
+            gcmd.respond_info("[dwell-release] no usable captures")
+            return
+        # Keep only steps where the toolhead actually reached the commanded
+        # frequency. Everything downstream (FRF peak, ring-down, width fit) is
+        # meaningless on a step whose drive collapsed to a different frequency.
+        usable = [r for r in results if r["achieved"]]
+        n_bad = len(results) - len(usable)
+        if not usable:
+            gcmd.respond_info(
+                "[dwell-release] EXCITATION FAILED: the toolhead never reached "
+                "the commanded frequency on any step (measured drive far from "
+                "commanded -- rate-limited / harmonic collapse). No FRF or zeta "
+                "is valid; not recommending any SET_MODEL_FF. Try a lower "
+                "frequency range, or fix the excitation before trusting this.")
+            return
+        if n_bad:
+            gcmd.respond_info(
+                "[dwell-release] WARNING: %d of %d steps did NOT reach the "
+                "commanded frequency (marked BAD) and were dropped."
+                % (n_bad, len(results)))
+        # Resonance = the drive frequency with the largest normalized response
+        # (the FRF peak). Its ring-down amplitude tells us whether the mode
+        # actually rings freely there (vs decaying into a fixed mount mode).
+        res = max(usable, key=lambda r: r["frf"])
+        ax_u = ax.upper()
+        gcmd.respond_info(
+            "[dwell-release] RESONANCE (FRF peak) at %.1f Hz: ring-down "
+            "amp@fdrive=%.0f, zeta=%.4f (%.2f%%)"
+            % (res["f_drive"], res["decay_amp"], res["zeta"],
+               100 * res["zeta"]))
+        if res["zeta"] > 0.0 and res["decay_amp"] > 3.0 * (
+                min(r["decay_amp"] for r in usable) + 1.0):
+            gcmd.respond_info(
+                "  -> apply: SET_MODEL_FF FREQ_%s=%.2f DAMPING_RATIO_%s=%.4f"
+                % (ax_u, res["f_drive"], ax_u, res["zeta"]))
+        else:
+            gcmd.respond_info(
+                "  (ring-down at the drive freq is weak -- the mode may not "
+                "freely ring here, or a fixed mount/structural mode dominates "
+                "the decay; check the accelerometer mount)")
+        # Stepped-sine damping: fit the FRF peak (Lorentzian) -> f_n and zeta
+        # with a Gaussian sigma. This is the primary zeta when the mode does
+        # not freely ring (it needs no decay -- just the resonance-curve width).
+        if stepped and len(usable) >= 6:
+            order = sorted(range(len(usable)),
+                           key=lambda i: usable[i]["f_drive"])
+            farr = np.array([usable[i]["f_drive"] for i in order])
+            yarr = np.array([usable[i]["frf"] for i in order]) ** 2  # power
+            hb = 0.5 * (farr[-1] - farr[0])
+            zf = self._fit_lorentzian_zeta(np, farr, yarr, res["f_drive"], hb)
+            if zf is not None:
+                f0z, zz, sz, r2, nb = zf
+                gcmd.respond_info(
+                    "[dwell-release] FRF-WIDTH fit: f_n=%.2f Hz, zeta=%.4f "
+                    "+/- %.4f (%.2f%%), r2=%.2f, %d pts -- the stepped-sine "
+                    "damping (no ring-down needed)"
+                    % (f0z, zz, sz, 100 * zz, r2, nb))
+                gcmd.respond_info(
+                    "  -> apply: SET_MODEL_FF FREQ_%s=%.2f DAMPING_RATIO_%s"
+                    "=%.4f" % (ax_u, f0z, ax_u, zz))
+            else:
+                gcmd.respond_info(
+                    "  [FRF-width] fit rejected -- sweep finer around the peak "
+                    "(e.g. FREQ_STEP=0.5) to resolve the ~3 Hz width")
+        if not stepped and last is not None:
+            self._hilbert_backbone(np, last[2][0], last[2][1],
+                                   freqs[0], band, gcmd)
 
 
 def load_config_prefix(config):

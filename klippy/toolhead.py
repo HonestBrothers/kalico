@@ -88,11 +88,14 @@ class Move:
         # stock constant-accel delta_v2.
         uj = (self.toolhead.unified_max_jerk
               if self.toolhead.unified_emit else 0.0)
-        if uj > 0.0 and prev_move.is_kinematic_move:
+        # Reach is rendered across prev_move's ramp, so notch on its direction.
+        nf = (self.toolhead._move_notch_freq(prev_move)
+              if self.toolhead.unified_emit else 0.0)
+        if (uj > 0.0 or nf > 0.0) and prev_move.is_kinematic_move:
             prev_reach_v2 = pathplan.jerk_reach_v2(
                 prev_move.max_start_v2, prev_move.move_d,
                 self.toolhead._move_jerk_accel(prev_move), uj,
-                self.toolhead.max_velocity)
+                self.toolhead.max_velocity, notch_freq=nf or None)
         else:
             prev_reach_v2 = prev_move.max_start_v2 + prev_move.delta_v2
         max_start_v2 = min(
@@ -193,16 +196,22 @@ class LookAheadQueue:
         # step would become a multi-step position jump -> stepcompress).
         uj = (self.toolhead.unified_max_jerk
               if self.toolhead.unified_emit else 0.0)
+        notch_on = bool(self.toolhead.unified_emit
+                        and self.toolhead._notch_on())
+        jerk_on = uj > 0.0 or notch_on
         for i in range(flush_count - 1, -1, -1):
             move = queue[i]
             # Jerk reach uses the conservative accel (torque-curve aware) so the
             # plan never exceeds what the emitter's a_of_v can render.
             m_accel = (self.toolhead._move_jerk_accel(move)
-                       if uj > 0.0 and move.is_kinematic_move else move.accel)
-            if uj > 0.0 and move.is_kinematic_move:
+                       if jerk_on and move.is_kinematic_move else move.accel)
+            # Per-move direction-weighted notch (0.0 when off / non-kinematic).
+            nf = (self.toolhead._move_notch_freq(move)
+                  if jerk_on and move.is_kinematic_move else 0.0)
+            if jerk_on and move.is_kinematic_move:
                 reachable_start_v2 = pathplan.jerk_reach_v2(
                     next_end_v2, move.move_d, m_accel, uj,
-                    self.toolhead.max_velocity)
+                    self.toolhead.max_velocity, notch_freq=nf or None)
             else:
                 reachable_start_v2 = next_end_v2 + move.delta_v2
             start_v2 = min(move.max_start_v2, reachable_start_v2)
@@ -239,18 +248,23 @@ class LookAheadQueue:
                         move.max_cruise_v2,
                         peak_cruise_v2,
                     )
-                    if uj > 0.0 and move.is_kinematic_move:
+                    if jerk_on and move.is_kinematic_move:
                         # Jerk S-curve peak is below the constant-accel midpoint;
                         # clamp cruise to what is jerk-reachable from each end so
                         # the emitted profile stays jerk-feasible (FF-safe).
+                        # Must use the SAME jerk law as the emitter (notch or
+                        # fixed) or the clamp lets through a cruise the emitter
+                        # cannot ramp to, forcing the sharp fallback.
                         cruise_v2 = min(
                             cruise_v2,
                             pathplan.jerk_reach_v2(start_v2, move.move_d,
                                                    m_accel, uj,
-                                                   self.toolhead.max_velocity),
+                                                   self.toolhead.max_velocity,
+                                                   notch_freq=nf or None),
                             pathplan.jerk_reach_v2(next_end_v2, move.move_d,
                                                    m_accel, uj,
-                                                   self.toolhead.max_velocity),
+                                                   self.toolhead.max_velocity,
+                                                   notch_freq=nf or None),
                         )
                     move.set_junction(
                         min(start_v2, cruise_v2),
@@ -293,9 +307,14 @@ class LookAheadQueue:
 
     def add_move(self, move):
         # Track layer height (for per-move extrusion-width inference) on every
-        # move before any corner splice reshapes the stream.
-        if self.toolhead.corner_blend:
-            self.toolhead.note_layer_height(move)
+        # move before any corner splice reshapes the stream. Unconditional on
+        # purpose: corner_blend is live-settable (SET_UNIFIED CORNER_BLEND=1),
+        # and if tracking only ran while blending was ON, enabling it mid-print
+        # would leave _layer_height at 0 until the next Z step -- so the first
+        # layer after the toggle would silently use the static nozzle-based bead
+        # width instead of the per-move extrusion width. The call is a cheap
+        # early-out for non-extruding moves.
+        self.toolhead.note_layer_height(move)
         # Bead-bounded corner blend (topp-ra-v3): round a sharp extruding corner
         # into a tangent arc within the bead-derived deviation, rendered by the
         # unified emitter. Falls through to the stock path when no blend applies.
@@ -381,6 +400,30 @@ class ToolHead:
             "unified_max_jerk", 0.0, minval=0.0)
         self.unified_jerk_dt = config.getfloat(
             "unified_jerk_dt", 0.001, above=0.0)
+        # Per-ramp jerk law: park the jerk ramp's shaper zero on a FIXED mode
+        # frequency (Hz) instead of using a fixed jerk. A non-saturating jerk
+        # ramp is triangular in a(t), so its zero sits at sqrt(J/dv) and slides
+        # with every move's dv; J = dv*f_n^2 pins it at f_n and makes a_peak
+        # scale as dv*f_n. See pathplan.Constraints.ramp_jerk for the
+        # derivation. 0 = off (fixed unified_max_jerk). When set,
+        # unified_max_jerk becomes a CEILING on the per-ramp jerk, not the jerk.
+        self.unified_notch_freq = config.getfloat(
+            "unified_notch_freq", 0.0, minval=0.0)
+        # Optional PER-AXIS notch (Hz). The ramp shapes the SCALAR path speed, so
+        # its single spectral zero hits both axes at once (a_x, a_y are the same
+        # a(t) scaled by the move direction) -- two independent zeros can't
+        # coexist on one move, so the target is chosen per move, weighted by
+        # direction (see _move_notch_freq).
+        #   - unified_notch_freq alone notches BOTH axes at that frequency.
+        #   - unified_notch_freq_x AND _y set the per-axis modes; they must be
+        #     given together (setting exactly one is a config error).
+        nfx = config.getfloat("unified_notch_freq_x", None, minval=0.0)
+        nfy = config.getfloat("unified_notch_freq_y", None, minval=0.0)
+        try:
+            self.unified_notch_freq_x, self.unified_notch_freq_y = \
+                self._resolve_notch(self.unified_notch_freq, nfx, nfy)
+        except ValueError as e:
+            raise config.error(str(e))
         # Velocity quadrature step (mm/s) for the emitter's a_of_v reach when a
         # torque curve feeds the unified constraints (velocity-dependent accel).
         self.unified_torque_dv = config.getfloat(
@@ -516,6 +559,11 @@ class ToolHead:
             "RESET_VELOCITY_LIMIT",
             self.cmd_RESET_VELOCITY_LIMIT,
             desc=self.cmd_RESET_VELOCITY_LIMIT_help,
+        )
+        gcode.register_command(
+            "SET_UNIFIED",
+            self.cmd_SET_UNIFIED,
+            desc=self.cmd_SET_UNIFIED_help,
         )
         gcode.register_command("M204", self.cmd_M204)
         self.printer.register_event_handler(
@@ -752,6 +800,54 @@ class ToolHead:
                 a = min(a, ac)
         return a
 
+    @staticmethod
+    def _resolve_notch(shared, nfx, nfy):
+        # Resolve the notch config into a per-axis pair (f_x, f_y).
+        #   shared   -> unified_notch_freq (0 = off), notches BOTH axes.
+        #   nfx/nfy  -> unified_notch_freq_x/_y, or None when absent.
+        # Per-axis values override `shared` but must be given as a pair: setting
+        # exactly one is ambiguous, so it is rejected (ValueError -> config
+        # error at the caller).
+        if (nfx is None) != (nfy is None):
+            raise ValueError(
+                "unified_notch_freq_x and unified_notch_freq_y must be set"
+                " together. Use unified_notch_freq to notch both axes at one"
+                " frequency, or set BOTH unified_notch_freq_x and"
+                " unified_notch_freq_y.")
+        if nfx is None:
+            return shared, shared
+        return nfx, nfy
+
+    def _notch_on(self):
+        # True when a notch frequency is configured on either axis. The shared
+        # unified_notch_freq is folded into both at config time (_resolve_notch).
+        return bool(self.unified_notch_freq_x or self.unified_notch_freq_y)
+
+    def _move_notch_freq(self, move):
+        # Direction-weighted notch frequency (Hz) for one move; 0.0 = off.
+        #
+        # A jerk-limited accel ramp shapes the SCALAR path speed, so its single
+        # spectral zero lands on both axes at once: a_x(t) = rx*a(t) and
+        # a_y(t) = ry*a(t) share one zero. Two independent per-axis zeros are
+        # impossible on a single move; pick ONE target, weighted by how much
+        # each axis moves:
+        #     f = (f_x*|rx| + f_y*|ry|) / (|rx| + |ry|)
+        # -> f_x on pure-X, f_y on pure-Y, a weighted mean (always within
+        # [min(f_x,f_y), max(f_x,f_y)]) on diagonals. f_x / f_y are pre-resolved
+        # at config time (_resolve_notch), so a single shared unified_notch_freq
+        # yields that frequency for every direction.
+        fx = self.unified_notch_freq_x
+        fy = self.unified_notch_freq_y
+        if not fx and not fy:
+            return 0.0
+        rx = abs(move.axes_r[0])
+        ry = abs(move.axes_r[1])
+        w = rx + ry
+        if w <= 1e-12:
+            # No XY motion (Z/E-only): path notch is direction-free.
+            return fx or fy
+        return (fx * rx + fy * ry) / w
+
     def _pathplan_cons(self, move):
         # Build the pathplan.Constraints oracle for one move. When a torque curve
         # is loaded the phase-plane a_max(v) IS the curve (velocity-dependent
@@ -760,6 +856,11 @@ class ToolHead:
         # trapezoid (identical geometry, one extra structural guarantee).
         jerk = self.unified_max_jerk or None
         jerk_dt = self.unified_jerk_dt
+        # Per-ramp notch law (jerk = dv*f_n^2); `jerk` above degrades to a
+        # ceiling when this is set. Direction-weighted per-axis blend; must match
+        # the value the jerk-aware lookahead used (same _move_notch_freq), or
+        # moves get planned into the sharp fallback.
+        notch_freq = self._move_notch_freq(move) or None
         # When the model-inverse FF is active, cap the per-segment accel change
         # so its p2*a term stays sub-step even on short jerk-infeasible moves
         # (else the sharp fallback's hard accel step becomes a position jump ->
@@ -779,11 +880,13 @@ class ToolHead:
                 max_jerk=jerk,
                 jerk_dt=jerk_dt,
                 max_da=max_da,
+                notch_freq=notch_freq,
             )
         v_ceil = max(move.cruise_v, move.start_v, move.end_v) + 1.0
         return pathplan.Constraints(
             a_of_v=None, a_const=move.accel, v_ceil=v_ceil, dv_slice=1e18,
             max_jerk=jerk, jerk_dt=jerk_dt, max_da=max_da,
+            notch_freq=notch_freq,
         )
 
     def _process_moves(self, moves):
@@ -1298,6 +1401,56 @@ class ToolHead:
                 and min_cruise_ratio is None
             ):
                 gcmd.respond_info("\n".join(msg), log=False)
+
+    cmd_SET_UNIFIED_help = (
+        "Toggle the unified planner (jerk limiting / corner blending) live. "
+        "ENABLE=0/1 flips the emitter; MAX_JERK sets the jerk cap "
+        "(mm/s^3, 0 = uncapped); NOTCH_FREQ parks the jerk ramp's shaper zero "
+        "on a mode frequency (Hz, 0 = fixed-jerk); NOTCH_FREQ_X / NOTCH_FREQ_Y "
+        "set per-axis notch modes blended by move direction (0 = use NOTCH_FREQ); "
+        "CORNER_BLEND=0/1 and CORNER_DEVIATION_RATIO tune bead-bounded corner "
+        "rounding. No args = report state.")
+
+    def cmd_SET_UNIFIED(self, gcmd):
+        en = gcmd.get_int("ENABLE", None, minval=0, maxval=1)
+        jerk = gcmd.get_float("MAX_JERK", None, minval=0.0)
+        notch = gcmd.get_float("NOTCH_FREQ", None, minval=0.0)
+        notch_x = gcmd.get_float("NOTCH_FREQ_X", None, minval=0.0)
+        notch_y = gcmd.get_float("NOTCH_FREQ_Y", None, minval=0.0)
+        cblend = gcmd.get_int("CORNER_BLEND", None, minval=0, maxval=1)
+        cdev = gcmd.get_float("CORNER_DEVIATION_RATIO", None,
+                              above=0.0, maxval=0.5)
+        # Flush pending moves so the change only affects moves planned after
+        # this point (same live-mutation contract as SET_VELOCITY_LIMIT).
+        self.flush_step_generation()
+        if en is not None:
+            self.unified_emit = bool(en)
+        if jerk is not None:
+            self.unified_max_jerk = jerk
+        if notch is not None:
+            # NOTCH_FREQ notches both axes; explicit NOTCH_FREQ_X/Y below win.
+            self.unified_notch_freq = notch
+            self.unified_notch_freq_x = notch
+            self.unified_notch_freq_y = notch
+        if notch_x is not None:
+            self.unified_notch_freq_x = notch_x
+        if notch_y is not None:
+            self.unified_notch_freq_y = notch_y
+        # Safe to flip between moves: LookAheadQueue.add_move re-reads
+        # corner_blend per move, and the flush above guarantees no partially
+        # spliced blend chain is left in the queue across the change.
+        if cblend is not None:
+            self.corner_blend = bool(cblend)
+        if cdev is not None:
+            self.corner_deviation_ratio = cdev
+        gcmd.respond_info(
+            "unified_emit=%d unified_max_jerk=%.0f unified_auto_jerk=%d "
+            "unified_notch_freq=%.2f notch_freq_x=%.2f notch_freq_y=%.2f "
+            "corner_blend=%d corner_deviation_ratio=%.3f"
+            % (self.unified_emit, self.unified_max_jerk,
+               self.unified_auto_jerk, self.unified_notch_freq,
+               self.unified_notch_freq_x, self.unified_notch_freq_y,
+               self.corner_blend, self.corner_deviation_ratio))
 
     cmd_RESET_VELOCITY_LIMIT_help = "Reset printer velocity limits"
 
