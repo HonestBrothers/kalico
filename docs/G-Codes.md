@@ -1144,6 +1144,28 @@ thermal model update (for debugging).
 `INDX_DEBUG_STREAM_RAW_IR_SENSOR`: Toggle streaming of raw IR sensor
 readings to a timestamped csv file under /tmp (for debugging).
 
+### [corner_blend]
+
+The following command is enabled if a
+[corner_blend config section](Config_Reference.md#corner_blend) has been
+enabled.
+
+#### SET_CORNER_BLEND
+`SET_CORNER_BLEND [ENABLE=<0|1>] [BEAD_WIDTH=<mm>] [BEAD_RATIO=<ratio>]
+[LAYER_HEIGHT=<mm>] [DEVIATION_RATIO=<ratio>] [BLEND_RATIO=<ratio>]
+[MIN_TURN=<degrees>] [MAX_TURN=<degrees>] [CHORD_RATIO=<ratio>]
+[MAX_CHORD_ANGLE=<degrees>] [MAX_EXTRUSION_SCALE=<scale>]`: Modify
+bead-bounded corner blending parameters, and report the resulting state
+along with the effective bead width. Pending moves are flushed first, so
+a change only affects moves planned after the command. Every parameter
+is validated against the same bounds the config parser applies; if any
+is rejected, all of them are rolled back. See
+[config reference](Config_Reference.md#corner_blend) for details on each.
+
+Because the parameters are settable at runtime, they can be swept with
+[TUNING_TOWER](#tuning_tower), e.g.
+`TUNING_TOWER COMMAND=SET_CORNER_BLEND PARAMETER=DEVIATION_RATIO START=0.05 FACTOR=0.01`.
+
 ### [input_shaper]
 
 The following command is enabled if an
