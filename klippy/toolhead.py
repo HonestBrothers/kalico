@@ -445,7 +445,60 @@ class LookAheadQueue:
         del queue[:flush_count]
         return res
 
+    def _splice_corner_chain(self, chain):
+        # Replace queue[-1] (the sharp prev move) with chain[0] (the trimmed
+        # prev) and append the arc chords + the trimmed outgoing move.
+        #
+        # These Move objects are synthesized here and never pass through
+        # ToolHead.move(), so they have to run the same kinematic and
+        # extra-axis limit checks that method applies -- skipping them is how
+        # the old jerk_limiting round_corners let out-of-range blend moves
+        # reach the steppers.
+        #
+        # The toolhead comes off the move rather than off self: LookAheadQueue
+        # does not hold a back-reference, and tests build one standalone.
+        th = chain[0].toolhead
+        kin = th.kin
+        extra_axes = th.extra_axes
+        for nm in chain:
+            if nm.is_kinematic_move:
+                kin.check_move(nm)
+            for e_index, ea in enumerate(extra_axes):
+                if nm.axes_d[e_index + 3]:
+                    ea.check_move(nm, e_index + 3)
+        # queue[-1]'s min_move_t was already debited from junction_flush when it
+        # was queued, and chain[0] is strictly shorter. Not re-crediting the
+        # difference makes the flush fire marginally early, which is the safe
+        # direction -- correcting it would need the pre-trim length kept around
+        # for a sub-millisecond gain.
+        self.queue[-1] = chain[0]
+        if len(self.queue) >= 2:
+            self.queue[-1].calc_junction(self.queue[-2])
+        for nm in chain[1:]:
+            self.queue.append(nm)
+            nm.calc_junction(self.queue[-2])
+            self.junction_flush -= nm.min_move_t
+        return self.junction_flush <= 0.0
+
     def add_move(self, move):
+        # Bead-bounded corner blend ([corner_blend]): round a sharp EXTRUDING
+        # corner into a tangent arc whose deviation is bounded by the extruded
+        # bead. Falls through to the stock path whenever no blend applies. The
+        # toolhead is reached through the move because LookAheadQueue holds no
+        # reference to it -- getattr keeps standalone queues (tests) working.
+        cb = getattr(move.toolhead, "corner_blend", None)
+        if cb is not None and cb.enabled:
+            # Track layer height (for per-move extrusion-width inference) on
+            # every move, before any corner splice reshapes the stream.
+            cb.note_layer_height(move)
+            if (
+                self.queue
+                and move.is_kinematic_move
+                and self.queue[-1].is_kinematic_move
+            ):
+                chain = cb.plan_chain(self.queue[-1], move)
+                if chain is not None:
+                    return self._splice_corner_chain(chain)
         self.queue.append(move)
         if len(self.queue) == 1:
             return
@@ -552,6 +605,10 @@ class ToolHead:
         )
         self._sync_span_cos()
         self._check_unified_settings(config.error)
+        # Bead-bounded corner blending, if the optional [corner_blend] section
+        # is present. The toolhead is created after every config section (see
+        # Printer._read_config), so this resolves without a connect handler.
+        self.corner_blend = self.printer.lookup_object("corner_blend", None)
         self.orig_cfg = {}
         self.orig_cfg["max_velocity"] = self.max_velocity
         self.orig_cfg["max_accel"] = self.max_accel

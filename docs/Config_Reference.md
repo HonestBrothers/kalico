@@ -2259,6 +2259,64 @@ Marlin/RepRapFirmware compatible M486 G-Code macro.
 #   The default is `True`.
 ```
 
+### [corner_blend]
+
+Bead-bounded corner blending. Replaces a sharp *extruding* corner with a
+tangent circular arc, approximated as a bounded-angle polyline, whose maximum
+deviation from the vertex is derived from the printed bead rather than from a
+tuned `junction_deviation`.
+
+The bead has a stadium cross-section, so a printed corner is already rounded at
+roughly half the extrusion width. A toolpath rounding that stays well inside
+that is optically indistinguishable from the exact corner, and it lets the tool
+keep moving through the junction instead of stopping — which is what produces
+the pressure-advance decompress/recompress blob.
+
+Corners are left sharp unless the blend is clearly safe: both legs must extrude
+positively, the turn must fall between `min_turn` and `max_turn`, the trim may
+not exceed `blend_ratio` of either leg, and the corner may not concentrate
+filament beyond `max_extrusion_scale`.
+
+```
+[corner_blend]
+#enable: True
+#   Whether to blend corners. Adding the section enables the feature; set to
+#   False to keep it configured but inactive. The default is True.
+#bead_width: 0.0
+#   Extrusion width (mm) used for the deviation bound. 0 (the default) derives
+#   it from the extruder's nozzle_diameter times bead_ratio.
+#bead_ratio: 1.125
+#   Multiplier applied to nozzle_diameter when bead_width is 0. The default
+#   is 1.125.
+#layer_height: 0.0
+#   Layer height (mm) used to infer each move's real bead width from its own
+#   extrusion, as filament_area*E/(move_d*h). 0 (the default) derives it from
+#   the Z rise between extruding moves, so thin gap-fill beads get a
+#   proportionally tighter deviation bound with no extra tuning.
+#deviation_ratio: 0.15
+#   Maximum path deviation from the vertex, as a fraction of the bead width.
+#   The default is 0.15, so a 0.45mm bead permits about 0.07mm.
+#blend_ratio: 0.4
+#   Largest fraction of either adjacent move the blend may trim away. Bounds
+#   how much a leg shared by two corners can be consumed. The default is 0.4.
+#min_turn: 8.0
+#   Turns shallower than this (degrees) are left alone -- there is nothing to
+#   round. The default is 8.0.
+#max_turn: 150.0
+#   Turns sharper than this (degrees) are left alone. A near-reversal is a
+#   genuine corner or a seam, where the stop is wanted. The default is 150.0.
+#chord_ratio: 1.0
+#   Target arc chord length, as a multiple of the bead width. The default is
+#   1.0.
+#max_chord_angle: 5.0
+#   Maximum heading change (degrees) any one chord may represent, independent
+#   of chord_ratio. The default is 5.0.
+#max_extrusion_scale: 1.35
+#   Reject the blend when routing filament around the shorter arc would raise
+#   the corner's extrusion density above this multiple of the incoming moves'.
+#   The default is 1.35.
+```
+
 ## Resonance compensation
 
 ### [input_shaper]
