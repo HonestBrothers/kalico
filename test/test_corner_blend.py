@@ -250,6 +250,147 @@ def test_blend_chain_bounds_extrusion_density():
     print("  excessive corner extrusion density skipped OK")
 
 
+# --- SET_CORNER_BLEND -------------------------------------------------------
+#
+# The command is exercised against stub printer/gcode/toolhead objects: the
+# point is the mutation contract (flush first, validate, roll back on error,
+# drop the memoized bead width), not klippy wiring.
+
+
+class _StubGCodeError(Exception):
+    pass
+
+
+class _StubGCmd:
+    def __init__(self, params):
+        self.params = {k.upper(): v for k, v in params.items()}
+        self.responses = []
+
+    def get_int(self, name, default, minval=None, maxval=None):
+        return (
+            int(self.params.get(name, default))
+            if name in self.params
+            else default
+        )
+
+    def get_float(
+        self, name, default, minval=None, maxval=None, above=None, below=None
+    ):
+        if name not in self.params:
+            return default
+        v = float(self.params[name])
+        if minval is not None and v < minval:
+            raise _StubGCodeError("%s below minval" % name)
+        if maxval is not None and v > maxval:
+            raise _StubGCodeError("%s above maxval" % name)
+        if above is not None and v <= above:
+            raise _StubGCodeError("%s not above %s" % (name, above))
+        if below is not None and v >= below:
+            raise _StubGCodeError("%s not below %s" % (name, below))
+        return v
+
+    def error(self, msg):
+        return _StubGCodeError(msg)
+
+    def respond_info(self, msg):
+        self.responses.append(msg)
+
+
+class _StubToolHead:
+    def __init__(self):
+        self.flushes = 0
+
+    def flush_step_generation(self):
+        self.flushes += 1
+
+    def get_extruder(self):
+        return None
+
+
+class _StubPrinter:
+    def __init__(self):
+        self.toolhead = _StubToolHead()
+        self.commands = {}
+
+    def lookup_object(self, name, default=None):
+        if name == "toolhead":
+            return self.toolhead
+        if name == "gcode":
+            return self
+        return default
+
+    def register_command(self, name, func, desc=None):
+        self.commands[name] = func
+
+
+class _StubConfig:
+    def __init__(self, printer):
+        self.printer = printer
+
+    def get_printer(self):
+        return self.printer
+
+    def getboolean(self, name, default):
+        return default
+
+    def getfloat(self, name, default, **kw):
+        return default
+
+    def error(self, msg):
+        return _StubGCodeError(msg)
+
+
+def _make_blend():
+    printer = _StubPrinter()
+    cb_obj = cb.CornerBlend(_StubConfig(printer))
+    return printer, cb_obj
+
+
+def test_command_is_registered_and_flushes():
+    printer, blend = _make_blend()
+    assert "SET_CORNER_BLEND" in printer.commands
+    gcmd = _StubGCmd({"DEVIATION_RATIO": 0.25})
+    blend.cmd_SET_CORNER_BLEND(gcmd)
+    assert blend.deviation_ratio == 0.25
+    # The change must not reach moves already planned.
+    assert printer.toolhead.flushes == 1
+    assert gcmd.responses and "deviation_ratio=0.2500" in gcmd.responses[0]
+    print("  SET_CORNER_BLEND registered, flushes, and applies OK")
+
+
+def test_command_rolls_back_on_invalid_pair():
+    printer, blend = _make_blend()
+    before = (blend.min_turn, blend.max_turn)
+    gcmd = _StubGCmd({"MIN_TURN": 90.0, "MAX_TURN": 30.0})
+    try:
+        blend.cmd_SET_CORNER_BLEND(gcmd)
+    except _StubGCodeError:
+        pass
+    else:
+        raise AssertionError("min_turn > max_turn was accepted")
+    assert (blend.min_turn, blend.max_turn) == before
+    print("  SET_CORNER_BLEND rolls back a rejected turn range OK")
+
+
+def test_command_drops_memoized_bead_width():
+    printer, blend = _make_blend()
+    blend._bead_w = 0.45  # pretend the nozzle-derived width was resolved
+    blend.cmd_SET_CORNER_BLEND(_StubGCmd({"BEAD_WIDTH": 0.6}))
+    # bead_width is now literal, so the stale memo must not survive.
+    assert blend._static_bead_width() == 0.6
+    print("  SET_CORNER_BLEND drops the memoized bead width OK")
+
+
+def test_command_enable_toggle():
+    printer, blend = _make_blend()
+    assert blend.enabled
+    blend.cmd_SET_CORNER_BLEND(_StubGCmd({"ENABLE": 0}))
+    assert not blend.enabled
+    blend.cmd_SET_CORNER_BLEND(_StubGCmd({"ENABLE": 1}))
+    assert blend.enabled
+    print("  SET_CORNER_BLEND ENABLE toggles OK")
+
+
 if __name__ == "__main__":
     test_bead_deviation()
     test_corner_geometry_angles()
@@ -263,4 +404,8 @@ if __name__ == "__main__":
     test_blend_chain_asymmetric_extrusion()
     test_blend_chain_rejects_nonpositive_extrusion()
     test_blend_chain_bounds_extrusion_density()
+    test_command_is_registered_and_flushes()
+    test_command_rolls_back_on_invalid_pair()
+    test_command_drops_memoized_bead_width()
+    test_command_enable_toggle()
     print("ALL PASS")

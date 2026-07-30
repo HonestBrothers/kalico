@@ -328,6 +328,102 @@ class CornerBlend:
         self.max_extrusion_scale = config.getfloat(
             "max_extrusion_scale", 1.35, minval=1.0
         )
+        gcode = self.printer.lookup_object("gcode")
+        gcode.register_command(
+            "SET_CORNER_BLEND",
+            self.cmd_SET_CORNER_BLEND,
+            desc=self.cmd_SET_CORNER_BLEND_help,
+        )
+
+    # Live-tunable fields, as (gcode parameter, attribute, getter kwargs). The
+    # bounds match the config parser's, so a value rejected at startup is also
+    # rejected here.
+    _TUNABLES = (
+        ("BEAD_WIDTH", "bead_width", {"minval": 0.0}),
+        ("BEAD_RATIO", "bead_ratio", {"above": 0.0}),
+        ("LAYER_HEIGHT", "layer_height", {"minval": 0.0}),
+        ("DEVIATION_RATIO", "deviation_ratio", {"above": 0.0, "maxval": 0.5}),
+        ("BLEND_RATIO", "blend_ratio", {"above": 0.0, "maxval": 0.5}),
+        ("MIN_TURN", "min_turn", {"minval": 0.0, "below": 180.0}),
+        ("MAX_TURN", "max_turn", {"minval": 0.0, "below": 180.0}),
+        ("CHORD_RATIO", "chord_ratio", {"above": 0.0}),
+        ("MAX_CHORD_ANGLE", "max_chord_angle", {"above": 0.0, "maxval": 45.0}),
+        ("MAX_EXTRUSION_SCALE", "max_extrusion_scale", {"minval": 1.0}),
+    )
+
+    def _state(self):
+        return (self.enabled,) + tuple(
+            getattr(self, attr) for _, attr, _ in self._TUNABLES
+        )
+
+    def _restore(self, state):
+        self.enabled = state[0]
+        for (_, attr, _), value in zip(self._TUNABLES, state[1:]):
+            setattr(self, attr, value)
+
+    cmd_SET_CORNER_BLEND_help = "Set bead-bounded corner blending parameters"
+
+    def cmd_SET_CORNER_BLEND(self, gcmd):
+        en = gcmd.get_int("ENABLE", None, minval=0, maxval=1)
+        values = [
+            (attr, gcmd.get_float(name, None, **kw))
+            for name, attr, kw in self._TUNABLES
+        ]
+        # Flush pending moves so the change only affects moves planned after
+        # this point (same live-mutation contract as SET_VELOCITY_LIMIT).
+        self.printer.lookup_object("toolhead").flush_step_generation()
+        old = self._state()
+        try:
+            if en is not None:
+                self.enabled = bool(en)
+            for attr, value in values:
+                if value is not None:
+                    setattr(self, attr, value)
+            if self.min_turn > self.max_turn:
+                raise gcmd.error("MIN_TURN must not exceed MAX_TURN")
+        except:
+            self._restore(old)
+            raise
+        # The nozzle-derived width is memoized, so a changed bead setting has to
+        # drop it or the old width would outlive the command that replaced it.
+        if self._state() != old:
+            self._bead_w = None
+        gcmd.respond_info(
+            "corner_blend: enable=%d bead_width=%.4f bead_ratio=%.3f"
+            " layer_height=%.4f deviation_ratio=%.4f blend_ratio=%.3f"
+            " min_turn=%.1f max_turn=%.1f chord_ratio=%.3f"
+            " max_chord_angle=%.1f max_extrusion_scale=%.3f"
+            " [effective bead=%.4f]"
+            % (
+                self.enabled,
+                self.bead_width,
+                self.bead_ratio,
+                self.layer_height or self._layer_height,
+                self.deviation_ratio,
+                self.blend_ratio,
+                self.min_turn,
+                self.max_turn,
+                self.chord_ratio,
+                self.max_chord_angle,
+                self.max_extrusion_scale,
+                self._static_bead_width(),
+            )
+        )
+
+    def get_status(self, eventtime):
+        return {
+            "enabled": self.enabled,
+            "bead_width": self.bead_width,
+            "bead_ratio": self.bead_ratio,
+            "layer_height": self.layer_height or self._layer_height,
+            "deviation_ratio": self.deviation_ratio,
+            "blend_ratio": self.blend_ratio,
+            "min_turn": self.min_turn,
+            "max_turn": self.max_turn,
+            "chord_ratio": self.chord_ratio,
+            "max_chord_angle": self.max_chord_angle,
+            "max_extrusion_scale": self.max_extrusion_scale,
+        }
 
     def _get_extruder(self):
         toolhead = self.printer.lookup_object("toolhead", None)
