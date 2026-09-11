@@ -529,11 +529,15 @@ class PrinterExtruder:
     def get_trapq(self):
         return self.trapq
 
+    def get_axis_gcode_id(self):
+        return "E"
+
     def stats(self, eventtime):
         return self.heater.stats(eventtime)
 
-    def check_move(self, move):
-        axis_r = move.axes_r[3]
+    def check_move(self, move, ea_index):
+        axis_r = move.axes_r[ea_index]
+        axis_d = move.axes_d[ea_index]
         if not self.heater.can_extrude:
             raise self.printer.command_error(
                 "Extrude below minimum temp\n"
@@ -541,11 +545,11 @@ class PrinterExtruder:
             )
         if (not move.axes_d[0] and not move.axes_d[1]) or axis_r < 0.0:
             # Extrude only move (or retraction move) - limit accel and velocity
-            if abs(move.axes_d[3]) > self.max_e_dist:
+            if abs(axis_d) > self.max_e_dist:
                 raise self.printer.command_error(
                     "Extrude only move too long (%.3fmm vs %.3fmm)\n"
                     "See the 'max_extrude_only_distance' config"
-                    " option for details" % (move.axes_d[3], self.max_e_dist)
+                    " option for details" % (axis_d, self.max_e_dist)
                 )
             inv_extrude_r = 1.0 / abs(axis_r)
             move.limit_speed(
@@ -553,7 +557,7 @@ class PrinterExtruder:
                 self.max_e_accel * inv_extrude_r,
             )
         elif axis_r > self.max_extrude_ratio:
-            if move.axes_d[3] <= self.nozzle_diameter * self.max_extrude_ratio:
+            if axis_d <= self.nozzle_diameter * self.max_extrude_ratio:
                 # Permit extrusion if amount extruded is tiny
                 return
             area = axis_r * self.filament_area
@@ -570,14 +574,14 @@ class PrinterExtruder:
                 % (area, self.max_extrude_ratio * self.filament_area)
             )
 
-    def calc_junction(self, prev_move, move):
-        diff_r = move.axes_r[3] - prev_move.axes_r[3]
+    def calc_junction(self, prev_move, move, ea_index):
+        diff_r = move.axes_r[ea_index] - prev_move.axes_r[ea_index]
         if diff_r:
             return (self.instant_corner_v / abs(diff_r)) ** 2
         return move.max_cruise_v2
 
-    def move(self, print_time, move):
-        axis_r = move.axes_r[3]
+    def process_move(self, print_time, move, ea_index):
+        axis_r = move.axes_r[ea_index]
         abs_axis_r = abs(axis_r)
         accel = move.accel * abs_axis_r
         start_v = move.start_v * abs_axis_r
@@ -605,10 +609,61 @@ class PrinterExtruder:
             cruise_v,
             accel,
         )
-        extr_d = abs(move.axes_d[3])
+        extr_d = abs(move.axes_d[ea_index])
         for i in range(3):
             self.last_position[i] += extr_d * extr_r[i]
 
+    def process_move_segment(
+        self,
+        print_time,
+        move,
+        ea_index,
+        accel_t,
+        cruise_t,
+        decel_t,
+        start_v,
+        cruise_v,
+        accel,
+        seg_dist,
+    ):
+        # One velocity slice of `move` queued to the extruder trapq, mirroring
+        # a jerk-limited toolhead slice emitted at the same print_time so the
+        # extruder stays time-synced with the (non-trapezoidal) XY profile.
+        #
+        # Ported onto the bleeding-edge extruder, where pressure advance is no
+        # longer a scalar in the trapq y/z slots: it rides in the direction
+        # ratios extr_r = copysign(r*r, axis_r) that kin_extruder reads, and
+        # last_position is a 3-vector in that same space. extr_r depends only
+        # on the MOVE's direction, so it is identical for every slice of the
+        # move; only the distance advanced differs. Summing abs(axis_r)*seg_dist
+        # across a move's slices gives abs(axes_d[ea_index]), so last_position
+        # lands exactly where process_move would have left it.
+        axis_r = move.axes_r[ea_index]
+        abs_axis_r = abs(axis_r)
+        extr_pos = self.last_position
+        if move.is_kinematic_move:
+            extr_r = [math.copysign(r * r, axis_r) for r in move.axes_r[:3]]
+        else:
+            extr_r = [0.0, 0.0, axis_r]
+        self.trapq_append(
+            self.trapq,
+            print_time,
+            accel_t,
+            cruise_t,
+            decel_t,
+            extr_pos[0],
+            extr_pos[1],
+            extr_pos[2],
+            extr_r[0],
+            extr_r[1],
+            extr_r[2],
+            start_v * abs_axis_r,
+            cruise_v * abs_axis_r,
+            accel * abs_axis_r,
+        )
+        extr_d = abs(axis_r * seg_dist)
+        for i in range(3):
+            self.last_position[i] += extr_d * extr_r[i]
     def find_past_position(self, print_time):
         if not self.extruder_steppers:
             return 0.0
@@ -675,14 +730,17 @@ class DummyExtruder:
     def update_move_time(self, flush_time, clear_history_time):
         pass
 
-    def check_move(self, move):
+    def check_move(self, move, ea_index):
         raise move.move_error("Extrude when no extruder present")
 
     def find_past_position(self, print_time):
         return 0.0
 
-    def calc_junction(self, prev_move, move):
+    def calc_junction(self, prev_move, move, ea_index):
         return move.max_cruise_v2
+
+    def get_axis_gcode_id(self):
+        return "E"
 
     def get_name(self):
         return ""
@@ -694,7 +752,12 @@ class DummyExtruder:
         raise self.printer.command_error("Extruder not configured")
 
     def get_trapq(self):
-        raise self.printer.command_error("Extruder not configured")
+        # None, not a raise: the notch toolhead uses this as the "no
+        # extruder configured yet" sentinel in set_extruder (it compares
+        # the outgoing and incoming extra-axis trapqs). bleeding-edge
+        # raised here, which aborted klippy startup before any extruder
+        # was linked.
+        return None
 
 
 def add_printer_objects(config):

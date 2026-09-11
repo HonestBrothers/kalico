@@ -12,7 +12,7 @@ from collections import deque
 
 from .. import chelper, toolhead
 from ..gcode import CommandError
-from ..kinematics import extruder
+from ..kinematics import extruder as kinematics_extruder
 from ..stepper import LookupMultiRail
 from .homing import Homing, HomingMove
 
@@ -2323,7 +2323,7 @@ class TradRackToolHead(toolhead.ToolHead, object):
         ]
         self.mcu = self.all_mcus[0]
         if hasattr(toolhead, "LookAheadQueue"):
-            self.lookahead = toolhead.LookAheadQueue(self)
+            self.lookahead = toolhead.LookAheadQueue()
             self.lookahead.set_flush_time(toolhead.BUFFER_TIME_HIGH)
         else:
             self.move_queue = toolhead.MoveQueue(self)
@@ -2360,6 +2360,16 @@ class TradRackToolHead(toolhead.ToolHead, object):
         self.square_corner_velocity = config.getfloat(
             "square_corner_velocity", 5.0, minval=0.0
         )
+        self.unified_emit = False
+        self.unified_jerk_dt = 0.001
+        self.unified_notch_freq = 0.0
+        self.unified_notch_freq_x = 0.0
+        self.unified_notch_freq_y = 0.0
+        self.unified_span_ramps = False
+        self.unified_span_max_angle = toolhead.SPAN_MAX_ANGLE
+        self.unified_span_min_cos = 1.0
+        self._unified_warned = set()
+        self._unified_all_warned = False
         self.junction_deviation = self.max_accel_to_decel = 0.0
         self._calc_junction_deviation()
         # Input stall detection
@@ -2374,7 +2384,6 @@ class TradRackToolHead(toolhead.ToolHead, object):
         self.print_time = 0.0
         self.special_queuing_state = "NeedPrime"
         self.priming_timer = None
-        self.drip_completion = None
         # Flush tracking
         self.flush_timer = self.reactor.register_timer(self._flush_handler)
         self.do_kick_flush_timer = True
@@ -2392,11 +2401,14 @@ class TradRackToolHead(toolhead.ToolHead, object):
         self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
         self.trapq_append = ffi_lib.trapq_append
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
+        # Motion flushing
         self.step_generators = []
+        self.flush_trapqs = [self.trapq]
         # Create kinematic class
         gcode = self.printer.lookup_object("gcode")
         self.Coord = gcode.Coord
-        self.extruder = extruder.DummyExtruder(self.printer)
+        extruder = kinematics_extruder.DummyExtruder(self.printer)
+        self.extra_axes = [extruder]
         try:
             self.kin = TradRackKinematics(self, config, is_extruder_synced)
         except config.error as e:
