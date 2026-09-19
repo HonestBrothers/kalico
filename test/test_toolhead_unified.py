@@ -510,6 +510,88 @@ def test_straight_spans_keep_the_spectral_null():
     print("  straight spans keep the null, turning spans report the loss OK")
 
 
+def _load_extra(name):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_th_test_" + name, os.path.join(KLIPPY, "extras", name + ".py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _curve(speeds, accels, enabled=True):
+    tc = object.__new__(_load_extra("torque_curve").TorqueCurve)
+    tc.enabled = enabled
+    tc.fallback_max_accel = None
+    tc.interpolation = "linear"
+    tc.safety_margin = 1.0
+    tc.set_curve_data(speeds, accels)
+    return tc
+
+
+class _Recorder:
+    def __init__(self):
+        self.moves = []
+
+    def add_move(self, move):
+        self.moves.append(move)
+        return False
+
+
+def _move_toolhead(curves):
+    th = make_unified_toolhead(unified_emit=False)
+    th.max_accel = 20000.0
+    th.commanded_pos = [0.0, 0.0, 0.0, 0.0]
+    th.kin = types.SimpleNamespace(check_move=lambda move: None)
+    th.lookahead = _Recorder()
+    th.print_time = 0.0
+    th.need_check_pause = 1e9
+    th.torque_curves = curves
+    return th
+
+
+def test_torque_curve_caps_move_accel():
+    # a_max falls 20000 -> 4000 over 0..400 mm/s. A 300 mm/s move is capped
+    # at a_max(300) = 8000 -- the value at its TOP speed.
+    tc = _curve([0.0, 400.0], [20000.0, 4000.0])
+    th = _move_toolhead([tc])
+    th.move([100.0, 0.0, 0.0, 0.0], 300.0)
+    m = th.lookahead.moves[-1]
+    assert abs(m.accel - 8000.0) < 1e-6, m.accel
+    assert abs(m.delta_v2 - 2.0 * m.move_d * 8000.0) < 1e-6
+    # Extrude-only moves carry no XY speed: the XY curve must not touch them.
+    th.move([100.0, 0.0, 0.0, 5.0], 300.0)
+    assert th.lookahead.moves[-1].accel > 1e6
+    # Disabled curve (e.g. mid-calibration) leaves the move alone.
+    tc.enabled = False
+    th.move([0.0, 0.0, 0.0, 5.0], 300.0)
+    assert th.lookahead.moves[-1].accel == 20000.0
+    print("  torque curve caps kinematic move accel at a_max(v_top) OK")
+
+
+def test_calibration_sweep_suspends_caps_and_notch():
+    calib = _load_extra("torque_curve_calibrate")
+    tc = _curve([0.0, 400.0], [20000.0, 4000.0])
+    th = make_unified_toolhead()
+    th.torque_curves = [tc]
+    th.flush_step_generation = lambda: None
+    before = th._unified_state()
+    c = object.__new__(calib.TorqueCurveCalibrate)
+    c.toolhead = th
+    c.measure_vibration = False
+    c.vibration_shaper_off = False
+    msgs = []
+    gcmd = types.SimpleNamespace(respond_info=msgs.append)
+    saved = c._disable_reshapers(gcmd)
+    assert not tc.enabled and not th.unified_emit
+    th.unified_notch_freq_x = 1.0  # sweep-time edits must not leak out
+    c._restore_reshapers(saved, gcmd)
+    assert tc.enabled and th._unified_state() == before
+    print("  calibration sweep suspends + restores caps and notch OK")
+
+
 def main():
     test_subclass_without_unified_fields()
     test_unified_rejects_unsegmented_extra_axis()
@@ -525,6 +607,8 @@ def main():
     test_no_velocity_step_at_move_boundaries()
     test_reset_velocity_limit_resyncs_derived_span_angle()
     test_infeasible_batch_fails_before_emission()
+    test_torque_curve_caps_move_accel()
+    test_calibration_sweep_suspends_caps_and_notch()
     print("ALL PASS")
 
 

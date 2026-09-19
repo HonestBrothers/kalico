@@ -556,6 +556,9 @@ class ToolHead:
         )
         self._sync_span_cos()
         self._check_unified_settings(config.error)
+        # [torque_curve] sections register here on klippy:connect; move()
+        # applies each one's per-move accel cap.
+        self.torque_curves = []
         self.orig_cfg = {}
         self.orig_cfg["max_velocity"] = self.max_velocity
         self.orig_cfg["max_accel"] = self.max_accel
@@ -1125,6 +1128,13 @@ class ToolHead:
             return
         if move.is_kinematic_move:
             self.kin.check_move(move)
+            # Torque-speed curve: cap the move's accel at a_max(v) for its top
+            # speed. The curve falls with speed, so that is the minimum over
+            # the move's range -- conservative, and it feeds move.accel, which
+            # every downstream consumer (lookahead reach, notch ramp law,
+            # sharp emitter) already honors.
+            for tc in self.torque_curves:
+                tc.limit_move(move)
         for e_index, ea in enumerate(self.extra_axes):
             if move.axes_d[e_index + 3]:
                 ea.check_move(move, e_index + 3)
