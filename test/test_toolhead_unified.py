@@ -511,12 +511,23 @@ def test_straight_spans_keep_the_spectral_null():
 
 
 def _load_extra(name):
+    # Load klippy/extras/<name>.py inside a throwaway package so its relative
+    # imports (from . import pathplan) resolve to sibling modules.
     import importlib.util
 
+    pkg_name = "_th_test_extras"
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [os.path.join(KLIPPY, "extras")]
+        sys.modules[pkg_name] = pkg
+    full = pkg_name + "." + name
+    if full in sys.modules:
+        return sys.modules[full]
     spec = importlib.util.spec_from_file_location(
-        "_th_test_" + name, os.path.join(KLIPPY, "extras", name + ".py")
+        full, os.path.join(KLIPPY, "extras", name + ".py")
     )
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[full] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -527,6 +538,7 @@ def _curve(speeds, accels, enabled=True):
     tc.fallback_max_accel = None
     tc.interpolation = "linear"
     tc.safety_margin = 1.0
+    tc._planner_curve = tc._planner_curve_key = None
     tc.set_curve_data(speeds, accels)
     return tc
 
@@ -571,6 +583,27 @@ def test_torque_curve_caps_move_accel():
     print("  torque curve caps kinematic move accel at a_max(v_top) OK")
 
 
+def test_notch_planner_applies_curve_per_ramp():
+    # With the notch planner on, the curve is NOT a per-move cap: move.accel
+    # keeps max_accel and the curve rides in the constraints, where each ramp
+    # gets its own accel.
+    tc = _curve([0.0, 400.0], [20000.0, 4000.0])
+    th = _move_toolhead([tc])
+    th.unified_emit = True
+    th.max_accel = 20000.0
+    th.move([100.0, 0.0, 0.0, 0.0], 300.0)
+    m = th.lookahead.moves[-1]
+    assert m.accel == 20000.0, m.accel
+    cons = th._pathplan_cons(m)
+    assert cons.curve is tc.planner_curve()
+    # A short, slow ramp gets far more than a(300) = 8000.
+    assert cons.ramp_accel(0.0, 100.0) > 8000.0 * 1.5
+    # Disabling the curve drops it from the constraints entirely.
+    tc.enabled = False
+    assert th._pathplan_cons(m).curve is None
+    print("  notch planner applies the curve per ramp, not per move OK")
+
+
 def test_calibration_sweep_suspends_caps_and_notch():
     calib = _load_extra("torque_curve_calibrate")
     tc = _curve([0.0, 400.0], [20000.0, 4000.0])
@@ -608,6 +641,7 @@ def main():
     test_reset_velocity_limit_resyncs_derived_span_angle()
     test_infeasible_batch_fails_before_emission()
     test_torque_curve_caps_move_accel()
+    test_notch_planner_applies_curve_per_ramp()
     test_calibration_sweep_suspends_caps_and_notch()
     print("ALL PASS")
 

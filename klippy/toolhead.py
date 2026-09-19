@@ -1128,13 +1128,13 @@ class ToolHead:
             return
         if move.is_kinematic_move:
             self.kin.check_move(move)
-            # Torque-speed curve: cap the move's accel at a_max(v) for its top
-            # speed. The curve falls with speed, so that is the minimum over
-            # the move's range -- conservative, and it feeds move.accel, which
-            # every downstream consumer (lookahead reach, notch ramp law,
-            # sharp emitter) already honors.
-            for tc in self.torque_curves:
-                tc.limit_move(move)
+            # Torque-speed curve. The notch planner applies it per RAMP (see
+            # _pathplan_cons); anything else gets one cap for the whole move
+            # at a_max of its top speed -- the curve falls with speed, so that
+            # is the minimum over the move's range.
+            if not self._uses_unified_reach(move):
+                for tc in self.torque_curves:
+                    tc.limit_move(move)
         for e_index, ea in enumerate(self.extra_axes):
             if move.axes_d[e_index + 3]:
                 ea.check_move(move, e_index + 3)
@@ -1538,6 +1538,7 @@ class ToolHead:
             v_ceil = math.sqrt(move.max_cruise_v2) + 1.0
         want_null = getattr(self, "unified_spectral_null", False)
         cons = pathplan.Constraints(
+            curve=self._planner_curve(),
             a_const=move.accel if a_const is None else a_const,
             v_ceil=v_ceil,
             jerk_dt=self.unified_jerk_dt,
@@ -1556,6 +1557,15 @@ class ToolHead:
             # Say so rather than quietly emitting an uncorrected run.
             cons.spectral_loss = "spectral_null_span_turned"
         return cons
+
+    def _planner_curve(self):
+        # The torque curve the notch planner shapes ramps with, or None. One
+        # curve drives the path: the first enabled, loaded [torque_curve].
+        for tc in getattr(self, "torque_curves", ()):
+            curve = tc.planner_curve()
+            if curve is not None:
+                return curve
+        return None
 
     def _z_couples_xy(self):
         # Does a Z-only cartesian move drive the same actuators as X or Y?
@@ -1639,7 +1649,7 @@ class ToolHead:
         # more in the unified cruise clamp) and repeats next_end_v2, so a
         # one-entry cache removes most of the calls. cons.v_ceil is part of the
         # key because it changes once set_junction() has run on this move.
-        key = (start_v2, cons.v_ceil, dist)
+        key = (start_v2, cons.v_ceil, dist, cons.curve)
         cached = getattr(move, "_unified_reach_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -1654,6 +1664,8 @@ class ToolHead:
             self.max_velocity,
             notch_freq=cons.notch_freq,
             notch_freq2=cons.notch_freq2,
+            curve=cons.curve,
+            jerk_dt=cons.jerk_dt,
         )
         move._unified_reach_cache = (key, res)
         return res

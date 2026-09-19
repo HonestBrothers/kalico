@@ -39,11 +39,21 @@
 # are. This is inherent to per-move notched ramps, not a tuning problem. See
 # docs/Jerk_Limiting.md "Throughput" for the measured table.
 #
-# Pure (only `math`) and toolhead-decoupled so it is unit-testable in isolation;
-# the toolhead adapter supplies per-move constraints.
+# TORQUE CURVE (TOPP-RA). A stepper's usable acceleration falls with speed,
+# so one max_accel is either too timid at low speed or skips steps at high
+# speed. Given a measured a(v), each ramp gets its OWN constant plateau accel:
+# the largest A for which the whole notched ramp stays under the curve (see
+# AccelCurve.ramp_accel). The ramp is still exactly the notched trapezoid
+# above -- only its A differs -- so the zeros, the planning distances and the
+# spectral-null solve are untouched, and a slow ramp is no longer held to the
+# accel a fast one can afford.
+#
+# Pure (only `math` and `bisect`) and toolhead-decoupled so it is unit-testable
+# in isolation; the toolhead adapter supplies per-move constraints.
 #
 # Copyright (C) 2026
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import bisect
 import math
 
 # Slice budget one ramp is allowed to ask for at CONFIG time. Settings that
@@ -92,6 +102,136 @@ class InfeasibleProfile(Exception):
     pass
 
 
+class AccelCurve:
+    """Velocity-dependent acceleration limit a(v) (a torque-speed curve).
+
+    Built from (speed, accel) knots, linearly interpolated and held constant
+    outside them. Everything the planner reads goes through envelope(), which
+    only ever LOWERS the curve:
+
+    - running minimum, so a(v) never rises with speed. A notched ramp spends
+      its peak accel at the TOP of its plateau; with a non-increasing curve
+      that is the one point to check, and every lower speed is covered.
+    - fall-rate limit |da/dv| <= f_lo (s^-1). The ramp's falling edge drops at
+      exactly f_edge >= f_lo where it leaves the plateau and steeper after, so
+      a curve that falls no faster than f_lo cannot cut under that edge.
+
+    Interpolating the envelope's knot values is conservative too: the exact
+    envelope is concave between knots and the chord lies under it.
+    """
+
+    def __init__(self, speeds, accels):
+        if len(speeds) != len(accels) or len(speeds) < 1:
+            raise ValueError("AccelCurve needs matching speed/accel knots")
+        pairs = sorted(zip(speeds, accels))
+        self.speeds = [float(v) for v, _a in pairs]
+        mono = []
+        for _v, a in pairs:
+            a = float(a)
+            if a <= 0.0:
+                raise ValueError("AccelCurve accels must be positive")
+            mono.append(min(a, mono[-1]) if mono else a)
+        self.accels = mono
+        self._envs = {}
+
+    def envelope(self, max_fall):
+        """Knot accels with the fall rate limited to max_fall (s^-1)."""
+        key = float(max_fall)
+        env = self._envs.get(key)
+        if env is not None:
+            return env
+        sp, ac = self.speeds, self.accels
+        n = len(sp)
+        # e_i = min over j >= i of a_j + max_fall*(v_j - v_i): lower each knot
+        # until nothing above it is more than max_fall per mm/s away.
+        out = list(ac)
+        for i in range(n - 2, -1, -1):
+            out[i] = min(out[i], out[i + 1] + key * (sp[i + 1] - sp[i]))
+        env = self._envs[key] = out
+        return env
+
+    def at(self, v, max_fall):
+        """Envelope accel at speed v."""
+        sp = self.speeds
+        env = self.envelope(max_fall)
+        j = bisect.bisect_right(sp, v) - 1
+        if j < 0:
+            return env[0]
+        if j >= len(sp) - 1:
+            return env[-1]
+        t = (v - sp[j]) / (sp[j + 1] - sp[j])
+        return env[j] + t * (env[j + 1] - env[j])
+
+    def plateau_accel(self, v1, k, a_hi, max_fall):
+        """Largest A <= a_hi with A <= envelope(v1 - k*A).
+
+        v1 - k*A is where a ramp ending at v1 leaves its plateau (k is half
+        the falling edge's duration). g(A) = A - envelope(v1 - k*A) is
+        strictly increasing because k*max_fall <= 1/2, so the answer is its
+        root, found in closed form on whichever linear piece holds it --
+        walking down from v1 visits one or two pieces in practice, cheap
+        enough for the lookahead's reach bisection.
+        """
+        if a_hi <= self.at(v1 - k * a_hi, max_fall):
+            return a_hi
+        sp = self.speeds
+        env = self.envelope(max_fall)
+        n = len(sp)
+        j = bisect.bisect_right(sp, v1) - 1
+        while True:
+            if j >= n - 1:
+                # Above the last knot the curve is flat.
+                base_v, base_a, q = sp[-1], env[-1], 0.0
+                lo_v = sp[-1]
+            elif j < 0:
+                base_v, base_a, q = sp[0], env[0], 0.0
+                lo_v = -math.inf
+            else:
+                base_v, base_a = sp[j], env[j]
+                q = (env[j + 1] - env[j]) / (sp[j + 1] - sp[j])
+                lo_v = sp[j]
+            # A = base_a + q*(v1 - k*A - base_v)
+            a = (base_a + q * (v1 - base_v)) / (1.0 + q * k)
+            if v1 - k * a >= lo_v - 1e-9 or j < 0:
+                return max(min(a, a_hi), 0.0)
+            j -= 1
+
+    def ramp_accel(self, v0, v1, a_const, f_lo, f_hi, jerk_dt):
+        """Constant plateau accel for one notched ramp v0 -> v1 (v1 > v0).
+
+        The ramp's accel never exceeds its peak P, and it holds P up to
+        v_top = v1 - P/(2*f_edge) before the falling edge. With the envelope
+        non-increasing and falling no faster than that edge, P <= a(v_top)
+        keeps the WHOLE ramp under the curve. Using f_hi for the edge puts
+        v_top at its highest possible point, so the check also covers a
+        saturated ramp that spends its one zero on f_lo (sat_rise_freq).
+
+        The emitter holds each slice's accel for a whole jerk_dt, so the last
+        plateau slice carries A up to A*jerk_dt of speed past v_top, and the
+        spectral-null solve shifts the ramp's speeds by up to ~0.6 of that
+        again (measured worst case over thousands of random ramps). The check
+        is therefore made TWO slices above v_top. The margin also covers the
+        falling edge: it lies under its tangent at v_top, which falls at
+        f_edge >= the envelope's fall rate.
+
+        Unsaturated first: the notch law's own peak dv*f_lo, if the curve
+        allows it -- then the returned accel is the curve's value (>= that
+        peak), so the ramp shape is exactly what it was without a curve and
+        the spectral solve may use the headroom. Otherwise the plateau is
+        lowered to the curve and the ramp saturates.
+        """
+        dv = v1 - v0
+        if dv <= 1e-12 or not f_lo:
+            return a_const
+        k = max(0.5 / f_hi - 2.0 * jerk_dt, 0.0)
+        peak = dv * f_lo
+        if peak <= a_const:
+            cap = self.at(v1 - k * peak, f_lo)
+            if peak <= cap:
+                return min(a_const, cap)
+        return self.plateau_accel(v1, k, min(a_const, peak), f_lo)
+
+
 class Constraints:
     """Per-move motion limits for the jerk-limited emitter and lookahead.
 
@@ -108,6 +248,8 @@ class Constraints:
                -> SECOND mode frequency (Hz) to null in the same ramp. None/0,
                   or equal to notch_freq, gives the single-zero triangle. See
                   ramp_jerk() for the two-zero law.
+    curve      -> optional AccelCurve (torque-speed limit). Each ramp then
+                  gets its own plateau accel <= a_const; see ramp_accel().
     """
 
     def __init__(
@@ -118,8 +260,12 @@ class Constraints:
         notch_freq=None,
         notch_freq2=None,
         spectral_null=False,
+        curve=None,
     ):
         self.a_const = a_const
+        # AccelCurve or None. When set, each ramp's plateau accel comes from
+        # ramp_accel() instead of a_const.
+        self.curve = curve
         self.v_ceil = v_ceil
         self.jerk_dt = jerk_dt
         self.notch_freq = notch_freq
@@ -149,8 +295,14 @@ class Constraints:
             self.notch_period = 1.0 / self.notch_lo + 1.0 / self.notch_hi
             self.notch_f_eq = 2.0 / self.notch_period
 
-    def a_max(self, v):
-        return self.a_const
+    def ramp_accel(self, v0, v1):
+        """Plateau accel for the ramp between speeds v0 and v1 (any order)."""
+        if self.curve is None or not self.notch_freq:
+            return self.a_const
+        lo, hi = (v0, v1) if v0 <= v1 else (v1, v0)
+        return self.curve.ramp_accel(
+            lo, hi, self.a_const, self.notch_lo, self.notch_hi, self.jerk_dt
+        )
 
     def ramp_accel_cap(self, dv):
         """Peak |accel| (mm/s^2) the two-zero law allows for ONE ramp of |dv|.
@@ -171,7 +323,7 @@ class Constraints:
             return None
         return dv * self.notch_lo
 
-    def ramp_jerk(self, dv):
+    def ramp_jerk(self, dv, accel=None):
         """Jerk (mm/s^3) for ONE ramp of size |dv| (mm/s).
 
         With no notch frequency configured there is no shaped ramp.
@@ -237,7 +389,7 @@ class Constraints:
         dv = abs(dv)
         if not self.notch_freq or dv <= 1e-12:
             return None
-        a = self.a_const
+        a = self.a_const if accel is None else accel
         f_lo, f_hi = self.notch_lo, self.notch_hi
         if a and a > 0.0 and dv > a / f_lo:
             j = a * sat_rise_freq(dv, a, f_lo, f_hi)
@@ -302,7 +454,9 @@ def _sat_rise(dv, accel, f_lo, f_hi):
 SECOND_NOTCH_EPS = 0.01
 
 
-def notch_dist(v0, v1, accel, notch_freq, notch_freq2=None):
+def notch_dist(
+    v0, v1, accel, notch_freq, notch_freq2=None, curve=None, jerk_dt=None
+):
     # Path distance to change speed v0 -> v1 under a symmetric jerk-limited
     # notch profile (accel ramps 0 -> peak -> 0, so a(t) is continuous in the
     # ideal law). Closed form: distance = mean speed * duration, exact because
@@ -321,6 +475,14 @@ def notch_dist(v0, v1, accel, notch_freq, notch_freq2=None):
     # widens to dv/A and the rise edge keeps one configured zero.
     f_lo = min(notch_freq, notch_freq2 or notch_freq)
     f_hi = max(notch_freq, notch_freq2 or notch_freq)
+    if curve is not None:
+        # Same per-ramp accel the emitter will use (Constraints.ramp_accel),
+        # which depends on the emitter's slice length.
+        if jerk_dt is None:
+            raise ValueError("notch_dist with a curve requires jerk_dt")
+        accel = curve.ramp_accel(
+            min(v0, v1), max(v0, v1), accel, f_lo, f_hi, jerk_dt
+        )
     saturated = accel > 0.0 and dv > accel / f_lo
     if saturated:
         f_rise = sat_rise_freq(dv, accel, f_lo, f_hi)
@@ -337,6 +499,8 @@ def notch_reach_v2(
     v_ceil,
     notch_freq,
     notch_freq2=None,
+    curve=None,
+    jerk_dt=None,
 ):
     # Max u = v^2 reachable from v0=sqrt(u0) over path-distance `dist` under a
     # notch profile. Direction-symmetric (forward accel == backward decel).
@@ -345,7 +509,9 @@ def notch_reach_v2(
     #
     # Bisection stays valid under the notch law: distance is (v0+v1)/f while
     # a_peak is unsaturated and 0.5*(v0+v1)*(dv/A + 1/f) past that; both are
-    # monotonically increasing in v1.
+    # monotonically increasing in v1. With a curve, A = ramp_accel(v0, v1)
+    # only falls as v1 rises, which lengthens the ramp further -- still
+    # monotonic.
     if dist <= 0.0:
         return u0
     if accel <= 0.0:
@@ -367,7 +533,7 @@ def notch_reach_v2(
         return u0
 
     def _fits(v1):
-        return notch_dist(v0, v1, accel, f_lo, f_hi) <= dist
+        return notch_dist(v0, v1, accel, f_lo, f_hi, curve, jerk_dt) <= dist
 
     hi = max(v0, v_ceil)
     if _fits(hi):
@@ -413,7 +579,10 @@ def _ramp_up_jerk(v0, v1, cons, collect=True, limit=RAMP_SLICE_BACKSTOP):
     #
     # Per-ramp jerk is derived from the configured notch frequencies. See
     # Constraints.ramp_jerk.
-    J = cons.ramp_jerk(v1 - v0)
+    # One constant plateau accel for the whole ramp -- a_const, or the torque
+    # curve's value for this ramp (Constraints.ramp_accel).
+    a_ramp = cons.ramp_accel(v0, v1)
+    J = cons.ramp_jerk(v1 - v0, a_ramp)
     dt0 = cons.jerk_dt
     # Two-zero mode caps the plateau at dv*f_lo, which is what turns the
     # triangle into the trapezoid that nulls both modes. None in single-zero
@@ -436,9 +605,7 @@ def _ramp_up_jerk(v0, v1, cons, collect=True, limit=RAMP_SLICE_BACKSTOP):
             # Did not converge to v1 -> signal infeasible, never emit.
             return None, float("inf")
         rem = v1 - v
-        a_curve = cons.a_max(v)
-        if a_curve is None or a_curve <= 0.0:
-            a_curve = cons.a_const if cons.a_const else 1e30
+        a_curve = a_ramp if a_ramp and a_ramp > 0.0 else 1e30
         if a_notch is not None and a_notch < a_curve:
             a_curve = a_notch
         a_brake = math.sqrt(2.0 * J * rem)
@@ -740,7 +907,11 @@ def _apply_spectral_null(ramp, cons):
         freqs = [cons.notch_lo]
     else:
         freqs = [cons.notch_lo, cons.notch_hi]
-    solved = solve_ramp_null(ramp, freqs, cons.a_const)
+    # Cap the correction at the accel this ramp was built with -- with a torque
+    # curve that is the ramp's own plateau, not the machine's max_accel.
+    solved = solve_ramp_null(
+        ramp, freqs, cons.ramp_accel(ramp[0][3], ramp[-1][4])
+    )
     if solved is None:
         # Rank deficient, too few free slices, or nothing the ramp could carry.
         cons.spectral_loss = "spectral_null_failed"
@@ -1040,14 +1211,12 @@ def notch_loss_reasons(vs, vc, ve, cons):
         return []
     reasons = set()
     two_zero = cons.notch_hi > cons.notch_lo
-    for dv in (abs(vc - vs), abs(vc - ve)):
+    for v_end in (vs, ve):
+        dv = abs(vc - v_end)
         if dv <= 1e-12:
             continue
-        saturated = (
-            cons.a_const
-            and cons.a_const > 0.0
-            and dv > cons.a_const / cons.notch_lo
-        )
+        a_ramp = cons.ramp_accel(v_end, vc)
+        saturated = a_ramp and a_ramp > 0.0 and dv > a_ramp / cons.notch_lo
         if two_zero and saturated:
             # a_peak would have to be dv*f_lo to keep the plateau exactly
             # 1/f_lo wide; max_accel is lower, so the plateau widens to dv/A
@@ -1056,9 +1225,7 @@ def notch_loss_reasons(vs, vc, ve, cons):
             # zero sometimes covers the other mode anyway. Fixable by raising
             # max_accel, or by spanning the ramp across more moves so each dv
             # is smaller.
-            _f, worst = _sat_rise(
-                dv, cons.a_const, cons.notch_lo, cons.notch_hi
-            )
+            _f, worst = _sat_rise(dv, a_ramp, cons.notch_lo, cons.notch_hi)
             if worst > SECOND_NOTCH_EPS and not (
                 cons.spectral_null and cons.spectral_loss is None
             ):
