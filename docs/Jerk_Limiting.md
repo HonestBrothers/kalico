@@ -232,6 +232,14 @@ than whatever chord tolerance the slicer happened to use. At `resolution: 1.0`
 the same curve ceilings at 55 mm/s instead; coarser values raise it
 proportionally.
 
+Coarse `resolution` is only safe because `max_deviation` (default 0.05 mm)
+still splits any arc whose chords would stray further than that from the
+curve. Without it, length-only segmenting turns every arc shorter than
+`2 * resolution` into one straight chord from its start to its end: at
+`resolution: 3.0` a 5.6 mm, 340° loop collapsed to a 0.33 mm chord carrying
+the whole loop's plastic and aborted the print with "Move exceeds maximum
+extrusion". Gentle arcs, the ones worth a long chord, are untouched.
+
 This is a different lever from spanning, and it does not help spanning — longer
 segments turn *more* per segment, not less. On a tight r=4 mm arc, 0.2 mm chords
 turn 2.87° per segment and 1 mm segments turn 14.4°, so neither spans at the 2°
