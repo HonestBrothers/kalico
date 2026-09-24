@@ -165,3 +165,91 @@ def test_home_axis_homes_both_for_xy():
     c.test_axis = "y"
     c._home_axis()
     assert sent == ["G28 X Y", "G28 Y"]
+
+
+# --- Notch kept on during the sweep ------------------------------------------
+
+def _load_pathplan():
+    spec = importlib.util.spec_from_file_location(
+        "_tcc_pathplan", os.path.join(KLIPPY, "extras", "pathplan.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def make_notch(f_x=56.0, f_y=48.0, dt=0.0005, keep=True):
+    c, _, _ = make("cartesian", "x")
+    c.keep_notch = keep
+    c.toolhead = types.SimpleNamespace(
+        flush_step_generation=lambda: None, unified_emit=True,
+        unified_notch_freq_x=f_x, unified_notch_freq_y=f_y,
+        unified_jerk_dt=dt)
+    return c
+
+
+def test_notch_params_follow_keep_notch():
+    assert make_notch()._notch_params() == (48.0, 56.0, 0.0005)
+    assert make_notch(keep=False)._notch_params() is None
+    c = make_notch()
+    c.toolhead.unified_emit = False
+    assert c._notch_params() is None
+
+
+def test_notch_ceiling_is_speed_times_f_lo():
+    c = make_notch()
+    assert c._notch_peak_ceiling(100.0) == pytest.approx(4800.0)
+    assert make_notch(keep=False)._notch_peak_ceiling(100.0) is None
+
+
+def test_stress_point_without_notch_is_identity():
+    c = make_notch(keep=False)
+    assert c._stress_point(300.0, 20000.0) == (300.0, 20000.0)
+
+
+def test_stress_point_caps_peak_and_moves_speed_down():
+    c = make_notch()
+    k = 0.5 / 56.0 - 2 * 0.0005
+    # Saturated: plateau at the commanded accel, left k*A below the target.
+    v, a = c._stress_point(400.0, 10000.0)
+    assert a == 10000.0 and v == pytest.approx(400.0 - k * 10000.0)
+    # Unsaturated: the ramp only reaches speed*f_lo.
+    v, a = c._stress_point(100.0, 20000.0)
+    assert a == pytest.approx(4800.0)
+    assert v == pytest.approx(100.0 - k * 4800.0)
+
+
+def test_notched_move_is_long_enough():
+    c = make_notch()
+    pp = _load_pathplan()
+    for v, a in ((100.0, 20000.0), (400.0, 10000.0), (500.0, 3000.0)):
+        need = 2 * pp.notch_dist(0.0, v, a, 48.0, 56.0)
+        assert c._calculate_required_distance(v, a) >= need
+    # Without the notch it is the plain triangle.
+    c.keep_notch = False
+    assert c._calculate_required_distance(400.0, 10000.0) == pytest.approx(
+        400.0 ** 2 / 10000.0)
+
+
+def test_recorded_points_admit_the_tested_ramps():
+    """The planner, given a curve built from the recorded stress points,
+    lets a 0 -> v ramp use the accel that passed at v."""
+    c = make_notch()
+    pp = _load_pathplan()
+    probes = [(200.0, 9000.0), (300.0, 8000.0), (400.0, 7000.0),
+              (500.0, 6000.0)]
+    pts = sorted(c._stress_point(v, a) for v, a in probes)
+    curve = pp.AccelCurve([p[0] for p in pts], [p[1] for p in pts])
+    for v, a in probes:
+        got = curve.ramp_accel(0.0, v, 1e9, 48.0, 56.0, 0.0005)
+        assert got == pytest.approx(min(a, v * 48.0), rel=1e-6)
+
+
+def test_sweep_keeps_notch_when_asked():
+    c = make_notch()
+    c.measure_vibration = False
+    c.vibration_shaper_off = False
+    msgs = []
+    gcmd = types.SimpleNamespace(respond_info=msgs.append)
+    saved = c._disable_reshapers(gcmd)
+    assert c.toolhead.unified_emit and "unified" not in saved
+    assert any("stays ON" in m for m in msgs)

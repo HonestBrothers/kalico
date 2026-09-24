@@ -358,6 +358,15 @@ class TorqueCurveCalibrate:
         # ON by default (real-world, shaped vibration); set
         # vibration_shaper_off True to disable shaping and capture raw modes.
         self.measure_vibration = config.getboolean("measure_vibration", False)
+        # Keep the unified notch planner running during the skip test, so the
+        # axis is damped the way it is when printing and the measured limit
+        # is the motor's, not the resonance's. With it on, moves are sized for
+        # notched ramps and each result is recorded at the stress point the
+        # planner looks the curve up at -- see _stress_point(). NOTCH=0|1
+        # overrides per run; PASS=modeid always turns it off (it needs the
+        # axis ringing freely).
+        self._cfg_keep_notch = config.getboolean("keep_notch", True)
+        self.keep_notch = self._cfg_keep_notch
         self.accel_chip_name = config.get("accel_chip", None)
         self.vibration_shaper_off = config.getboolean(
             "vibration_shaper_off", False
@@ -740,13 +749,22 @@ class TorqueCurveCalibrate:
                 c.enabled = False
             gcmd.respond_info("Disabled torque-curve accel caps for calibration")
         # The unified notch planner replaces the raw trapezoid with jerk-limited
-        # (and optionally spectrally nulled) ramps, so turn the emitter off for
-        # the sweep -- it falls back to stock constant-accel trapezoids.
-        # Restored from the snapshot after.
-        if getattr(self.toolhead, "unified_emit", False):
+        # (and optionally spectrally nulled) ramps. Unless keep_notch is set,
+        # turn the emitter off for the sweep -- it falls back to stock
+        # constant-accel trapezoids. Restored from the snapshot after.
+        if (getattr(self.toolhead, "unified_emit", False)
+                and not getattr(self, "keep_notch", False)):
             saved["unified"] = self.toolhead._unified_state()
             self.toolhead.unified_emit = False
             gcmd.respond_info("Unified notch planner off for calibration")
+        elif getattr(self.toolhead, "unified_emit", False):
+            notch = self._notch_params()
+            if notch is not None:
+                gcmd.respond_info(
+                    "Notch planner stays ON (%.1f/%.1f Hz): moves are sized "
+                    "for notched ramps, accel is capped at speed x %.1f Hz, "
+                    "and results are recorded at each ramp's peak-accel speed"
+                    % (notch[0], notch[1], notch[0]))
         # The model-inverse FF rewrites the trapezoid too: it adds p1*v + p2*a to
         # the commanded position. It MUST be suspended for the sweep -- always,
         # not just for raw-vibration capture -- for the SAME reason jerk limiting
@@ -826,12 +844,69 @@ class TorqueCurveCalibrate:
 
         return start_pos, end_pos
 
+    def _notch_params(self):
+        """(f_lo, f_hi, jerk_dt) of the notch planner the sweep runs under,
+        or None when the sweep uses plain constant-accel moves."""
+        th = self.toolhead
+        if not getattr(self, "keep_notch", False) or not getattr(
+                th, "unified_emit", False):
+            return None
+        freqs = [f for f in (getattr(th, "unified_notch_freq_x", 0.0),
+                             getattr(th, "unified_notch_freq_y", 0.0)) if f]
+        if not freqs:
+            return None
+        return min(freqs), max(freqs), th.unified_jerk_dt
+
+    def _notch_peak_ceiling(self, speed):
+        """Highest accel a 0 -> speed notched ramp can reach, or None.
+
+        An unsaturated notched ramp peaks at dv*f_lo whatever the accel limit
+        is, so from rest nothing above speed*f_lo is ever commanded. Probing
+        above it would repeat the same motion under a bigger label.
+        """
+        notch = self._notch_params()
+        if notch is None:
+            return None
+        return speed * notch[0]
+
+    def _stress_point(self, speed, accel):
+        """(speed, accel) the torque curve must allow for this probe to pass.
+
+        Without the notch the test triangle holds `accel` right up to `speed`.
+        A notched ramp peaks at P = min(accel, speed*f_lo) and leaves that peak
+        at speed - k*P, before its falling edge -- and that is exactly where
+        pathplan.AccelCurve.ramp_accel looks the curve up for a ramp ending at
+        `speed` (same k, including the two-slice margin). Recording the probe
+        there makes the calibrated curve admit precisely the ramps that were
+        tested.
+        """
+        notch = self._notch_params()
+        if notch is None:
+            return speed, accel
+        f_lo, f_hi, jerk_dt = notch
+        k = max(0.5 / f_hi - 2.0 * jerk_dt, 0.0)
+        peak = min(accel, speed * f_lo)
+        return speed - k * peak, peak
+
     def _calculate_required_distance(self, speed, accel):
         """
         Calculate minimum distance required to reach target speed.
         Using: v^2 = 2*a*d  ->  d = v^2 / (2*a)
         Need 2x this for accel + decel.
         """
+        notch = self._notch_params()
+        if notch is not None:
+            # Notched ramp 0 -> speed: distance = mean speed * duration, with
+            # duration 1/f_lo + 1/f_hi unsaturated, or speed/accel + one edge
+            # past saturation (taken as the longer 1/f_lo edge, so the move is
+            # never short). Mirrors pathplan.notch_dist. Plus 2% for the
+            # emitter's slice rounding, so the planner reaches `speed`.
+            f_lo, f_hi, _ = notch
+            if speed * f_lo <= accel:
+                t = 1.0 / f_lo + 1.0 / f_hi
+            else:
+                t = speed / accel + 1.0 / f_lo
+            return 1.02 * speed * t  # 2 ramps x 0.5*speed*t
         accel_dist = (speed ** 2) / (2 * accel)
         return accel_dist * 2  # Need to accelerate and decelerate
 
@@ -856,7 +931,7 @@ class TorqueCurveCalibrate:
         Lost-step detection is done by the caller via _home_and_measure /
         _check_for_lost_steps, so nothing is returned."""
         # Triangle (v^2/a) plus a minimum cruise hold of dwell_time at peak.
-        tri_dist = self._calculate_required_distance(speed, accel)  # v^2/a
+        tri_dist = self._calculate_required_distance(speed, accel)
         half = (tri_dist + speed * dwell_time) / 2.0
         half = max(self.min_move_distance / 2.0, min(half, max_half))
         start_pos = center - half
@@ -2034,6 +2109,13 @@ class TorqueCurveCalibrate:
                 # v*dwell). Below this the move can't reach the target speed, so
                 # start the search here.
                 usable_distance = max_distance - test_speed * dwell_time
+                notch = self._notch_params()
+                if notch is not None:
+                    # Notched ramps add a 1/f_lo edge each (conservative, see
+                    # _calculate_required_distance): v/f_lo over the pair.
+                    usable_distance = (max_distance / 1.02
+                                       - test_speed * dwell_time
+                                       - test_speed / notch[0])
                 if usable_distance <= 0.0:
                     gcmd.respond_info(
                         "  Speed %.0f mm/s: peak dwell alone exceeds travel, "
@@ -2054,6 +2136,15 @@ class TorqueCurveCalibrate:
                 if a_degen is not None and a_degen < accel_ceiling:
                     accel_ceiling = a_degen
                     ceiling_is_degen = True
+                # Under the notch the degeneracy above cannot happen (a notched
+                # ramp lasts at least 1/f_lo + 1/f_hi); what bounds the search
+                # instead is the ramp's own peak, speed*f_lo.
+                a_notch = self._notch_peak_ceiling(test_speed)
+                ceiling_is_notch = False
+                if a_notch is not None:
+                    accel_ceiling = min(self.accel_max, a_notch)
+                    ceiling_is_degen = False
+                    ceiling_is_notch = a_notch < self.accel_max
 
                 # Pass 1 has no reason to go above print accel: the mode is
                 # amplitude-dependent, so driving harder than the machine ever
@@ -2079,7 +2170,14 @@ class TorqueCurveCalibrate:
                         ceiling_is_degen = False
 
                 if start_accel > accel_ceiling:
-                    if ceiling_is_degen:
+                    if ceiling_is_notch:
+                        gcmd.respond_info(
+                            "  Speed %.0f mm/s: the move needs accel %.0f to "
+                            "fit the travel, above the notch's peak %.0f "
+                            "(speed x f_lo); skipping"
+                            % (test_speed, start_accel, accel_ceiling)
+                        )
+                    elif ceiling_is_degen:
                         gcmd.respond_info(
                             "  Speed %.0f mm/s: not measurable -- even the "
                             "starting accel %.0f gives a ramp under %.1f "
@@ -2275,7 +2373,18 @@ class TorqueCurveCalibrate:
                                     break
                                 test_accel = accel_ceiling
                                 continue
-                            if ceiling_is_degen:
+                            if ceiling_is_notch:
+                                # Not a torque limit either: this is the most
+                                # a notched ramp from rest ever asks for at
+                                # this speed, and it held.
+                                gcmd.respond_info(
+                                    "  No skip up to the notch's peak accel "
+                                    "%.0f (%.0f mm/s x %.1f Hz) -- the planner "
+                                    "never asks for more at this speed"
+                                    % (accel_ceiling, test_speed,
+                                       accel_ceiling / test_speed)
+                                )
+                            elif ceiling_is_degen:
                                 # Not a torque limit -- we ran out of ramp. The
                                 # motor never saw the accel, so it could never
                                 # skip. Say so rather than reporting a number
@@ -2316,10 +2425,20 @@ class TorqueCurveCalibrate:
                 self._write_progress_row(
                     test_speed, last_good_accel, skip_accel)
                 self._save_psd_checkpoint()
-                gcmd.respond_info(
-                    "  Result: %.0f mm/s -> max accel %.0f mm/s^2"
-                    % (test_speed, last_good_accel)
-                )
+                sp_v, sp_a = self._stress_point(test_speed, last_good_accel)
+                if (sp_v, sp_a) == (test_speed, last_good_accel):
+                    gcmd.respond_info(
+                        "  Result: %.0f mm/s -> max accel %.0f mm/s^2"
+                        % (test_speed, last_good_accel)
+                    )
+                else:
+                    gcmd.respond_info(
+                        "  Result: %.0f mm/s -> max accel %.0f mm/s^2; "
+                        "notched ramp peaks at %.0f mm/s^2 leaving %.0f mm/s "
+                        "-> curve point (%.0f, %.0f)"
+                        % (test_speed, last_good_accel, sp_a, sp_v,
+                           sp_v, sp_a)
+                    )
 
                 # Pass 1 is done the moment the mode is identified -- the
                 # remaining speeds would only re-measure a frequency we already
@@ -2359,8 +2478,12 @@ class TorqueCurveCalibrate:
             key=lambda r: r[0])
 
         if len(valid_results) >= 2:
-            # Save results
-            self._save_results(gcmd, valid_results)
+            # Save results. The curve file gets each probe's stress point
+            # (identity without the notch); the motion-mode report below keeps
+            # the raw per-test-speed table it keys _skip_accel by.
+            self._save_results(gcmd, sorted(
+                (self._stress_point(v, a) for v, a in valid_results),
+                key=lambda r: r[0]))
             self._emit_motion_modes(gcmd, valid_results)
         else:
             gcmd.respond_info(
@@ -2879,7 +3002,10 @@ class TorqueCurveCalibrate:
         # to the first run's theoretical max, and Pass 1's cap would leak into
         # the torque/ff passes that follow it in CALIBRATE_Y_ALL.
         self.speed_end = self._cfg_speed_end
+        self.keep_notch = self._cfg_keep_notch
         if pass_name == "modeid":
+            # Mode ID wants the axis ringing freely: no notch.
+            self.keep_notch = False
             self.measure_vibration = True
             self.vibration_shaper_off = True
             self.apply_shaper = True
@@ -2918,6 +3044,8 @@ class TorqueCurveCalibrate:
                 "and set the model-inverse FF (FREQ_Y + DAMPING_RATIO_Y).")
 
         # Allow parameter overrides
+        self.keep_notch = bool(gcmd.get_int(
+            "NOTCH", 1 if self.keep_notch else 0, minval=0, maxval=1))
         self.speed_start = gcmd.get_float(
             "SPEED_START", self.speed_start, above=0.0
         )
