@@ -167,10 +167,13 @@ class TorqueCurveCalibrate:
         self.printer = config.get_printer()
         self.name = config.get_name().split()[-1]
 
-        # Test configuration
-        self.test_axis = config.get("axis", "x").lower()
-        if self.test_axis not in ("x", "y"):
-            raise config.error("axis must be 'x' or 'y'")
+        # Test configuration. 'xy' drives both axes at once along the 45-degree
+        # diagonal: on CoreXY that is the direction that loads one motor alone
+        # (at sqrt(2) times the path speed), on cartesian it loads both motors
+        # together. The AXIS= command parameter overrides this per run.
+        self.test_axis = self._parse_axis(
+            config.get("axis", "x"), config.error)
+        self._cfg_test_axis = self.test_axis
 
         # Speed range to test (mm/s). speed_end is optional: when omitted, the
         # sweep runs up to the theoretical back-EMF top speed (see below); when
@@ -305,14 +308,18 @@ class TorqueCurveCalibrate:
         self.position_tolerance = config.getfloat(
             "position_tolerance", None, above=0.0
         )
-        # Microsteps of the test-axis stepper, read from its own config section
-        # so we can convert the raw MCU step count (microsteps) into full steps.
-        self._axis_microsteps = None
-        try:
-            sec = config.getsection("stepper_" + self.test_axis)
-            self._axis_microsteps = sec.getint("microsteps", None, minval=1)
-        except Exception:
-            self._axis_microsteps = None
+        # Microsteps of each XY stepper, read from its own config section so we
+        # can convert the raw MCU step count (microsteps) into full steps. Kept
+        # per stepper name because AXIS= can pick either axis (or both) at run
+        # time, and on CoreXY both motors take part in a single-axis move.
+        self._stepper_microsteps = {}
+        for sname in ("stepper_x", "stepper_y"):
+            try:
+                if config.has_section(sname):
+                    self._stepper_microsteps[sname] = config.getsection(
+                        sname).getint("microsteps", None, minval=1)
+            except Exception:
+                pass
 
         # Settle dwell held AFTER the stress burst, BEFORE the verification
         # re-home. The FF is suspended for the sweep (raw trapezoids), so the
@@ -493,15 +500,17 @@ class TorqueCurveCalibrate:
             "klippy:connect", self._handle_connect
         )
 
-        # Register gcode commands
+        # Register gcode commands. A bare [torque_curve_calibrate] section is
+        # the default instance, so it answers when NAME= is omitted.
+        mux_name = self.name if len(config.get_name().split()) > 1 else None
         gcode = self.printer.lookup_object("gcode")
         gcode.register_mux_command(
-            "TORQUE_CURVE_CALIBRATE", "NAME", self.name,
+            "TORQUE_CURVE_CALIBRATE", "NAME", mux_name,
             self.cmd_TORQUE_CURVE_CALIBRATE,
             desc=self.cmd_TORQUE_CURVE_CALIBRATE_help,
         )
         gcode.register_mux_command(
-            "MEASURE_MODE_DAMPING", "NAME", self.name,
+            "MEASURE_MODE_DAMPING", "NAME", mux_name,
             self.cmd_MEASURE_MODE_DAMPING,
             desc=self.cmd_MEASURE_MODE_DAMPING_help,
         )
@@ -535,27 +544,105 @@ class TorqueCurveCalibrate:
                 return f or None
         return None
 
+    @staticmethod
+    def _parse_axis(value, error):
+        """Normalize an axis selector to 'x', 'y' or 'xy' (both at once)."""
+        ax = str(value).strip().lower()
+        if ax in ("yx", "both"):
+            ax = "xy"
+        if ax not in ("x", "y", "xy"):
+            raise error("axis must be X, Y or XY (got '%s')" % (value,))
+        return ax
+
+    def _axis_letters(self):
+        """The cartesian axes the test moves: ('x',), ('y',) or ('x', 'y')."""
+        return ("x", "y") if self.test_axis == "xy" else (self.test_axis,)
+
+    def _test_dir(self):
+        """Unit XY direction of the test move."""
+        if self.test_axis == "xy":
+            return (math.sqrt(0.5), math.sqrt(0.5))
+        return (1.0, 0.0) if self.test_axis == "x" else (0.0, 1.0)
+
     def _get_axis_index(self):
-        """Get axis index (0=X, 1=Y, 2=Z)."""
+        """Get axis index (0=X, 1=Y, 2=Z). Single-axis tests only; the
+        vibration paths that use it are refused for AXIS=XY."""
         return {"x": 0, "y": 1, "z": 2}[self.test_axis]
 
-    def _get_axis_limits(self):
-        """Get min/max positions for the test axis."""
-        axis_idx = self._get_axis_index()
-        rails = self.kin.rails
-        for rail in rails:
-            steppers = rail.get_steppers()
-            for stepper in steppers:
-                if stepper.is_active_axis(self.test_axis):
-                    pos_min, pos_max = rail.get_range()
-                    return pos_min, pos_max
+    def _rail_range(self, letter):
+        for rail in self.kin.rails:
+            for stepper in rail.get_steppers():
+                if stepper.is_active_axis(letter):
+                    return rail.get_range()
         raise self.printer.command_error(
-            "Could not find axis limits for %s" % self.test_axis
+            "Could not find axis limits for %s" % letter
         )
 
+    def _get_axis_limits(self):
+        """Get min/max of the test coordinate s.
+
+        Single axis: s is that axis's position, as before. XY: s is the
+        distance along the diagonal from the XY centre of travel, bounded so
+        both axes stay inside their ranges.
+        """
+        if self.test_axis != "xy":
+            return self._rail_range(self.test_axis)
+        (x0, x1), (y0, y1) = self._rail_range("x"), self._rail_range("y")
+        cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        dx, dy = self._test_dir()
+        self._xy_center = (cx, cy)
+        return (max((x0 - cx) / dx, (y0 - cy) / dy),
+                min((x1 - cx) / dx, (y1 - cy) / dy))
+
+    def _set_path_pos(self, pos, s):
+        """Set pos (toolhead coords, in place) to test coordinate s."""
+        if self.test_axis == "xy":
+            cx, cy = self._xy_center
+            dx, dy = self._test_dir()
+            pos[0] = cx + s * dx
+            pos[1] = cy + s * dy
+        else:
+            pos[self._get_axis_index()] = s
+        return pos
+
+    def _test_steppers(self):
+        """Every stepper driven by the test move, with motor mm per path mm.
+
+        Returns [(stepper, ratio)], ratio > 0. The ratio comes from the
+        kinematics, so CoreXY is handled without a special case: a pure X move
+        drives both A and B at ratio 1, the diagonal drives one motor at
+        sqrt(2) and leaves the other still (ratio 0 -> left out, as it cannot
+        skip).
+        """
+        dx, dy = self._test_dir()
+        out, seen = [], set()
+        for rail in self.kin.rails:
+            for stepper in rail.get_steppers():
+                name = stepper.get_name()
+                if name in seen:
+                    continue
+                if not any(stepper.is_active_axis(a)
+                           for a in self._axis_letters()):
+                    continue
+                seen.add(name)
+                ratio = abs(stepper.calc_position_from_coord([dx, dy, 0.0])
+                            - stepper.calc_position_from_coord([0.0, 0.0, 0.0]))
+                if ratio > 1e-9:
+                    out.append((stepper, ratio))
+        return out
+
+    def _primary_stepper(self):
+        """(stepper, ratio) of the most-loaded motor: the one whose limit the
+        path hits first. None if unresolved."""
+        steppers = self._test_steppers()
+        if not steppers:
+            return None
+        return max(steppers, key=lambda sr: sr[1])
+
     def _home_axis(self):
-        """Home the test axis."""
-        self.gcode.run_script_from_command("G28 %s" % self.test_axis.upper())
+        """Home the test axis (both X and Y for AXIS=XY)."""
+        self.gcode.run_script_from_command(
+            "G28 %s" % " ".join(a.upper() for a in self._axis_letters()))
 
     def _raise_z(self, gcmd):
         """Home Z if needed, then lift the gantry to safe_z.
@@ -718,15 +805,12 @@ class TorqueCurveCalibrate:
         return self.toolhead.get_position()[axis_idx]
 
     def _get_stepper_position(self):
-        """Get raw stepper position for precise lost step detection."""
-        axis_idx = self._get_axis_index()
+        """Raw MCU position of every motor the test drives, {name: steps},
+        for precise lost step detection. None if no stepper resolved."""
         self.toolhead.flush_step_generation()
-
-        for rail in self.kin.rails:
-            for stepper in rail.get_steppers():
-                if stepper.is_active_axis(self.test_axis):
-                    return stepper.get_mcu_position()
-        return None
+        pos = {st.get_name(): st.get_mcu_position()
+               for st, _ in self._test_steppers()}
+        return pos or None
 
     def _calculate_test_positions(self):
         """Calculate safe test positions that allow full acceleration."""
@@ -771,8 +855,6 @@ class TorqueCurveCalibrate:
 
         Lost-step detection is done by the caller via _home_and_measure /
         _check_for_lost_steps, so nothing is returned."""
-        axis_idx = self._get_axis_index()
-
         # Triangle (v^2/a) plus a minimum cruise hold of dwell_time at peak.
         tri_dist = self._calculate_required_distance(speed, accel)  # v^2/a
         half = (tri_dist + speed * dwell_time) / 2.0
@@ -784,8 +866,7 @@ class TorqueCurveCalibrate:
         self.gcode.run_script_from_command(
             "SET_VELOCITY_LIMIT ACCEL=1000 VELOCITY=100"
         )
-        pos = list(self.toolhead.get_position())
-        pos[axis_idx] = start_pos
+        pos = self._set_path_pos(list(self.toolhead.get_position()), start_pos)
         self.toolhead.move(pos, 100)
         self.toolhead.wait_moves()
 
@@ -806,10 +887,8 @@ class TorqueCurveCalibrate:
         if capture and self.accel_chip is not None:
             aclient = self.accel_chip.start_internal_client()
         for _ in range(self.test_cycles):
-            pos[axis_idx] = end_pos
-            self.toolhead.move(pos, speed)
-            pos[axis_idx] = start_pos
-            self.toolhead.move(pos, speed)
+            self.toolhead.move(self._set_path_pos(pos, end_pos), speed)
+            self.toolhead.move(self._set_path_pos(pos, start_pos), speed)
         self.toolhead.wait_moves()
         if aclient is None:
             return None
@@ -1592,23 +1671,30 @@ class TorqueCurveCalibrate:
             return None
 
     def _step_dist(self):
-        """Step distance (mm) of the test axis stepper."""
-        for rail in self.kin.rails:
-            for stepper in rail.get_steppers():
-                if stepper.is_active_axis(self.test_axis):
-                    return stepper.get_step_dist()
-        return None
+        """Path travel (mm along the test direction) per microstep of the
+        most-loaded motor -- the finest step any driven motor takes. For a
+        single cartesian axis this is just that stepper's step distance."""
+        dists = [st.get_step_dist() / ratio
+                 for st, ratio in self._test_steppers()]
+        return min(dists) if dists else None
 
-    def _full_step_dist(self):
-        """Belt travel (mm) per motor FULL step on the test axis.
+    def _full_step_dist(self, stepper=None):
+        """Belt travel (mm) per motor FULL step of `stepper` (default: the
+        most-loaded test motor).
 
         get_step_dist() is mm per *micro*step; a full step is that times the
         configured microsteps. Returns None if either is unknown.
         """
-        sd = self._step_dist()
-        if not sd or not self._axis_microsteps:
+        if stepper is None:
+            primary = self._primary_stepper()
+            if primary is None:
+                return None
+            stepper = primary[0]
+        usteps = self._stepper_microsteps.get(stepper.get_name())
+        sd = stepper.get_step_dist()
+        if not sd or not usteps:
             return None
-        return sd * self._axis_microsteps
+        return sd * usteps
 
     def _max_meaningful_accel(self, speed):
         """Highest accel whose ramp still spans >= min_ramp_steps microsteps.
@@ -1638,8 +1724,9 @@ class TorqueCurveCalibrate:
             return 0.0
         return (speed * speed) / (2.0 * accel) / sd
 
-    def _lost_step_tol_mm(self):
-        """Lost-step threshold in mm.
+    def _lost_step_tol_mm(self, stepper=None):
+        """Lost-step threshold in mm of belt travel for `stepper` (default:
+        the most-loaded test motor).
 
         Derived from position_tolerance_steps (full steps) x the full-step
         distance so the gate tracks the physics -- a real skip is a whole
@@ -1649,7 +1736,7 @@ class TorqueCurveCalibrate:
         """
         if self.position_tolerance is not None:
             return self.position_tolerance
-        fs = self._full_step_dist()
+        fs = self._full_step_dist(stepper)
         if fs:
             return self.position_tolerance_steps * fs
         return 0.4
@@ -1671,6 +1758,9 @@ class TorqueCurveCalibrate:
     def _check_for_lost_steps(self, ref_home_pos):
         """Re-home and report drift from the reference at-home position.
 
+        Every motor the test drives is checked against its own tolerance;
+        drift_mm is the worst one, in belt mm of that motor.
+
         Returns (lost_steps_detected, drift_mm). ref_home_pos must have been
         captured by a prior _home_and_measure() (i.e. at the endstop), NOT at
         an arbitrary position -- otherwise the difference is just the homing
@@ -1685,17 +1775,23 @@ class TorqueCurveCalibrate:
         after = self._home_and_measure()
         if ref_home_pos is None or after is None:
             return False, 0.0
-        step_dist = self._step_dist() or 0.0
-        diff_mm = abs(after - ref_home_pos) * step_dist
-        return diff_mm > self._lost_step_tol_mm(), diff_mm
+        lost, worst = False, 0.0
+        for st, _ in self._test_steppers():
+            name = st.get_name()
+            if name not in after or name not in ref_home_pos:
+                continue
+            diff_mm = abs(after[name] - ref_home_pos[name]) * st.get_step_dist()
+            worst = max(worst, diff_mm)
+            lost = lost or diff_mm > self._lost_step_tol_mm(st)
+        return lost, worst
 
     def _axis_rotation_distance(self):
-        """Belt travel per motor revolution (mm) for the test axis."""
-        for rail in self.kin.rails:
-            for stepper in rail.get_steppers():
-                if stepper.is_active_axis(self.test_axis):
-                    return stepper.get_rotation_distance()[0]
-        return None
+        """Path travel (mm along the test direction) per revolution of the
+        most-loaded motor, so the back-EMF top speed below comes out in path
+        mm/s. For a single cartesian axis this is the rotation_distance."""
+        dists = [st.get_rotation_distance()[0] / ratio
+                 for st, ratio in self._test_steppers()]
+        return min(dists) if dists else None
 
     def _back_emf_constant(self):
         """Motor back-EMF constant Ke (V/(rad/s)), or None if unknown.
@@ -2750,11 +2846,16 @@ class TorqueCurveCalibrate:
             gcmd.respond_info("Could not start plot: %s" % str(e))
 
     cmd_TORQUE_CURVE_CALIBRATE_help = (
-        "Run automated torque curve calibration"
+        "Run automated torque curve calibration (AXIS=X|Y|XY)"
     )
     def cmd_TORQUE_CURVE_CALIBRATE(self, gcmd):
         if self.calibration_running:
             raise gcmd.error("Calibration already in progress")
+
+        # AXIS=X|Y|XY picks the axis per run (default: the section's `axis`).
+        # XY tests both at once along the diagonal -- see __init__.
+        self.test_axis = self._parse_axis(
+            gcmd.get("AXIS", self._cfg_test_axis), gcmd.error)
 
         # PASS selector: preset the flag combo for one step of the three-pass
         # flow. Each pass is the SAME sweep with different damping/capture, and
@@ -2900,6 +3001,12 @@ class TorqueCurveCalibrate:
             "ZETA_FIT_HALFBAND", self.zeta_fit_halfband, above=0.0)
         self.p1_abort = bool(gcmd.get_int(
             "P1_ABORT", 1 if self.p1_abort else 0, minval=0, maxval=1))
+        # The vibration analysis (residual PSD, shaper fit, mode ID) is per
+        # axis; a diagonal has no single axis to fit it to.
+        if self.measure_vibration and self.test_axis == "xy":
+            raise gcmd.error(
+                "AXIS=XY is a skip test only: use PASS=torque (or "
+                "MEASURE_VIBRATION=0); vibration capture needs AXIS=X or Y")
         # Resolve the accel chip if vibration was just enabled at runtime.
         if self.measure_vibration and self.accel_chip is None:
             self.accel_chip = self._lookup_accel_chip()
@@ -3342,4 +3449,8 @@ class TorqueCurveCalibrate:
 
 
 def load_config_prefix(config):
+    return TorqueCurveCalibrate(config)
+
+
+def load_config(config):
     return TorqueCurveCalibrate(config)
