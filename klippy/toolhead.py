@@ -472,6 +472,10 @@ DRIP_TIME = 0.100
 
 # Main code to track events (and their timing) on the printer toolhead
 class ToolHead:
+    # Opt-in exact constant-jerk emission; see __init__. A class default so
+    # code paths reached before (or without) config parsing see it off.
+    unified_cubic = False
+
     def __init__(self, config):
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -508,6 +512,13 @@ class ToolHead:
         self.unified_spectral_null = config.getboolean(
             "unified_spectral_null", True
         )
+        # Emit each ramp as exact constant-jerk (cubic) trapq segments instead
+        # of constant-accel slices. The piecewise-linear a(t) the notch law
+        # designs is then represented exactly: the zeros hold by construction,
+        # so unified_spectral_null and unified_jerk_dt no longer apply to the
+        # rendered motion, and a ramp is at most three segments instead of
+        # notch_period/jerk_dt slices. See pathplan "Cubic emitter".
+        self.unified_cubic = config.getboolean("unified_cubic", False)
         # Per-ramp notch law: park the jerk ramp's shaper zero on a fixed mode
         # frequency (Hz) via J = dv*f_n^2, instead of a fixed jerk. Peak accel
         # then self-scales as a_peak = dv*f_n. See pathplan.Constraints.ramp_jerk.
@@ -598,6 +609,7 @@ class ToolHead:
         ffi_main, ffi_lib = chelper.get_ffi()
         self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
         self.trapq_append = ffi_lib.trapq_append
+        self.trapq_append_jerk = ffi_lib.trapq_append_jerk
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
         # Motion flushing
         self.step_generators = []
@@ -780,6 +792,63 @@ class ToolHead:
                 ea.sync_position(move, e_index + 3)
         return t
 
+    def _pp_validate(self, vs, vc, ve, move_d, cons):
+        if self.unified_cubic:
+            pathplan.validate_cubic_profile(vs, vc, ve, move_d, cons)
+        else:
+            pathplan.validate_profile(vs, vc, ve, move_d, cons)
+
+    def _pp_render(self, vs, vc, ve, move_d, cons):
+        if self.unified_cubic:
+            return pathplan.render_cubic_profile(vs, vc, ve, move_d, cons)
+        return pathplan._render_validated_profile(vs, vc, ve, move_d, cons)
+
+    def _pp_split(self, segs, lengths):
+        if self.unified_cubic:
+            return pathplan.split_cubic_segments(segs, lengths)
+        return pathplan.split_segments(segs, lengths)
+
+    def _emit_cubic(self, move, segs, next_move_time):
+        # Push one move's exact constant-jerk segments into the toolhead trapq
+        # and every extra axis, and return the time the move ends at.
+        t = next_move_time
+        pos = 0.0
+        sp = move.start_pos
+        r = move.axes_r
+        append = self.trapq_append_jerk
+        for seg in segs:
+            move_t, sv, a0, j, dist = seg
+            append(
+                self.trapq,
+                t,
+                move_t,
+                sp[0] + r[0] * pos,
+                sp[1] + r[1] * pos,
+                sp[2] + r[2] * pos,
+                r[0],
+                r[1],
+                r[2],
+                sv,
+                a0,
+                j,
+            )
+            for e_index, ea in enumerate(self.extra_axes):
+                if not move.axes_d[e_index + 3]:
+                    continue
+                if not hasattr(ea, "process_move_cubic"):
+                    raise self.printer.command_error(
+                        "unified_cubic requires extra axis '%s' to"
+                        " implement process_move_cubic"
+                        % (ea.get_axis_gcode_id(),)
+                    )
+                ea.process_move_cubic(t, move, e_index + 3, seg)
+            t += move_t
+            pos += dist
+        for e_index, ea in enumerate(self.extra_axes):
+            if move.axes_d[e_index + 3] and hasattr(ea, "sync_position"):
+                ea.sync_position(move, e_index + 3)
+        return t
+
     def _span_groups(self, moves):
         # Split the flush batch into the runs the LOOKAHEAD already planned.
         # Yields (group, peak_v, cap_v).
@@ -870,7 +939,7 @@ class ToolHead:
                 a_const=a_span,
                 for_span=not self._group_is_collinear(group),
             )
-            pathplan.validate_profile(vs, vc, ve, total_d, cons)
+            self._pp_validate(vs, vc, ve, total_d, cons)
             plan = (group, vs, vc, ve, total_d, cons)
             for index, move in enumerate(group):
                 out[id(move)] = (plan, index)
@@ -892,7 +961,7 @@ class ToolHead:
             ):
                 continue
             cons = self._pathplan_cons(move)
-            pathplan.validate_profile(
+            self._pp_validate(
                 move.start_v,
                 move.cruise_v,
                 move.end_v,
@@ -913,12 +982,8 @@ class ToolHead:
             segs = span_buckets.pop(id(move), None)
             if span_item is not None and span_item[1] == 0:
                 group, vs, vc, ve, total_d, cons = span_item[0]
-                rendered = pathplan._render_validated_profile(
-                    vs, vc, ve, total_d, cons
-                )
-                buckets = pathplan.split_segments(
-                    rendered, [m.move_d for m in group]
-                )
+                rendered = self._pp_render(vs, vc, ve, total_d, cons)
+                buckets = self._pp_split(rendered, [m.move_d for m in group])
                 if not all(buckets):
                     raise AssertionError(
                         "validated span produced an empty move"
@@ -936,7 +1001,7 @@ class ToolHead:
             elif segs is None and self.unified_emit and move.is_kinematic_move:
                 cons = self._pathplan_cons(move)
                 segs = (
-                    pathplan._render_validated_profile(
+                    self._pp_render(
                         move.start_v,
                         move.cruise_v,
                         move.end_v,
@@ -962,7 +1027,14 @@ class ToolHead:
                 # profile. The profile's duration differs from the nominal
                 # trapezoid (a_peak = dv*f_n < max_accel), so advance
                 # next_move_time by the ACTUAL emitted duration.
-                next_move_time = self._emit_slices(move, segs, next_move_time)
+                if self.unified_cubic:
+                    next_move_time = self._emit_cubic(
+                        move, segs, next_move_time
+                    )
+                else:
+                    next_move_time = self._emit_slices(
+                        move, segs, next_move_time
+                    )
             else:
                 if move.is_kinematic_move:
                     self.trapq_append(
@@ -1526,7 +1598,11 @@ class ToolHead:
             # start_v/cruise_v/end_v. Use the move's configured cruise limit
             # as the conservative ceiling for reach calculations.
             v_ceil = math.sqrt(move.max_cruise_v2) + 1.0
-        want_null = getattr(self, "unified_spectral_null", False)
+        # The cubic emitter is exact; there is no slice staircase to solve.
+        want_null = (
+            getattr(self, "unified_spectral_null", False)
+            and not self.unified_cubic
+        )
         cons = pathplan.Constraints(
             a_const=move.accel if a_const is None else a_const,
             v_ceil=v_ceil,

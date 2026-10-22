@@ -471,6 +471,7 @@ class PrinterExtruder:
         ffi_main, ffi_lib = chelper.get_ffi()
         self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
         self.trapq_append = ffi_lib.trapq_append
+        self.trapq_append_jerk = ffi_lib.trapq_append_jerk
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
 
         # Setup extruder stepper
@@ -664,6 +665,36 @@ class PrinterExtruder:
         extr_d = abs(axis_r * seg_dist)
         for i in range(3):
             self.last_position[i] += extr_d * extr_r[i]
+    def process_move_cubic(self, print_time, move, ea_index, seg):
+        # Cubic counterpart of process_move_segment: one exact constant-jerk
+        # segment of `move`, mirrored onto the extruder trapq at the same
+        # print_time so pressure advance integrates the real profile.
+        move_t, start_v, accel, jerk, seg_dist = seg
+        axis_r = move.axes_r[ea_index]
+        abs_axis_r = abs(axis_r)
+        extr_pos = self.last_position
+        if move.is_kinematic_move:
+            extr_r = [math.copysign(r * r, axis_r) for r in move.axes_r[:3]]
+        else:
+            extr_r = [0.0, 0.0, axis_r]
+        self.trapq_append_jerk(
+            self.trapq,
+            print_time,
+            move_t,
+            extr_pos[0],
+            extr_pos[1],
+            extr_pos[2],
+            extr_r[0],
+            extr_r[1],
+            extr_r[2],
+            start_v * abs_axis_r,
+            accel * abs_axis_r,
+            jerk * abs_axis_r,
+        )
+        extr_d = abs(axis_r * seg_dist)
+        for i in range(3):
+            self.last_position[i] += extr_d * extr_r[i]
+
     def find_past_position(self, print_time):
         if not self.extruder_steppers:
             return 0.0
