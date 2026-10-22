@@ -1186,6 +1186,223 @@ def split_segments(segs, lengths):
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# Cubic (constant-jerk) emitter
+#
+# The notch ramp is piecewise LINEAR in a(t): rise at +J, hold at a_peak, fall
+# at -J. Instead of approximating that with constant-accel slices (and then
+# solving the slices back onto the null), emit it exactly: each piece is one
+# trapq_append_jerk segment whose position is cubic in time. A ramp is at most
+# three segments, computed in closed form -- no integration loop, no jerk_dt,
+# no spectral solve -- and the zeros it parks are exact by construction.
+#
+# Segment tuple: (move_t, start_v, start_a, jerk, dist).
+#
+# The ramp has exactly the planning model's duration and distance
+# (notch_dist), so the lookahead's analytic model is now the rendered profile
+# rather than an approximation of it.
+#
+# NOT recovered here: past accel saturation the two-zero trapezoid widens its
+# plateau to dv/A and only ONE zero survives (see Constraints.ramp_jerk). The
+# slice emitter's spectral solve can sometimes claw the second back; this
+# emitter reports it through notch_loss_reasons() as second_notch_saturated.
+# ---------------------------------------------------------------------------
+
+
+def _cubic_ramp_shape(v0, v1, cons):
+    # (a_peak, J, t_rise, t_hold) for the ramp |v1 - v0|, or None.
+    dv = abs(v1 - v0)
+    if dv <= 1e-12 or not cons.notch_freq:
+        return None
+    a_ramp = cons.ramp_accel(v0, v1)
+    J = cons.ramp_jerk(dv, a_ramp)
+    if J is None or J <= 0.0:
+        return None
+    # Unsaturated: a_peak = dv*f_lo (the two-zero cap; dv*f_n for a single
+    # notch, where it is the triangle's own peak). Saturated: a_peak = A.
+    a_peak = dv * cons.notch_lo
+    if a_ramp and 0.0 < a_ramp < a_peak:
+        a_peak = a_ramp
+    t_rise = a_peak / J
+    t_hold = max(0.0, dv / a_peak - t_rise)
+    return a_peak, J, t_rise, t_hold
+
+
+def cubic_ramp_dist(v0, v1, cons):
+    """Path distance of the exact ramp v0 -> v1 (closed form)."""
+    shape = _cubic_ramp_shape(v0, v1, cons)
+    if shape is None:
+        return 0.0
+    _a, _J, t_rise, t_hold = shape
+    return 0.5 * (v0 + v1) * (2.0 * t_rise + t_hold)
+
+
+def _cubic_ramp_up(v0, v1, cons):
+    # Exact segments taking v0 -> v1 (v1 >= v0), rise / hold / fall.
+    shape = _cubic_ramp_shape(v0, v1, cons)
+    if shape is None:
+        return []
+    a_peak, J, t_rise, t_hold = shape
+    dv_edge = 0.5 * a_peak * t_rise
+    segs = []
+    v = v0
+    d = (v * t_rise + J * t_rise ** 3 / 6.0)
+    segs.append((t_rise, v, 0.0, J, d))
+    v = v0 + dv_edge
+    if t_hold > 0.0:
+        segs.append((t_hold, v, a_peak, 0.0, v * t_hold
+                     + 0.5 * a_peak * t_hold * t_hold))
+    # Land the fall edge exactly on v1 rather than on the accumulated sum.
+    v = v1 - dv_edge
+    segs.append((t_rise, v, a_peak, -J,
+                 (v + 0.5 * a_peak * t_rise - J * t_rise * t_rise / 6.0)
+                 * t_rise))
+    return segs
+
+
+def _cubic_reverse(segs):
+    # Time-reverse an accelerating ramp into the matching decel. A segment
+    # v(s) = sv + a0*s + j*s^2/2 played backwards has start speed v(T),
+    # start accel -(a0 + j*T) and the SAME jerk. Magnitude spectrum, and so
+    # the parked zeros, are preserved under time reversal.
+    out = []
+    for t, sv, a0, j, dist in reversed(segs):
+        out.append((t, sv + a0 * t + 0.5 * j * t * t, -(a0 + j * t), j, dist))
+    return out
+
+
+def _cubic_peak_velocity(vs, ve, move_d, cons):
+    # Highest cruise the move can reach -- the same bisection as
+    # _peak_velocity_jerk, but each probe is O(1) closed form.
+    lo = max(vs, ve)
+    hi = cons.v_ceil
+    if cubic_ramp_dist(vs, lo, cons) + cubic_ramp_dist(ve, lo, cons) >= move_d:
+        return lo
+    for _ in range(48):
+        if hi - lo <= 1e-4:
+            break
+        mid = 0.5 * (lo + hi)
+        need = cubic_ramp_dist(vs, mid, cons) + cubic_ramp_dist(ve, mid, cons)
+        if need > move_d:
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
+def _emit_cubic_core(vs, vc, ve, move_d, cons, collect=True):
+    # Mirror of _emit_jerk_core for exact constant-jerk segments.
+    vc = max(vc, vs, ve)
+    d_acc = cubic_ramp_dist(vs, vc, cons)
+    d_dec = cubic_ramp_dist(ve, vc, cons)
+    cruise_d = move_d - d_acc - d_dec
+    if cruise_d < -1e-9:
+        vc = max(_cubic_peak_velocity(vs, ve, move_d, cons), vs, ve)
+        d_acc = cubic_ramp_dist(vs, vc, cons)
+        d_dec = cubic_ramp_dist(ve, vc, cons)
+        cruise_d = move_d - d_acc - d_dec
+        if cruise_d < -1e-6 * max(1.0, move_d):
+            return None
+        cruise_d = max(0.0, cruise_d)
+    if cruise_d > 1e-9 and vc <= 1e-9:
+        return None
+    if not collect:
+        return []
+    segs = _cubic_ramp_up(vs, vc, cons)
+    if cruise_d > 1e-9:
+        segs.append((cruise_d / vc, vc, 0.0, 0.0, cruise_d))
+    segs.extend(_cubic_reverse(_cubic_ramp_up(ve, vc, cons)))
+    if not segs and move_d > 1e-9:
+        return None
+    return segs
+
+
+def validate_cubic_profile(vs, vc, ve, move_d, cons):
+    """Raise InfeasibleProfile if the exact cubic profile cannot fit."""
+    if move_d <= 0.0 or not cons.notch_freq:
+        return
+    if _emit_cubic_core(vs, vc, ve, move_d, cons, collect=False) is None:
+        raise InfeasibleProfile(
+            "notched cubic profile does not fit move: "
+            "start=%.6f cruise=%.6f end=%.6f distance=%.6f"
+            % (vs, vc, ve, move_d)
+        )
+
+
+def render_cubic_profile(vs, vc, ve, move_d, cons):
+    """Render a validated profile as exact (move_t, sv, a0, jerk, dist)
+    segments. Without a notch frequency it is the classic trapezoid, which
+    is just the jerk == 0 case of the same tuple."""
+    if move_d <= 0.0:
+        return []
+    if cons.notch_freq:
+        segs = _emit_cubic_core(vs, vc, ve, move_d, cons)
+        if segs is None:
+            raise AssertionError("validated cubic profile failed to render")
+        return segs
+    out = []
+    for at, ct, dt, sv, cv, a, dist in _emit_sharp(vs, vc, ve, move_d, cons):
+        if at > 0.0:
+            out.append((at, sv, a, 0.0, dist))
+        elif ct > 0.0:
+            out.append((ct, cv, 0.0, 0.0, dist))
+        elif dt > 0.0:
+            out.append((dt, cv, -a, 0.0, dist))
+    return out
+
+
+def _cubic_time_at(seg, d1):
+    # Time at which segment `seg` has covered distance d1. Distance is
+    # monotonic (speed never goes negative inside a ramp), so safeguarded
+    # Newton on a bracket always converges.
+    t, sv, a0, j, dist = seg
+    lo, hi = 0.0, t
+    x = t * d1 / dist if dist > 0.0 else 0.0
+    for _ in range(60):
+        f = ((j / 6.0 * x + 0.5 * a0) * x + sv) * x - d1
+        if f > 0.0:
+            hi = x
+        else:
+            lo = x
+        v = (0.5 * j * x + a0) * x + sv
+        nx = x - f / v if v > 0.0 else 0.5 * (lo + hi)
+        if not (lo < nx < hi):
+            nx = 0.5 * (lo + hi)
+        if abs(nx - x) <= 1e-15 * max(t, 1e-9):
+            x = nx
+            break
+        x = nx
+    return min(max(x, 0.0), t)
+
+
+def split_cubic_segments(segs, lengths):
+    """Cut one cubic profile into per-move buckets (see split_segments)."""
+    out = [[] for _ in lengths]
+    if not lengths:
+        return out
+    i = 0
+    remaining = lengths[0]
+    for seg in segs:
+        d = seg[4]
+        while d > 0.0:
+            if d <= remaining + 1e-12 or i >= len(out) - 1:
+                out[i].append(seg)
+                remaining -= d
+                d = 0.0
+            else:
+                t, sv, a0, j, dist = seg
+                t1 = _cubic_time_at(seg, remaining)
+                out[i].append((t1, sv, a0, j, remaining))
+                v1 = (0.5 * j * t1 + a0) * t1 + sv
+                seg = (t - t1, v1, a0 + j * t1, j, dist - remaining)
+                d = seg[4]
+                remaining = 0.0
+            if remaining <= 1e-12 and i < len(out) - 1:
+                i += 1
+                remaining = lengths[i]
+    return out
+
 # Every reason notch_loss_reasons() can ever return. The toolhead uses this to
 # stop calling the diagnostic once it has reported all of them.
 LOSS_REASONS = frozenset(
