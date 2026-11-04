@@ -169,7 +169,9 @@ class VibrationPulseTestGenerator:
         return self.freq_end
 
     def get_accel_per_hz(self):
-        return self.accel_per_hz
+        # The value the last test actually ran with (ACCEL_PER_HZ= on the
+        # command line overrides the config), not just the config default.
+        return getattr(self, "test_accel_per_hz", self.accel_per_hz)
 
 
 class SweepingVibrationsTestGenerator:
@@ -379,9 +381,6 @@ class ResonanceTester:
 
         test_points = [test_point] if test_point else self.probe_points
 
-        if test_accel_per_hz is not None:
-            self.generator.accel_per_hz = test_accel_per_hz
-
         for point in test_points:
             toolhead.manual_move(point, self.move_speed)
             if len(test_points) > 1 or test_point is not None:
@@ -411,7 +410,7 @@ class ResonanceTester:
                     test_seq,
                     axis,
                     self.generator.vibration_generator.freq_end,
-                    self.generator.vibration_generator.accel_per_hz,
+                    self.generator.vibration_generator.get_accel_per_hz(),
                     gcmd,
                 )
                 for chip_axis, aclient, chip_name in raw_values:
