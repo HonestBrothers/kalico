@@ -46,7 +46,7 @@ class FakeAxis:
     def __init__(self, name="A", segmented=False):
         self.name = name
         if segmented:
-            self.process_move_segment = lambda *args: None
+            self.process_move_cubic = lambda *args: None
 
     def get_axis_gcode_id(self):
         return self.name
@@ -91,7 +91,7 @@ def test_unified_rejects_unsegmented_extra_axis():
     try:
         th._check_unified_extra_axis_support()
     except RuntimeError as e:
-        assert "process_move_segment" in str(e)
+        assert "process_move_cubic" in str(e)
         assert "'A'" in str(e)
     else:
         raise AssertionError("unsupported extra axis was accepted")
@@ -110,7 +110,6 @@ def make_unified_toolhead(**over):
     th.junction_deviation = 0.01
     th.max_accel_to_decel = 50000.0
     th.unified_emit = True
-    th.unified_jerk_dt = 0.001
     th.unified_notch_freq = 55.0
     th.unified_notch_freq_x = 55.0
     th.unified_notch_freq_y = 55.0
@@ -142,7 +141,7 @@ def test_notch_freq_floor():
     print("  notch frequency floor rejects stalling values OK")
 
 
-def test_unified_settings_require_notch_and_resolved_timestep():
+def test_unified_settings_require_notch():
     err = lambda msg: RuntimeError(msg)  # noqa: E731
     th = make_unified_toolhead(
         unified_notch_freq=0.0,
@@ -155,89 +154,34 @@ def test_unified_settings_require_notch_and_resolved_timestep():
         assert "requires unified_notch_freq" in str(e), e
     else:
         raise AssertionError("enabled planner without a notch was accepted")
-
     th = make_unified_toolhead(
-        unified_jerk_dt=0.002,
         unified_notch_freq_x=55.0,
         unified_notch_freq_y=75.0,
     )
-    try:
-        th._check_unified_settings(err)
-    except RuntimeError as e:
-        assert "at least 10 slices" in str(e), e
-    else:
-        raise AssertionError("under-resolved notch timestep was accepted")
-
-    th.unified_jerk_dt = 0.001
     th._check_unified_settings(err)
     th.unified_emit = False
-    th.unified_jerk_dt = 1.0
+    th.unified_notch_freq_x = th.unified_notch_freq_y = 0.0
     th._check_unified_settings(err)
-    print("  enabled planner requires a notch resolved by jerk_dt OK")
+    print("  enabled planner requires a notch OK")
 
 
-def test_unified_settings_bound_the_ramp_slice_budget():
-    # jerk_dt bounds slices per ramp from BELOW (resolve the notch edge). This
-    # is the bound from above, and it has to live at config time: the emitter
-    # reports an over-resolved ramp by raising InfeasibleProfile, nothing in
-    # klippy catches that, and it lands as a shutdown on some G1 mid-print.
+def test_low_max_accel_is_accepted_and_renders():
+    # The slice emitter had to bound slices per ramp, because a saturated
+    # plateau of dv/a_max could integrate into an unbounded slice count. The
+    # cubic plateau is one segment however long it is, so any max_accel --
+    # including what M204 may lower it to mid-print -- is just a slow ramp.
     err = lambda msg: RuntimeError(msg)  # noqa: E731
-
-    # A low max_accel is what can still run away: nothing shortens a
-    # saturated plateau of dv/a_max.
-    th = make_unified_toolhead(max_accel=100.0, max_velocity=400.0)
+    th = make_unified_toolhead(max_accel=50.0, max_velocity=800.0)
     th._check_unified_settings(err)
-    th.max_accel = 50.0
-    try:
-        th._check_unified_settings(err)
-    except RuntimeError as e:
-        assert "more than 4096 slices" in str(e), e
-    else:
-        raise AssertionError("over-long saturated plateau was accepted")
-    print("  config rejects an over-resolved ramp slice budget OK")
-
-
-def test_over_budget_settings_still_render_at_runtime():
-    # The config bound must NOT be the runtime bound. max_accel is not static
-    # -- M204 lowers it per feature, and failing there would be precisely the
-    # mid-print shutdown this is avoiding -- so a ramp past the config budget
-    # still has to emit. Only non-convergence may go fatal.
-    err = lambda msg: RuntimeError(msg)  # noqa: E731
-    th = make_unified_toolhead(max_accel=20000.0, max_velocity=400.0)
-    th._check_unified_settings(err)  # the config a print starts with
-    th.max_accel = 50.0  # what an M204 may do to it, unchecked
     cons = toolhead.pathplan.Constraints(
         a_const=th.max_accel,
         v_ceil=th.max_velocity + 1.0,
-        jerk_dt=th.unified_jerk_dt,
         notch_freq=th.unified_notch_freq_x,
     )
-    assert not toolhead.pathplan.ramp_fits_slice_budget(0.0, 400.0, cons)
-    segs = toolhead.pathplan.emit_profile(0.0, 400.0, 0.0, 1e6, cons)
-    assert segs, "a ramp past the config budget must still emit"
-    print("  a ramp past the config budget still renders OK")
-
-
-def test_set_velocity_limit_rolls_back_an_unemittable_limit():
-    # Raising max_velocity lengthens the worst ramp the emitter has to
-    # integrate, so VELOCITY alone can push a valid unified config past its
-    # slice budget. The command must refuse it and
-    # leave BOTH limits as they were; a half-applied limit is worse than the
-    # error, because the next G1 plans against it.
-    th = make_unified_toolhead(max_accel=100.0, max_velocity=400.0)
-    th._check_unified_settings(th.printer.command_error)
-    gcmd = FakeGCmd()
-    asked = {"VELOCITY": 800.0}
-    gcmd.get_float = lambda n, d, **kw: asked.get(n, d)
-    try:
-        th.cmd_SET_VELOCITY_LIMIT(gcmd)
-    except RuntimeError as e:
-        assert "more than 4096 slices" in str(e), e
-    else:
-        raise AssertionError("unemittable VELOCITY was accepted")
-    assert th.max_velocity == 400.0, th.max_velocity
-    assert th.max_accel == 100.0, th.max_accel
-    print("  SET_VELOCITY_LIMIT refuses and rolls back an unemittable limit OK")
+    toolhead.pathplan.validate_cubic_profile(0.0, 400.0, 0.0, 1e6, cons)
+    segs = toolhead.pathplan.render_cubic_profile(0.0, 400.0, 0.0, 1e6, cons)
+    assert len(segs) == 7, segs  # 3 up + cruise + 3 down
+    print("  a very low max_accel is accepted and renders OK")
 
 
 def test_set_unified_pair_rule_and_rollback():
@@ -423,7 +367,7 @@ def test_infeasible_batch_fails_before_emission():
     emitted = []
 
     class CountingAxis:
-        def process_move_segment(self, *args):
+        def process_move_cubic(self, *args):
             emitted.append(("axis", args))
 
     th.extra_axes = [CountingAxis()]
@@ -434,6 +378,7 @@ def test_infeasible_batch_fails_before_emission():
     th.print_time = 123.0
     th.trapq = object()
     th.trapq_append = lambda *args: emitted.append(("trapq", args))
+    th.trapq_append_jerk = lambda *args: emitted.append(("trapq", args))
     th._calc_print_time = lambda: emitted.append(("calc_print_time", ()))
     th._unified_all_warned = False
     th._unified_warned = set()
@@ -451,74 +396,12 @@ def test_infeasible_batch_fails_before_emission():
     print("  infeasible batch fails before timing or motion-queue mutation OK")
 
 
-def _span_move(rx, ry, accel=100000.0):
-    return types.SimpleNamespace(
-        axes_r=(rx, ry, 0.0, 0.0),
-        accel=accel,
-        cruise_v=100.0,
-        start_v=0.0,
-        end_v=0.0,
-        max_cruise_v2=10000.0,
-        start_pos=(0.0, 0.0, 0.0, 0.0),
-    )
-
-
-def test_straight_spans_keep_the_spectral_null():
-    # A spanned run renders ONE scalar profile split among its moves, and each
-    # axis sees a_i(t) = r_i(t)*a(t). With r_i CONSTANT the scalar null
-    # transfers to every axis unchanged, so a straight run is exactly as safe
-    # as a single move -- and with spanning on by default, disabling the
-    # correction for all spans would bypass it on most dense collinear gcode.
-    th = make_unified_toolhead(unified_spectral_null=True)
-    straight = [_span_move(1.0, 0.0) for _ in range(4)]
-    assert th._group_is_collinear(straight)
-    cons = th._pathplan_cons(
-        straight[0],
-        v_ceil=200.0,
-        a_const=100000.0,
-        for_span=not th._group_is_collinear(straight),
-    )
-    assert cons.spectral_null, "straight span lost the correction"
-    assert cons.spectral_loss is None
-
-    # unified_span_max_angle bounds each JUNCTION, not the run, so heading can
-    # drift across many small turns -- compare against the first move, not
-    # pairwise.
-    drifting = [
-        _span_move(1.0, 0.0),
-        _span_move(0.9999, 0.0141),
-        _span_move(0.9997, 0.0245),
-    ]
-    assert not th._group_is_collinear(drifting)
-    cons = th._pathplan_cons(
-        drifting[0],
-        v_ceil=200.0,
-        a_const=100000.0,
-        for_span=not th._group_is_collinear(drifting),
-    )
-    assert not cons.spectral_null, "turning span kept the correction"
-    assert cons.spectral_loss == "spectral_null_span_turned"
-    assert cons.spectral_loss in toolhead.pathplan.LOSS_REASONS
-
-    # With the option off, a turning span says nothing -- there is no loss.
-    off = make_unified_toolhead()
-    off.unified_spectral_null = False
-    cons = off._pathplan_cons(
-        drifting[0], v_ceil=200.0, a_const=100000.0, for_span=True
-    )
-    assert cons.spectral_loss is None
-    print("  straight spans keep the null, turning spans report the loss OK")
-
-
 def main():
     test_subclass_without_unified_fields()
     test_unified_rejects_unsegmented_extra_axis()
     test_notch_freq_floor()
-    test_straight_spans_keep_the_spectral_null()
-    test_unified_settings_require_notch_and_resolved_timestep()
-    test_unified_settings_bound_the_ramp_slice_budget()
-    test_over_budget_settings_still_render_at_runtime()
-    test_set_velocity_limit_rolls_back_an_unemittable_limit()
+    test_unified_settings_require_notch()
+    test_low_max_accel_is_accepted_and_renders()
     test_set_unified_pair_rule_and_rollback()
     test_set_unified_rearms_profile_warnings()
     test_reach_cache_tracks_start_v2()

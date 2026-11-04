@@ -11,14 +11,14 @@
 #     a(t) = rect(1/f_hi) * rect(1/f_lo)
 #     |A(f)| = |sinc(f/f_hi) * sinc(f/f_lo)|   -> exact zeros at BOTH modes
 #
-# which every axis inherits whatever its heading. Matching that to the emitter's
-# constant-jerk integrator needs J = dv*f_lo*f_hi with the plateau capped at
-# dv*f_lo, giving T_rise = 1/f_hi and T_total = 1/f_lo + 1/f_hi.
+# which every axis inherits whatever its heading. As constant-jerk segments that
+# is J = dv*f_lo*f_hi with the plateau capped at dv*f_lo, giving T_rise = 1/f_hi
+# and T_total = 1/f_lo + 1/f_hi.
 #
 # Verifies: both zeros actually appear in emitted profiles and beat the blend at
 # both modes; f_lo == f_hi degenerates to the single-zero triangle bit-for-bit;
 # the duration/peak/distance laws hold and are independent of dv; the lookahead
-# twins (notch_dist, notch_reach_v2) agree with the integrator; the emitter's
+# twins (notch_dist, notch_reach_v2) agree with the rendered ramp; the emitter's
 # distance invariant survives; accel saturation, which leaves room for only one
 # zero, spends it on whichever mode it helps more and reports the loss only when
 # a mode is really left excited; and the pair's harmonic mean f_eq, which every
@@ -38,61 +38,50 @@ F_LO = 55.0  # the two modes to null (red's real X and Y, roughly)
 F_HI = 75.0
 F_BLEND = 0.5 * (F_LO + F_HI)  # what the old single-zero law used at 45 deg
 A_BIG = 1e9  # high enough that dv*f_lo never saturates
-DT = 25e-6
 
 
 def cons(
     f_lo=F_LO,
     f_hi=F_HI,
     a_const=A_BIG,
-    jerk_dt=DT,
 ):
     return pathplan.Constraints(
         a_const=a_const,
         v_ceil=1e9,
-        jerk_dt=jerk_dt,
         notch_freq=f_lo,
         notch_freq2=f_hi,
     )
 
 
 def ramp(v0, v1, c):
-    """(pulse, distance) for one accel ramp; pulse is [(dt, accel), ...]."""
-    slices, dist = pathplan._ramp_up_jerk(v0, v1, c)
-    return [(s[0], s[5]) for s in slices], dist
+    """(segments, distance) for one accel ramp, as rendered."""
+    segs = pathplan._cubic_ramp_up(v0, v1, c)
+    return segs, math.fsum(s[4] for s in segs)
 
 
-def profile_pulse(segs):
-    """Flatten an emitted profile into a signed piecewise-constant a(t)."""
-    out = []
-    for accel_t, cruise_t, decel_t, _sv, _cv, a, _d in segs:
-        if accel_t > 0.0:
-            out.append((accel_t, a))
-        elif cruise_t > 0.0:
-            out.append((cruise_t, 0.0))
-        elif decel_t > 0.0:
-            out.append((decel_t, -a))
-    return out
-
-
-def residual(pulse, freq):
+def residual(segs, freq):
     """|A(f)| / |a|_1 -- what fraction of the pulse lands on the mode.
 
-    Normalised by the L1 norm so pulses of different size/duration compare
-    directly: 0 is a perfect null, and an unshaped step approaches 1.
+    Exact for the piecewise-linear a(t) the segments encode. Normalised by the
+    L1 norm so pulses of different size/duration compare directly: 0 is a
+    perfect null, and an unshaped step approaches 1. Every emitted segment
+    keeps one sign of acceleration, so |a|_1 integrates segment by segment.
     """
-    t = re = im = l1 = 0.0
     w = 2.0 * math.pi * freq
-    for dt, a in pulse:
-        re += a * (math.sin(w * (t + dt)) - math.sin(w * t)) / w
-        im += a * (math.cos(w * (t + dt)) - math.cos(w * t)) / w
-        l1 += abs(a) * dt
-        t += dt
-    return math.hypot(re, im) / l1 if l1 else 0.0
+    t0 = l1 = 0.0
+    acc = 0j
+    for t, _sv, a0, j, _d in segs:
+        e = complex(math.cos(w * t), -math.sin(w * t))
+        i0 = (1.0 - e) / (1j * w)
+        i1 = (-t * e + i0) / (1j * w)
+        acc += complex(math.cos(w * t0), -math.sin(w * t0)) * (a0 * i0 + j * i1)
+        l1 += abs(a0 * t + 0.5 * j * t * t)
+        t0 += t
+    return abs(acc) / l1 if l1 else 0.0
 
 
 def test_one_ramp_nulls_both_modes():
-    # The headline claim, straight off the integrator: a single accel ramp
+    # The headline claim, straight off the emitter: a single accel ramp
     # leaves essentially nothing at EITHER mode, while single-zero ramps at
     # f_lo, f_hi or their mean each leave one mode ringing.
     for dv in (20.0, 60.0, 200.0):
@@ -103,8 +92,7 @@ def test_one_ramp_nulls_both_modes():
         for f_single in (F_LO, F_HI, F_BLEND):
             single, _ = ramp(0.0, dv, cons(f_single, f_single))
             worst_single = max(residual(single, F_LO), residual(single, F_HI))
-            # The single-zero ramp always leaves at least one mode excited by
-            # more than the discretization floor.
+            # The single-zero ramp always leaves at least one mode excited.
             assert worst_single > 1e-2, (dv, f_single, worst_single)
             assert max(r_lo, r_hi) < worst_single
         print(
@@ -143,10 +131,10 @@ def test_duration_peak_and_distance_laws():
     # zeros); a_peak = dv*f_lo; distance = 0.5*(v0+v1)*T_total.
     want_t = 1.0 / F_LO + 1.0 / F_HI
     for v0, v1 in ((0.0, 50.0), (0.0, 200.0), (40.0, 300.0)):
-        pulse, dist = ramp(v0, v1, cons())
+        segs, dist = ramp(v0, v1, cons())
         dv = v1 - v0
-        t_total = sum(dt for dt, _a in pulse)
-        a_peak = max(a for _dt, a in pulse)
+        t_total = sum(s[0] for s in segs)
+        a_peak = max(max(s[2], s[2] + s[3] * s[0]) for s in segs)
         assert abs(t_total - want_t) / want_t < 0.01, (v0, v1, t_total)
         assert abs(a_peak - dv * F_LO) / (dv * F_LO) < 0.01, (v0, v1, a_peak)
         want_d = 0.5 * (v0 + v1) * want_t
@@ -161,18 +149,16 @@ def test_duration_peak_and_distance_laws():
     )
 
 
-def test_lookahead_twins_agree_with_the_integrator():
-    # notch_dist is the closed form the LOOKAHEAD plans with; the integrator is
+def test_lookahead_twins_agree_with_the_emitter():
+    # notch_dist is the closed form the LOOKAHEAD plans with; the emitter is
     # what actually renders. If they disagree the planner approves a cruise the
-    # emitter cannot fit and the move drops to the sharp constant-accel
-    # fallback -- losing the notch silently.
+    # emitter cannot fit and the move fails closed.
     for a_const in (A_BIG, 20000.0, 5000.0):
         for v0, v1 in ((0.0, 60.0), (0.0, 200.0), (30.0, 250.0)):
             _pulse, d_int = ramp(v0, v1, cons(a_const=a_const))
             d_cf = pathplan.notch_dist(v0, v1, a_const, F_LO, F_HI)
-            # 0.6% is the zero-order-hold discretization, the same error the
-            # single-notch law carries; it is not a modelling difference.
-            assert abs(d_int - d_cf) / d_cf < 0.01, (
+            # The cubic emitter renders exactly the planning model.
+            assert abs(d_int - d_cf) / d_cf < 1e-9, (
                 a_const,
                 v0,
                 v1,
@@ -187,7 +173,7 @@ def test_lookahead_twins_agree_with_the_integrator():
         need = pathplan.notch_dist(0.0, v, A_BIG, F_LO, F_HI)
         assert need <= dist + 1e-6, (dist, v, need)
         assert need > dist - 1e-3, (dist, v, need)  # and not leaving room
-    print("  notch_dist / notch_reach_v2 agree with the integrated ramp OK")
+    print("  notch_dist / notch_reach_v2 agree with the rendered ramp OK")
 
 
 def test_reach_is_monotone_in_distance():
@@ -201,37 +187,32 @@ def test_reach_is_monotone_in_distance():
 
 def test_emitted_profiles_keep_both_zeros_and_the_invariants():
     # Through the real entry point, on whole moves rather than bare ramps.
-    # emit_profile runs two nested bisections, each integrating trial ramps,
-    # so it uses a coarser slice than the bare-ramp spectral tests. That
-    # raises the zero-order-hold floor (hence 5e-3, not 1e-3) without
-    # changing what is being checked.
-    coarse = 2e-4
     for a_const in (A_BIG, 20000.0):
-        c = cons(a_const=a_const, jerk_dt=coarse)
+        c = cons(a_const=a_const)
         d = 2.0 * pathplan.notch_dist(0.0, 200.0, a_const, F_LO, F_HI) + 5.0
-        segs = pathplan.emit_profile(0.0, 200.0, 0.0, d, c)
+        pathplan.validate_cubic_profile(0.0, 200.0, 0.0, d, c)
+        segs = pathplan.render_cubic_profile(0.0, 200.0, 0.0, d, c)
         check_segs(segs, d, 0.0, 0.0, "dual a=%g" % a_const)
-        pulse = profile_pulse(segs)
-        assert residual(pulse, F_LO) < 5e-3, residual(pulse, F_LO)
-        assert residual(pulse, F_HI) < 5e-3, residual(pulse, F_HI)
+        assert residual(segs, F_LO) < 1e-9, residual(segs, F_LO)
+        assert residual(segs, F_HI) < 1e-9, residual(segs, F_HI)
         assert pathplan.notch_loss_reasons(0.0, 200.0, 0.0, c) == []
     # Distance conservation across a range of feasible move lengths. Infeasible
     # notched moves must fail closed instead of emitting a sharp fallback.
     for a_const in (A_BIG, 5000.0):
-        c = cons(a_const=a_const, jerk_dt=coarse)
+        c = cons(a_const=a_const)
         for d in (0.5, 3.0, 12.0, 60.0):
-            core = pathplan._emit_jerk_core(10.0, 200.0, 30.0, d, c)
+            core = pathplan._emit_cubic_core(10.0, 200.0, 30.0, d, c)
             if core is None:
                 try:
-                    pathplan.emit_profile(10.0, 200.0, 30.0, d, c)
+                    pathplan.validate_cubic_profile(10.0, 200.0, 30.0, d, c)
                 except pathplan.InfeasibleProfile:
                     continue
                 raise AssertionError(
                     "infeasible dual notch did not fail closed"
                 )
-            segs = pathplan.emit_profile(10.0, 200.0, 30.0, d, c)
+            segs = pathplan.render_cubic_profile(10.0, 200.0, 30.0, d, c)
             check_segs(segs, d, 10.0, 30.0, "dual d=%g" % d)
-            assert abs(sum(s[6] for s in segs) - d) <= 1e-6 * d
+            assert abs(sum(s[4] for s in segs) - d) <= 1e-6 * d
     print("  emitted profiles null both modes and conserve distance OK")
 
 
@@ -307,15 +288,13 @@ def test_f_eq_is_the_harmonic_mean_of_the_pair():
     # identical to the single-zero ones. Pin both against a measured ramp.
     for f_lo, f_hi in ((55.0, 75.0), (30.0, 31.0), (40.0, 160.0), (55.0, 55.0)):
         c = pathplan.Constraints(
-            a_const=A_BIG, jerk_dt=DT, notch_freq=f_lo, notch_freq2=f_hi
+            a_const=A_BIG, notch_freq=f_lo, notch_freq2=f_hi
         )
         assert abs(c.notch_period - (1.0 / f_lo + 1.0 / f_hi)) < 1e-12
         assert abs(c.notch_f_eq - 2.0 / (1.0 / f_lo + 1.0 / f_hi)) < 1e-12
         v0, v1 = 40.0, 140.0
-        _pulse, dist = ramp(v0, v1, c)
-        # 1% is the zero-order-hold discretization of the integrated ramp, the
-        # same slack the notch_dist agreement check above carries.
-        assert abs(dist - (v0 + v1) / c.notch_f_eq) < 1e-2 * dist, (
+        _segs, dist = ramp(v0, v1, c)
+        assert abs(dist - (v0 + v1) / c.notch_f_eq) < 1e-9 * dist, (
             f_lo,
             f_hi,
             dist,
@@ -328,7 +307,6 @@ def test_notch_unset_is_untouched():
     c = pathplan.Constraints(
         a_const=A_BIG,
         v_ceil=1e9,
-        jerk_dt=DT,
         notch_freq=None,
         notch_freq2=F_HI,
     )

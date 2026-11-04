@@ -1,5 +1,5 @@
-# Invariant checks for pathplan.emit_profile (the "stepguard" invariant made
-# structural) plus basic sharp/jerk profile shape.
+# Invariant checks for pathplan.render_cubic_profile (the "stepguard"
+# invariant made structural) on the un-notched trapezoid path.
 #
 # Run: klippy-env/bin/python test/test_pathplan.py
 import os
@@ -11,18 +11,18 @@ import pathplan  # noqa: E402
 
 
 def check_segs(segs, move_d, want_vs, want_ve, tag):
-    # Non-negative times/speeds, velocity continuity across segments, exact
-    # per-segment trapq-implied distance, and sum(dist) == move_d.
+    # Segments are (move_t, start_v, start_a, jerk, dist). Non-negative times
+    # and speeds, velocity continuity across segments, exact per-segment
+    # trapq-implied distance, and sum(dist) == move_d.
     eps_v = 1e-4
     total = 0.0
     prev_ev = None
     first_sv = None
-    for k, (at, ct, dt, sv, cv, a, dist) in enumerate(segs):
-        assert at >= -1e-9 and ct >= -1e-9 and dt >= -1e-9, (tag, "neg t", k)
-        assert sv >= -eps_v and cv >= -eps_v, (tag, "neg v", k, sv, cv)
-        ev = cv - a * dt
-        assert ev >= -eps_v, (tag, "end vel<0", k, ev, cv, a, dt)
-        d_impl = 0.5 * (sv + cv) * at + cv * ct + (cv * dt - 0.5 * a * dt * dt)
+    for k, (t, sv, a0, j, dist) in enumerate(segs):
+        assert t >= -1e-9, (tag, "neg t", k)
+        ev = sv + a0 * t + 0.5 * j * t * t
+        assert sv >= -eps_v and ev >= -eps_v, (tag, "neg v", k, sv, ev)
+        d_impl = ((j / 6.0 * t + 0.5 * a0) * t + sv) * t
         assert abs(d_impl - dist) <= 1e-6 + 1e-4 * abs(dist), (
             tag,
             "dist",
@@ -53,7 +53,7 @@ def check_segs(segs, move_d, want_vs, want_ve, tag):
 
 
 def test_sharp_trapezoid():
-    # No jerk, no notch -> classic accel/cruise/decel trapezoid.
+    # No notch -> classic accel/cruise/decel trapezoid, as jerk == 0 segments.
     cons = pathplan.Constraints(a_const=8000.0, v_ceil=400.0)
     for vs, vc, ve, d in [
         (0.0, 200.0, 0.0, 60.0),
@@ -61,7 +61,8 @@ def test_sharp_trapezoid():
         (80.0, 300.0, 80.0, 90.0),
         (0.0, 200.0, 0.0, 0.5),
     ]:  # short -> triangle
-        segs = pathplan.emit_profile(vs, vc, ve, d, cons)
+        segs = pathplan.render_cubic_profile(vs, vc, ve, d, cons)
+        assert all(s[3] == 0.0 for s in segs), segs
         assert segs, ("empty", vs, vc, ve, d)
         check_segs(segs, d, vs, ve, "sharp(%s,%s,%s,%s)" % (vs, vc, ve, d))
     print("  sharp trapezoid invariants OK")
@@ -71,7 +72,7 @@ def test_impossible_endpoint_change_rejected():
     cons = pathplan.Constraints(a_const=8000.0, v_ceil=400.0)
     cases = [(100.0, 200.0, 0.0, 0.5), (50.0, 200.0, 100.0, 0.2)]
     for c in cases:
-        assert pathplan.emit_profile(*c, cons) == [], (
+        assert pathplan.render_cubic_profile(*c, cons) == [], (
             "impossible endpoint change emitted",
             c,
         )

@@ -14,14 +14,14 @@ a move and back to zero at the end. Those instantaneous acceleration steps
 excite the machine's mechanical resonances, which show up as ringing or
 "ghosting" on printed surfaces.
 
-With jerk limiting enabled the planner instead emits short constant-acceleration
-slices whose acceleration changes are bounded by the configured jerk step. This
-is a discretized S-curve approximation rather than mathematically continuous
-acceleration.
+With jerk limiting enabled the planner instead emits each speed change as a
+piecewise-linear acceleration pulse: at most three constant-jerk segments per
+ramp (rise, hold, fall), queued as exact cubic moves rather than approximated by
+a staircase of constant-acceleration slices.
 
-The lookahead is jerk-aware and conservative: it plans boundary speeds using an
-analytic model that slightly overestimates the distance required by the emitted
-slices, so it should not approve a profile the emitter cannot render.
+The lookahead is jerk-aware and exact: the closed-form ramp distance it plans
+boundary speeds with is the distance of the emitted ramp, so it never approves
+a profile the emitter cannot render.
 
 ## The notch law
 
@@ -58,8 +58,9 @@ edge still has a zero at `f_n` while the configured acceleration limit is
 honored.
 
 The notch frequencies and ramp velocity change determine jerk directly. The
-emitted zero-order-held slices approximate the ideal pulse, and insufficient
-runway moves the response away from the requested notch.
+emitted ramp *is* the ideal pulse, so its zero is exact (to rounding, ~1e-17),
+not a discretized approximation of one. Insufficient runway does not move the
+zero; it stops the planner from changing speed in that move at all.
 
 ## Configuration
 
@@ -89,66 +90,10 @@ unified_notch_freq: 55
   different measured modes — e.g. a bed-slinger whose heavy Y rings low and
   lighter X higher.
 
-- `unified_jerk_dt` (default: 0.001)
-  Integration time step in seconds for the emitted ramp. Smaller values give a
-  smoother ramp and more motion-queue entries. The minimum is `0.0001`. It must
-  provide at least ten slices across the fastest configured notch edge:
-  `unified_jerk_dt * max(f_x, f_y) <= 0.1`.
-
-  Without `unified_spectral_null` this is the knob on the residual/CPU trade:
-  the emitted notch residual falls monotonically as `jerk_dt` shrinks, at a
-  proportional cost in motion-queue entries and planner CPU. Halving it roughly
-  halves the residual for twice the slices, bottoming out near 0.11% at the
-  `0.0001` minimum — 379 slices per ramp at 55 Hz.
-
-  With `unified_spectral_null` it stops buying depth *at the configured modes*
-  when the solve succeeds exactly. A constrained or rejected solve reports
-  `spectral_null_partial` or `spectral_null_failed`. What `jerk_dt` still sets
-  is the **broadband floor** everywhere else, which no null touches. Measured
-  on a 0→100 mm/s ramp with the null solved:
-
-  | `jerk_dt` | slices | at `f_n` | 150 Hz | 100–500 Hz mean |
-  | --------- | ------ | -------- | ------ | --------------- |
-  | 0.003     | 11     | 0.00000% | 2.30%  | 1.47%           |
-  | 0.001     | 34     | 0.00000% | 1.23%  | 0.434%          |
-  | 0.00025   | 143    | 0.00000% | 0.885% | 0.319%          |
-
-  So coarsening is not free once the null is solved: 11 slices costs 4.6x the
-  excitation above 100 Hz, and broadband energy is what reaches modes you have
-  not characterised. The default sits at a reasonable knee — most of the
-  benefit is in by 34 slices, and 143 buys only another 1.4x for four times the
-  motion-queue traffic.
-
-- `unified_spectral_null` (default: True)
-  Solve the emitted slice accelerations for the null instead of sampling the
-  ideal ramp.
-
-  The notch law's zero is exact only in continuous time. Emitting the ramp as
-  constant-acceleration slices smears it to about 1.3% of `dv` at the default
-  `jerk_dt`. But the emitted spectrum is *linear* in those slice
-  accelerations, and there are far more of them than there are constraints —
-  so the null can be solved for rather than approximated. Four equality rows
-  for one mode (preserve `dv`, preserve distance, zero the real and imaginary
-  parts of the spectrum at `f_n`), six for two modes, against `len(slices)`
-  unknowns.
-
-  Sampling the ideal curve was only ever a convenient way to choose those
-  numbers. It makes the emitted profile *look* like the ideal on a plot, which
-  was never the goal; an unconstrained successful solve is a slightly worse
-  pointwise fit (about 2%) and an exact spectral one.
-
-  `dv`, distance, and terminal velocity are checked after the solve, so nothing
-  upstream moves: runway is still sized from the same analytic model, the next
-  move still plans from the same exit speed, and print time is unchanged. A
-  numerically ill-conditioned answer is rejected and reported instead.
-
-  A ramp that saturates `max_accel` holds a plateau exactly on the limit, and
-  those slices cannot move up. They are pinned and the rest of the ramp carries
-  what it can, giving a reduced residual rather than a refusal or a violated
-  limit — 1.28% to 0.47% on a 0→400 mm/s ramp. Where even the scaled-back
-  correction will not fit, the ramp is emitted unchanged.
-
-  Costs roughly 23% more planner CPU.
+- `unified_jerk_dt`, `unified_spectral_null`, `unified_cubic`
+  Options of the retired slice emitter. They are still accepted, with a
+  deprecation warning, and have no effect: the ramp is always emitted as exact
+  constant-jerk segments (see [How it works](#how-it-works)).
 
 ### Two modes in one ramp
 
@@ -173,12 +118,12 @@ heading. Concretely, for `f_x = 55`, `f_y = 75`, `dv = 200 mm/s` (residual is
 
 | ramp | duration | peak accel | residual @55 | residual @75 |
 |---|---|---|---|---|
-| one zero @55 | 36.3 ms | 10997 | **0.0003** | 0.0451 |
-| one zero @75 | 26.6 ms | 14995 | 0.1044 | **0.0004** |
-| one zero @65 (the old blend) | 30.7 ms | 12998 | 0.0306 | 0.0162 |
-| **two zeros, 55 + 75** | **31.4 ms** | **11000** | **0.0004** | **0.0003** |
+| one zero @55 | 36.4 ms | 11000 | **0** | 0.0451 |
+| one zero @75 | 26.7 ms | 15000 | 0.1041 | **0** |
+| one zero @65 (the old blend) | 30.8 ms | 13000 | 0.0306 | 0.0164 |
+| **two zeros, 55 + 75** | **31.5 ms** | **11000** | **0** | **0** |
 
-The blend leaves 3.1% at X and 1.6% at Y; the trapezoid leaves ~0.04% at both,
+The blend leaves 3.1% at X and 1.6% at Y; the trapezoid leaves nothing at either,
 for 2% more ramp time and 15% *less* peak acceleration. The laws are
 
 ```
@@ -197,7 +142,7 @@ Two consequences worth knowing:
   curve on geometry alone (see `unified_span_ramps`).
 - If `a_peak = dv * f_lo` would exceed `max_accel`, the plateau is forced wider
   than `1/f_lo` and only **one** zero fits. Recovering both would need a
-  third-order (S-edge) pulse the emitter cannot render, so the planner keeps the
+  third-order (S-edge) pulse the notch law does not design, so the planner keeps the
   zero on whichever mode it helps more — which of the two that is depends on
   `dv`, so it is decided per ramp — and logs `second_notch_saturated` when a mode
   is genuinely left excited. Raising `max_accel`, or spanning the ramp across
@@ -296,9 +241,8 @@ would demand unbounded extruder acceleration; the smoothing rounds it off.
 
 A notched ramp is already a trapezoid in acceleration lasting
 `1/f_lo + 1/f_hi`, so velocity is C1 and the pressure advance term is already
-continuous. There is no discontinuity left to smooth. What remains is the
-`unified_jerk_dt` slice staircase, which is far shorter and needs a far smaller
-window.
+continuous. There is no discontinuity left to smooth, so the window only
+needs to be short against the ramp.
 
 Leaving the default in place is actively harmful once it approaches the ramp
 duration: at 55/65 Hz the ramp is `1/55 + 1/65` = 33.6 ms, so a 40 ms window is
@@ -307,8 +251,7 @@ across more than the whole ramp, which flattens and delays exactly the corner
 signal a pressure advance tuning tower is read on — the tower's optimum goes
 broad and its location moves between runs.
 
-Aim for roughly a third of the notch period, with a floor of a few times
-`unified_jerk_dt` so the slice staircase is still smoothed:
+Aim for roughly a third of the notch period:
 
 | notch                | ramp `1/f_lo + 1/f_hi` | suggested `smooth_time` |
 | -------------------- | ---------------------- | ----------------------- |
@@ -347,8 +290,10 @@ oversized smoothing window measures the window as much as the melt.
 - **Homing and probing.** Homing/probing drip moves continue to use the standard
   trapezoid path. `unified_planner` applies to normal queued motion.
 
-- **One zero.** The accel ramp provides a single shaper zero, so it cancels one
-  mode. A second, well-separated mode is not addressed by this feature.
+- **Two zeros at most.** `unified_notch_freq_x`/`_y` give the ramp two zeros
+  (see [Two modes in one ramp](#two-modes-in-one-ramp)), and a ramp that
+  saturates `max_accel` keeps only one. A third mode is not addressed by this
+  feature.
 
 - **Throughput.** Jerk-limited moves take longer than the equivalent trapezoid,
   and on short-segment geometry the cost is much larger than "a bit slower".
@@ -387,8 +332,8 @@ oversized smoothing window measures the window as much as the melt.
   and the runway is the run's length instead of a single segment's. The ramp
   itself is unchanged: same `2 / f_n` rise, same triangular `a(t)`, same zero
   sitting exactly on `f_n`. Measured on the emitted acceleration waveform of a
-  spanning profile at `f_n = 55` Hz, `|A(f_n)| / |A(0)| = 0.0066`, against `0.41`
-  at `f_n / 2` — the null is still on the mode and still sharp.
+  straight spanning profile at `f_n = 55` Hz, `|A(f_n)| / |A(0)|` is ~1e-17
+  against `0.41` at `f_n / 2` — the null is still on the mode and still exact.
 
   Terminal speed on a chain of collinear segments, requested feedrate 300 mm/s,
   `f_n = 55`, `max_accel = 20000`:
@@ -419,30 +364,16 @@ oversized smoothing window measures the window as much as the melt.
   The first term keeps the zero; the second is a *truncated* triangle, which
   has no null at `f_n`. Integrating the ideal pulse gives
   `|A_tail(f_n)| / |a|₁ ≤ 0.159` (worst when the turn lands on the acceleration
-  peak), so the residual left on the turning axis is about `2·sin(θ/2)·0.159` —
-  measured against the ~0.0066 the emitter's own ZOH discretization leaves on a
-  straight run **when `unified_spectral_null` is off**. That floor is what makes
-  a small angle free: below it, the turn is buried in noise the emitter was
-  already making.
+  peak), so the residual left on the turning axis is about `2·sin(θ/2)·0.159`.
+  A straight run nulls exactly, so there is no emitter floor for a turn to hide
+  under: this limit is a direct residual budget.
 
-  With `unified_spectral_null` on there is no such floor — a straight run nulls
-  exactly — so every degree of turn is measurable, and this limit stops being
-  "free up to 2°" and becomes a direct residual budget.
-
-  A spanned run that genuinely does not turn keeps the correction: with the
-  axis ratios constant, one scalar null transfers to every axis unchanged. A
-  run that turns anywhere along it does not, and reports
-  `spectral_null_span_turned` rather than quietly emitting an uncorrected run.
-
-  The table below is the floor-relative view and applies to the unsolved
-  emitter:
-
-  | heading change | residual at `f_n` | vs. straight-run floor |
-  | -------------- | ----------------- | ---------------------- |
-  | 0.5°           | 0.0014            | 0.2x                   |
-  | 2° (default)   | 0.0058            | 0.9x                   |
-  | 5°             | 0.014             | 2.1x                   |
-  | 18°            | 0.051             | 7.8x                   |
+  | heading change | residual at `f_n` |
+  | -------------- | ----------------- |
+  | 0.5°           | 0.0014            |
+  | 2° (default)   | 0.0055            |
+  | 5°             | 0.014             |
+  | 18°            | 0.050             |
 
   This is why the default is 2° and not the much coarser angle a "nearly
   collinear" intuition suggests. A scalar-only spectrum cannot see any of this,
@@ -460,19 +391,23 @@ oversized smoothing window measures the window as much as the melt.
   just past the default (emitting the arc as `G2`/`G3` and re-expanding it via
   `[gcode_arcs]` raises the per-move ceiling instead — see
   [Arc output](#arc-output)). Widening `unified_span_max_angle` to 3° recovers the
-  full speed there for a residual of 0.0083 — 1.3x the emitter's own floor
-  *when `unified_spectral_null` is off* — which is a far better trade than
-  shaping those moves on the wrong frequency would be. With the null on there
-  is no floor to compare against, so read 0.0083 as an absolute budget. What is left after that is genuinely sharp short-segment geometry,
+  full speed there for a residual of 0.0083, which is a far better trade than
+  shaping those moves on the wrong frequency would be. What is left after that
+  is genuinely sharp short-segment geometry,
   where the corners are already speed-capped by `junction_deviation` and the
   notch runway is usually not the binding constraint.
 
 ## How it works
 
-Jerk-limited profiles are emitted as a chain of short constant-acceleration
-slices through the existing trapezoid motion queue and step compression — there
-are no firmware or MCU changes. The extruder is driven slice-by-slice in
-lock-step with the toolhead so pressure advance integrates the real velocity
-profile. The planning math lives in `klippy/extras/pathplan.py` and is covered
-by `test_pathplan.py`, `test_pathplan_jerk.py`, `test_pathplan_notch.py`,
-and `test_notch_dual.py`.
+Each ramp is queued as at most three constant-jerk segments (rise, hold, fall)
+through `trapq_append_jerk`: the host trapq carries a jerk term, and the
+integrators used by step generation, pressure advance and the smoothing input
+shapers evaluate the cubic position exactly. Step compression and the MCU are
+unchanged — there are no firmware changes. A ramp spanning several moves is
+split at the move boundaries into the same segments. The extruder is driven
+segment-by-segment in lock-step with the toolhead (`process_move_cubic`), so
+pressure advance integrates the real velocity profile. The planning math lives
+in `klippy/extras/pathplan.py` and is covered by `test_pathplan.py`,
+`test_pathplan_cubic.py`, `test_pathplan_notch.py`, `test_notch_dual.py`,
+`test_notch_peraxis.py`, `test_toolhead_span.py`, and
+`test_toolhead_unified.py`.and `test_notch_dual.py`.

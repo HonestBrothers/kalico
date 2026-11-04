@@ -299,43 +299,15 @@ max_accel:
 #   the scalar path speed, so the axes see it scaled by the move direction;
 #   turning part-way through a ramp leaves the turning axis a truncated pulse,
 #   which has no null at the mode. The residual it leaves there is about
-#   2 * sin(angle / 2) * 0.159, against the roughly 0.0066 the emitter's own
-#   discretization leaves when unified_spectral_null is off - so 2 degrees
-#   costs nothing measurable, 5 degrees is about twice that floor and 18
-#   degrees about eight times it. After a successful exact spectral solve there
-#   is no floor to hide under, so every degree of turn is measurable and this
-#   becomes a direct residual budget rather than a free allowance. A spanned
-#   run that does not turn remains eligible for the spectral correction
-#   (constant axis ratios carry a scalar null to every axis); one that turns
-#   anywhere reports spectral_null_span_turned instead. Raise it only to span coarser geometry, and expect ringing in
-#   return. The default is 2.0.
-#unified_spectral_null: True
-#   Solve the emitted slice accelerations for the notch null instead of
-#   sampling the ideal ramp. The notch zero is exact only in continuous time;
-#   emitted as constant-acceleration slices it smears to about 1.3% of dv at
-#   the default unified_jerk_dt. But the emitted spectrum is LINEAR in those
-#   accelerations and there are far more of them than constraints, so the
-#   solver preserves dv and distance while zeroing the real and imaginary
-#   parts of the spectrum at each configured mode. Measured 1.395% to 0.0000%
-#   on ordinary unsaturated single-mode ramps at 55 Hz. Ill-conditioned or
-#   constrained cases report spectral_null_failed or spectral_null_partial.
-#   dv, distance, and terminal velocity are checked after solving, so print
-#   time and every lookahead calculation are unchanged. A ramp saturating
-#   max_accel pins its plateau and
-#   takes a partial null (1.28% to 0.47%) rather than refusing or exceeding the
-#   limit; a correction that still will not fit leaves the ramp untouched.
-#   Costs roughly 23% more planner CPU; set it False to reclaim that on a
-#   constrained host. It changes what unified_jerk_dt buys:
-#   depth at the configured modes stops depending on slice count, but the
-#   BROADBAND floor everywhere else still does, and no null touches that. At 11
-#   slices the response above 100 Hz is 4.6x what it is at 34, so coarsening is
-#   not free. The default is True.
-#unified_jerk_dt: 0.001
-#   Integration time step in seconds for emitted jerk-limited slices. Smaller
-#   values create more motion-queue entries. The minimum is 0.0001. When the
-#   planner is enabled it must provide at least 10 slices across the fastest
-#   configured notch edge (jerk_dt * max_notch_frequency <= 0.1). The default
-#   is 0.001.
+#   2 * sin(angle / 2) * 0.159 of the turning axis's pulse: 0.14% at 0.5
+#   degrees, 0.55% at 2, 1.4% at 5 and 5.0% at 18. A run that does not turn
+#   keeps an exact null, because the emitted ramp is the ideal pulse itself
+#   (see the Emission section of docs/Jerk_Limiting.md). Raise this only to
+#   span coarser geometry, and expect ringing in return. The default is 2.0.
+#
+#   The options unified_jerk_dt, unified_spectral_null and unified_cubic belong
+#   to the retired slice emitter. They are still accepted, with a deprecation
+#   warning, and have no effect.
 ```
 
 ### [stepper]

@@ -29,7 +29,6 @@ def _cons():
     return pathplan.Constraints(
         a_const=8000.0,
         v_ceil=600.0,
-        jerk_dt=0.001,
         notch_freq=55.0,
     )
 
@@ -44,11 +43,12 @@ def bench_emit(iterations=400):
         ve = float((i * 11) % 40)
         vc = max(vs, ve) + 20.0 + float(i % 120)
         move_d = 8.0 + float(i % 80) * 0.35
-        segs = pathplan.emit_profile(vs, vc, ve, move_d, cons)
+        pathplan.validate_cubic_profile(vs, vc, ve, move_d, cons)
+        segs = pathplan.render_cubic_profile(vs, vc, ve, move_d, cons)
         assert segs
         check_segs(segs, move_d, vs, ve, "perf[%d]" % (i,))
         seg_count += len(segs)
-        dist_sum += sum(s[6] for s in segs)
+        dist_sum += sum(s[4] for s in segs)
     return time.perf_counter() - start, seg_count, dist_sum
 
 
@@ -64,7 +64,8 @@ def bench_emit_short(iterations=400):
         vc = 5.0 + float(i % 16)
         ramp_d = pathplan.notch_dist(0.0, vc, cons.a_const, cons.notch_freq)
         move_d = 2.0 * ramp_d + 0.01
-        segs = pathplan.emit_profile(vs, vc, ve, move_d, cons)
+        pathplan.validate_cubic_profile(vs, vc, ve, move_d, cons)
+        segs = pathplan.render_cubic_profile(vs, vc, ve, move_d, cons)
         assert segs, (vs, vc, ve, move_d)
         check_segs(segs, move_d, vs, ve, "perf_short[%d]" % (i,))
         seg_count += len(segs)
@@ -72,10 +73,8 @@ def bench_emit_short(iterations=400):
 
 
 def bench_loss_reasons(iterations=400):
-    # The diagnostic the toolhead calls alongside emit_profile. It re-runs a
-    # feasibility probe, so it must stay CHEAPER than the emit it annotates --
-    # it used to cost ~1.7x emit_profile because it built and discarded a full
-    # slice list.
+    # The diagnostic the toolhead calls alongside every rendered profile. It
+    # must stay CHEAPER than the emit it annotates.
     cons = _cons()
     start = time.perf_counter()
     count = 0
@@ -101,9 +100,9 @@ def main():
     assert dist_sum > 0.0
     assert short_segs > 0
     print("reach: %.4fs for 2000 reach solves" % (reach_t,))
-    print("emit:  %.4fs for 400 profiles (%d slices)" % (emit_t, seg_count))
+    print("emit:  %.4fs for 400 profiles (%d segments)" % (emit_t, seg_count))
     print(
-        "short: %.4fs for 400 sub-mm profiles (%d slices)"
+        "short: %.4fs for 400 sub-mm profiles (%d segments)"
         % (short_t, short_segs)
     )
     print(

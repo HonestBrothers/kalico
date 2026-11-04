@@ -162,15 +162,12 @@ def test_split_preserves_profile():
             assert abs(seg_spectrum(flat, f) - seg_spectrum(segs, f)) < 1e-9
 
 
-def test_segment_count_vs_slices():
-    # The point of the exercise for a slow host: trapq traffic per ramp.
-    cons_s = pathplan.Constraints(
-        a_const=ACCEL, jerk_dt=0.001, notch_freq=55.0, notch_freq2=65.0
-    )
-    cons_c = cons_for(55.0, 65.0)
-    slices, _ = pathplan._ramp_up_jerk(0.0, 200.0, cons_s)
-    segs = pathplan._cubic_ramp_up(0.0, 200.0, cons_c)
-    assert len(segs) == 3 and len(slices) >= 30, (len(segs), len(slices))
+def test_segment_count():
+    # The point of the exercise for a slow host: trapq traffic per ramp. An
+    # unsaturated two-zero ramp is rise / hold / fall; a single notch has no
+    # hold, so its triangle is two segments.
+    assert len(pathplan._cubic_ramp_up(0.0, 200.0, cons_for(55.0, 65.0))) == 3
+    assert len(pathplan._cubic_ramp_up(0.0, 200.0, cons_for(55.0))) == 2
 
 
 if __name__ == "__main__":

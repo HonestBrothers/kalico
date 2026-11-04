@@ -67,7 +67,6 @@ def make_toolhead(span=True, notch=FN):
     th.square_corner_velocity = 5.0
     th.junction_deviation = 0.5 * th.square_corner_velocity**2 / th.max_accel
     th.unified_emit = True
-    th.unified_jerk_dt = 0.0005
     th.unified_notch_freq = notch
     th.unified_notch_freq_x = notch
     th.unified_notch_freq_y = notch
@@ -110,8 +109,9 @@ def span_buckets(th, moves):
         if item is None or item[1] != 0:
             continue
         group, vs, vc, ve, total_d, cons = item[0]
-        segs = toolhead.pathplan.emit_profile(vs, vc, ve, total_d, cons)
-        buckets = toolhead.pathplan.split_segments(
+        toolhead.pathplan.validate_cubic_profile(vs, vc, ve, total_d, cons)
+        segs = toolhead.pathplan.render_cubic_profile(vs, vc, ve, total_d, cons)
+        buckets = toolhead.pathplan.split_cubic_segments(
             segs, [m.move_d for m in group]
         )
         out.update(
@@ -134,8 +134,31 @@ def span_profile(th, moves):
     return segs or None
 
 
+def is_accel_seg(seg):
+    """True for a piece of an ACCEL ramp: a(t) >= 0 throughout, not a cruise."""
+    t, _sv, a0, j, _d = seg
+    a1 = a0 + j * t
+    return a0 >= -1e-9 and a1 >= -1e-9 and (a0 > 1e-9 or a1 > 1e-9)
+
+
+def _seg_ft(seg, t0, w):
+    # Fourier transform of one segment's linear a(t) = a0 + j*s, s in [0, t],
+    # placed at time t0: integral a(t0+s) exp(-i w (t0+s)) ds, in closed form.
+    t, _sv, a0, j, _d = seg
+    e = complex(math.cos(w * t), -math.sin(w * t))
+    i0 = (1.0 - e) / (1j * w)
+    i1 = (-t * e + i0) / (1j * w)
+    return complex(math.cos(w * t0), -math.sin(w * t0)) * (a0 * i0 + j * i1)
+
+
+def _seg_l1(seg):
+    # Every emitted segment keeps one sign of acceleration.
+    t, _sv, a0, j, _d = seg
+    return abs(a0 * t + 0.5 * j * t * t)
+
+
 def axis_spectrum(items, freq, axis):
-    """|FFT| of a_axis(t) = r[axis] * a(t) at `freq`, over (axes_r, slices).
+    """|FFT| of a_axis(t) = r[axis] * a(t) at `freq`, over (axes_r, segments).
 
     This is the measurement that matters. The scalar a(t) keeps its null by
     construction, but the AXES see a(t) scaled by the move's direction, so a
@@ -143,52 +166,30 @@ def axis_spectrum(items, freq, axis):
     axis and destroys the null there. A scalar-only spectrum cannot see it.
 
     freq is None returns the L1 norm of the SCALAR a(t), the common normaliser
-    for both axes so the two are compared in absolute terms.
+    for both axes so the two are compared in absolute terms. Exact for the
+    piecewise-linear a(t) the segments encode.
     """
     if freq is None:
-        return math.fsum(
-            abs(a) * (at + dt)
-            for _r, segs in items
-            for at, _ct, dt, _sv, _cv, a, _d in segs
-        )
+        return math.fsum(_seg_l1(s) for _r, segs in items for s in segs)
     w = 2.0 * math.pi * freq
-    re = im = t = 0.0
+    t = 0.0
+    acc = 0j
     for r, segs in items:
-        ra = r[axis]
-        for at, ct, dt, _sv, _cv, a, _d in segs:
-            for dur, acc in ((at, ra * a), (ct, 0.0), (dt, -ra * a)):
-                if dur <= 0.0:
-                    continue
-                nt = t + dur
-                if acc:
-                    re += acc * (math.sin(w * nt) - math.sin(w * t)) / w
-                    im += acc * (math.cos(w * nt) - math.cos(w * t)) / w
-                t = nt
-    return math.hypot(re, im)
+        for s in segs:
+            acc += r[axis] * _seg_ft(s, t, w)
+            t += s[0]
+    return abs(acc)
 
 
 def accel_spectrum(segs, freq):
-    """|FFT| of the emitted a(t) staircase at `freq` (ZOH slices).
+    """|FFT| of the emitted a(t) at `freq` (exact, piecewise linear).
 
     freq <= 0 returns the L1 norm of a(t), which is the natural scale for a
     profile whose accel and decel pulses cancel at DC.
     """
     if freq <= 0.0:
-        return math.fsum(
-            abs(a) * (at + dt) for at, _ct, dt, _sv, _cv, a, _d in segs
-        )
-    w = 2.0 * math.pi * freq
-    re = im = t = 0.0
-    for at, ct, dt, _sv, _cv, a, _d in segs:
-        for dur, acc in ((at, a), (ct, 0.0), (dt, -a)):
-            if dur <= 0.0:
-                continue
-            nt = t + dur
-            if acc:
-                re += acc * (math.sin(w * nt) - math.sin(w * t)) / w
-                im += acc * (math.cos(w * nt) - math.cos(w * t)) / w
-            t = nt
-    return math.hypot(re, im)
+        return math.fsum(_seg_l1(s) for s in segs)
+    return axis_spectrum([((1.0,), segs)], freq, 0)
 
 
 def test_span_beats_the_runway_floor():
@@ -217,7 +218,7 @@ def test_span_keeps_the_zero_on_fn():
     # spanning many moves rather than one triangle per move.
     pulse = []
     for seg in segs:
-        if seg[0] <= 0.0:
+        if not is_accel_seg(seg):
             break
         pulse.append(seg)
     assert len(pulse) > 1, "no spanning accel pulse"
@@ -226,14 +227,12 @@ def test_span_keeps_the_zero_on_fn():
     at_fn = accel_spectrum(pulse, FN) / dc
     # Off-notch reference: the same pulse is NOT quiet away from the mode.
     off_notch = accel_spectrum(pulse, FN * 0.5) / dc
-    assert at_fn < 0.02, ("zero moved off f_n", at_fn)
+    assert at_fn < 1e-9, ("zero moved off f_n", at_fn)
     assert off_notch > 10.0 * at_fn, ("null is not selective", at_fn, off_notch)
     # And the pulse really did span: its rise time is 1/f_n, far longer than
     # any single 0.2 mm move lasts.
-    # (the few-percent shortfall is the known ZOH discretization of the ramp,
-    # not a shift of the law -- see test_zoh_notch_error_scales_with_dt)
     rise = math.fsum(s[0] for s in pulse)
-    assert abs(rise - 2.0 / FN) < 0.1 / FN, ("ramp is not 2/f_n", rise)
+    assert abs(rise - 2.0 / FN) < 1e-9, ("ramp is not 2/f_n", rise)
     print(
         "  spanning accel pulse: rise %.4f s (2/f_n = %.4f),"
         " |A(f_n)|/|A(0)| = %.5f vs %.4f at f_n/2 OK"
@@ -268,7 +267,7 @@ def test_span_keeps_BOTH_zeros_with_per_axis_modes():
     assert segs is not None, "no spanning profile was emitted"
     pulse = []
     for seg in segs:
-        if seg[0] <= 0.0:
+        if not is_accel_seg(seg):
             break
         pulse.append(seg)
     assert len(pulse) > 1, "no spanning accel pulse"
@@ -276,22 +275,21 @@ def test_span_keeps_BOTH_zeros_with_per_axis_modes():
     assert dc > 1e-6, ("degenerate pulse", dc)
     at_x = accel_spectrum(pulse, f_x) / dc
     at_y = accel_spectrum(pulse, f_y) / dc
-    assert at_x < 0.02, ("no null at f_x", at_x)
-    assert at_y < 0.02, ("no null at f_y", at_y)
+    assert at_x < 1e-9, ("no null at f_x", at_x)
+    assert at_y < 1e-9, ("no null at f_y", at_y)
     # Not just a long quiet pulse: well below the pair, the same pulse carries
     # most of its energy.
     #
     # The probe is deliberately at f_x/2 and not between the two zeros. 55 and
     # 70 Hz are close enough that |sinc(f/55)*sinc(f/70)| stays small across the
-    # whole gap -- about 0.014 at the midpoint against a 0.007-0.009 ZOH floor
-    # at the zeros themselves. That shallow ratio is the pair working, not a
-    # missing null, so asserting on it would only measure the discretization.
+    # whole gap -- about 0.014 at the midpoint. That shallow ratio is the pair
+    # working, not a missing null.
     off_notch = accel_spectrum(pulse, 0.5 * f_x) / dc
     assert off_notch > 20.0 * max(at_x, at_y), (off_notch, at_x, at_y)
     # The ramp lasts 1/f_x + 1/f_y, not 2/f_n for either mode alone.
     rise = math.fsum(s[0] for s in pulse)
     want = 1.0 / f_x + 1.0 / f_y
-    assert abs(rise - want) < 0.1 * want, ("ramp is not 1/f_x + 1/f_y", rise)
+    assert abs(rise - want) < 1e-9, ("ramp is not 1/f_x + 1/f_y", rise)
     print(
         "  spanning pulse over %d moves: rise %.4f s (1/f_x+1/f_y = %.4f),"
         " |A|/|A(0)| = %.5f at %g Hz and %.5f at %g Hz OK"
@@ -309,19 +307,15 @@ def test_span_buckets_conserve_distance_and_velocity():
         b = buckets.get(id(move))
         if b is None:
             continue
-        d = math.fsum(s[6] for s in b)
+        d = math.fsum(s[4] for s in b)
         assert abs(d - move.move_d) <= 1e-9 * max(1.0, move.move_d), (
             "bucket distance != move distance",
             d,
             move.move_d,
         )
-        for at, ct, dt, sv, cv, a, dist in b:
-            # Per-slice trapq-implied distance must equal the declared dist.
-            implied = (
-                (sv * at + 0.5 * a * at * at)
-                + cv * ct
-                + (cv * dt - 0.5 * a * dt * dt)
-            )
+        for t, sv, a0, j, dist in b:
+            # Per-segment trapq-implied distance must equal the declared dist.
+            implied = ((j / 6.0 * t + 0.5 * a0) * t + sv) * t
             assert abs(implied - dist) <= 1e-6 * max(1.0, dist), (
                 "trapq invariant broken",
                 implied,
@@ -329,12 +323,12 @@ def test_span_buckets_conserve_distance_and_velocity():
             )
             if v is not None:
                 assert abs(sv - v) <= 1e-6, ("velocity discontinuity", v, sv)
-            v = cv - a * dt if dt > 0.0 else (sv + a * at if at > 0.0 else cv)
+            v = sv + a0 * t + 0.5 * j * t * t
     print("  spanning buckets conserve distance and stay continuous OK")
 
 
 def accel_pulse_items(th, moves):
-    """(axes_r, slices) for the span's leading ACCEL pulse, in path order."""
+    """(axes_r, segments) for the span's leading ACCEL pulse, in path order."""
     buckets = span_buckets(th, moves)
     items = []
     for move in moves:
@@ -343,7 +337,7 @@ def accel_pulse_items(th, moves):
             if items:
                 break
             continue
-        keep = [s for s in b if s[0] > 0.0]
+        keep = [s for s in b if is_accel_seg(s)]
         if keep:
             items.append((move.axes_r, keep))
         if len(keep) != len(b):
@@ -363,15 +357,17 @@ def turn_residual(deg, frac):
     cons = pathplan.Constraints(
         a_const=20000.0,
         v_ceil=400.0,
-        jerk_dt=0.0005,
         notch_freq=FN,
     )
     v = 300.0
-    segs = pathplan.emit_profile(0.0, v, v, v / FN, cons)
-    pulse = [seg for seg in segs if seg[0] > 0.0]
-    assert len(pulse) > 4, "no accel pulse to split"
-    d = math.fsum(seg[6] for seg in pulse)
-    first, second = pathplan.split_segments(pulse, [d * frac, d * (1.0 - frac)])
+    pathplan.validate_cubic_profile(0.0, v, v, v / FN, cons)
+    segs = pathplan.render_cubic_profile(0.0, v, v, v / FN, cons)
+    pulse = [seg for seg in segs if is_accel_seg(seg)]
+    assert len(pulse) >= 2, "no accel pulse to split"
+    d = math.fsum(seg[4] for seg in pulse)
+    first, second = pathplan.split_cubic_segments(
+        pulse, [d * frac, d * (1.0 - frac)]
+    )
     th = math.radians(deg)
     items = [
         ((1.0, 0.0, 0.0, 0.0), first),
@@ -395,27 +391,27 @@ def worst_turn_residual(deg):
 def test_turning_axis_keeps_its_null():
     # The claim "the zero stays on f_n" has to hold on the AXES, not just on
     # the scalar path speed. Turning part-way through a ramp leaves the turning
-    # axis a TRUNCATED pulse, which has no null; the residual scales as
-    # |r2 - r1| * 0.159 (see SPAN_MAX_ANGLE). Budget it against the ~0.0066
-    # the emitter's own discretization already leaves on a straight run.
-    floor = turn_residual(0.0, 0.5)[0]
-    assert 0.001 < floor < 0.02, ("unexpected collinear residual", floor)
+    # axis a TRUNCATED pulse, which has no null; the residual is bounded by
+    # |r2 - r1| * 0.159 (see SPAN_MAX_ANGLE). A straight run loses nothing.
+    straight = turn_residual(0.0, 0.5)[0]
+    assert straight < 1e-9, ("straight run is not exact", straight)
     limit = make_toolhead(span=True).unified_span_max_angle
     at_limit = worst_turn_residual(limit)
-    assert at_limit <= floor, (
-        "the allowed heading change exceeds the emitter's own floor",
+    bound = 0.16 * 2.0 * math.sin(math.radians(limit) / 2.0)
+    assert 0.0 < at_limit <= bound, (
+        "the allowed heading change exceeds the truncated-pulse bound",
         limit,
         at_limit,
-        floor,
+        bound,
     )
     # Sensitivity: the measurement must actually react. 18 degrees was the
-    # original constant and has to come out clearly over budget, or this test
-    # proves nothing.
+    # original constant and has to come out clearly worse, or this test proves
+    # nothing.
     coarse = worst_turn_residual(18.0)
-    assert coarse > 4.0 * floor, ("measurement is not sensitive", coarse, floor)
+    assert coarse > 4.0 * at_limit, ("measurement is not sensitive", coarse)
     print(
         "  turning axis: %.5f at the %.1f deg limit, %.5f at 18 deg,"
-        " straight-run floor %.5f OK" % (at_limit, limit, coarse, floor)
+        " straight run %.1e OK" % (at_limit, limit, coarse, straight)
     )
 
 
@@ -554,7 +550,7 @@ def test_lazy_flush_never_emits_an_unrealisable_move():
             if id(move) in plans or not move.is_kinematic_move:
                 continue
             try:
-                pathplan.validate_profile(
+                pathplan.validate_cubic_profile(
                     move.start_v,
                     move.cruise_v,
                     move.end_v,

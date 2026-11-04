@@ -205,39 +205,13 @@ LOOKAHEAD_FLUSH_TIME = 0.250
 # |A_tail(f_n)| / |a|_1 <= 0.159, worst at t_c on the accel peak, so the
 # residual left on the turning axis is about
 #     |r2 - r1| * 0.159,   with |r2 - r1| = 2*sin(theta/2)
-# against the ~0.0066 the emitter's ZOH discretization leaves there WHEN
-# unified_spectral_null is off. That puts 18 degrees at 7.5x the floor -- far
-# too coarse -- while 2 degrees lands at 0.8x, under the noise already present:
-#     0.5 deg -> 0.2x    2 deg -> 0.8x     10 deg -> 4.2x
-#     1.0 deg -> 0.4x    5 deg -> 2.1x     18 deg -> 7.5x
+# The emitted ramp itself is exact, so this is the only residual a spanned run
+# adds:
+#     0.5 deg -> 0.14%   2 deg -> 0.55%   5 deg -> 1.4%   18 deg -> 5.0%
 # Hence a 2 degree default, tunable via unified_span_max_angle for anyone who
-# wants to trade that residual for spanning across coarser geometry.
-#
-# With the null ON there is no 0.0066 floor to hide under, so this table no
-# longer sets the trade -- see SPAN_COLLINEAR_EPS.
+# wants to trade that residual for spanning across coarser geometry. A straight
+# run (constant axis ratios) loses nothing.
 SPAN_MAX_ANGLE = 2.0
-
-# How exactly two moves must agree on direction for a spanned run to count as
-# straight, per unit-vector component. A straight run's axis ratios are
-# constant, so one scalar spectral null transfers to every axis unchanged; any
-# real turn makes them time-varying and it does not. Slicer output that is
-# genuinely collinear reproduces the direction bit-for-bit, so this only has to
-# absorb the rounding in axes_r itself.
-#
-# MEASURED 2026-07-29, and this is stricter than the physics needs. Nulling the
-# scalar on a turning run does make the TURNING axis slightly worse (it cannot
-# see the truncated tail, and redistributes ~20% into it), but it takes orders
-# of magnitude off the dominant axis, so the vector residual at f_n still wins
-# by a wide margin. Swept 50 geometries (4-40 moves, 0.2-2 mm segments, 60-300
-# mm/s, 3000-20000 mm/s^2): the null stops helping only past 1.29 deg per
-# junction / 19.3 deg of TOTAL heading drift, worst case. Neither variable
-# collapses the crossover on its own. A drift budget of a few degrees would keep
-# the null on exactly the near-straight runs it still helps -- notably small
-# arcs, the case Jerk_Limiting.md calls out (r=4 mm at 0.2 mm chords turns
-# 2.87 deg per segment). Not taken: all of it is the COMMANDED spectrum on
-# monotone turns, and real gcode zigzags.
-SPAN_COLLINEAR_EPS = 1e-12
-
 
 # Class to track a list of pending move requests and to facilitate
 # "look-ahead" across moves to reduce acceleration between moves.
@@ -472,10 +446,6 @@ DRIP_TIME = 0.100
 
 # Main code to track events (and their timing) on the printer toolhead
 class ToolHead:
-    # Opt-in exact constant-jerk emission; see __init__. A class default so
-    # code paths reached before (or without) config parsing see it off.
-    unified_cubic = False
-
     def __init__(self, config):
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -495,30 +465,18 @@ class ToolHead:
         self.square_corner_velocity = config.getfloat(
             "square_corner_velocity", 5.0, minval=0.0
         )
-        # Jerk-limited motion (opt-in). When enabled, each move is rendered as
-        # jerk-bounded constant-accel slices instead of one hard accel step, and
-        # the lookahead plans the boundary speeds that ramp can reach.
+        # Jerk-limited motion (opt-in). When enabled, each notched ramp is
+        # rendered as exact constant-jerk (cubic) trapq segments -- at most
+        # three per ramp -- instead of one hard accel step, and the lookahead
+        # plans the boundary speeds that ramp can reach. See pathplan "Cubic
+        # emitter".
         self.unified_emit = config.getboolean("unified_planner", False)
-        # Ramp integration time step (s).
-        self.unified_jerk_dt = config.getfloat(
-            "unified_jerk_dt", 0.001, minval=0.0001
-        )
-        # Solve the emitted slice accelerations for an exact spectral null
-        # instead of sampling the ideal ramp. See pathplan.solve_ramp_null.
-        # On by default: it costs nothing to anyone who has not already opted
-        # into unified_planner, and sampling rather than solving leaves the
-        # notch about 1.4% short of the null the notch law exists to hit. Set
-        # it False to reclaim the ~23% planner CPU on a constrained host.
-        self.unified_spectral_null = config.getboolean(
-            "unified_spectral_null", True
-        )
-        # Emit each ramp as exact constant-jerk (cubic) trapq segments instead
-        # of constant-accel slices. The piecewise-linear a(t) the notch law
-        # designs is then represented exactly: the zeros hold by construction,
-        # so unified_spectral_null and unified_jerk_dt no longer apply to the
-        # rendered motion, and a ramp is at most three segments instead of
-        # notch_period/jerk_dt slices. See pathplan "Cubic emitter".
-        self.unified_cubic = config.getboolean("unified_cubic", False)
+        # Options of the retired constant-accel slice emitter. Accepted (and
+        # ignored) so an existing config keeps loading, with a deprecation
+        # notice instead of an "option not valid" error.
+        for opt in ("unified_jerk_dt", "unified_spectral_null", "unified_cubic"):
+            config.deprecate(opt)
+            config.get(opt, None)
         # Per-ramp notch law: park the jerk ramp's shaper zero on a fixed mode
         # frequency (Hz) via J = dv*f_n^2, instead of a fixed jerk. Peak accel
         # then self-scales as a_peak = dv*f_n. See pathplan.Constraints.ramp_jerk.
@@ -573,7 +531,6 @@ class ToolHead:
         self.orig_cfg["min_cruise_ratio"] = self.min_cruise_ratio
         self.orig_cfg["square_corner_velocity"] = self.square_corner_velocity
         self.orig_cfg["unified_emit"] = self.unified_emit
-        self.orig_cfg["unified_jerk_dt"] = self.unified_jerk_dt
         self.orig_cfg["unified_notch_freq"] = self.unified_notch_freq
         self.orig_cfg["unified_notch_freq_x"] = self.unified_notch_freq_x
         self.orig_cfg["unified_notch_freq_y"] = self.unified_notch_freq_y
@@ -751,64 +708,7 @@ class ToolHead:
                 self.print_time,
             )
 
-    def _emit_slices(self, move, segs, next_move_time):
-        # Push one move's constant-accel slices into the toolhead trapq and
-        # into every extra axis, and return the time the move ends at.
-        t = next_move_time
-        pos = 0.0
-        for at, ct, dt, sv, cv, a, dist in segs:
-            self.trapq_append(
-                self.trapq,
-                t,
-                at,
-                ct,
-                dt,
-                move.start_pos[0] + move.axes_r[0] * pos,
-                move.start_pos[1] + move.axes_r[1] * pos,
-                move.start_pos[2] + move.axes_r[2] * pos,
-                move.axes_r[0],
-                move.axes_r[1],
-                move.axes_r[2],
-                sv,
-                cv,
-                a,
-            )
-            for e_index, ea in enumerate(self.extra_axes):
-                if not move.axes_d[e_index + 3]:
-                    continue
-                if not hasattr(ea, "process_move_segment"):
-                    raise self.printer.command_error(
-                        "unified_planner requires extra axis '%s' to"
-                        " implement process_move_segment"
-                        % (ea.get_axis_gcode_id(),)
-                    )
-                ea.process_move_segment(
-                    t, move, e_index + 3, at, ct, dt, sv, cv, a, dist
-                )
-            t += at + ct + dt
-            pos += dist
-        for e_index, ea in enumerate(self.extra_axes):
-            if move.axes_d[e_index + 3] and hasattr(ea, "sync_position"):
-                ea.sync_position(move, e_index + 3)
-        return t
-
-    def _pp_validate(self, vs, vc, ve, move_d, cons):
-        if self.unified_cubic:
-            pathplan.validate_cubic_profile(vs, vc, ve, move_d, cons)
-        else:
-            pathplan.validate_profile(vs, vc, ve, move_d, cons)
-
-    def _pp_render(self, vs, vc, ve, move_d, cons):
-        if self.unified_cubic:
-            return pathplan.render_cubic_profile(vs, vc, ve, move_d, cons)
-        return pathplan._render_validated_profile(vs, vc, ve, move_d, cons)
-
-    def _pp_split(self, segs, lengths):
-        if self.unified_cubic:
-            return pathplan.split_cubic_segments(segs, lengths)
-        return pathplan.split_segments(segs, lengths)
-
-    def _emit_cubic(self, move, segs, next_move_time):
+    def _emit_segments(self, move, segs, next_move_time):
         # Push one move's exact constant-jerk segments into the toolhead trapq
         # and every extra axis, and return the time the move ends at.
         t = next_move_time
@@ -837,7 +737,7 @@ class ToolHead:
                     continue
                 if not hasattr(ea, "process_move_cubic"):
                     raise self.printer.command_error(
-                        "unified_cubic requires extra axis '%s' to"
+                        "unified_planner requires extra axis '%s' to"
                         " implement process_move_cubic"
                         % (ea.get_axis_gcode_id(),)
                     )
@@ -896,31 +796,8 @@ class ToolHead:
         if len(group) > 1:
             yield group, peak, cap
 
-    def _group_is_collinear(self, group):
-        # Does every move in a run point the same way?
-        #
-        # A spanned run renders ONE scalar profile and splits it among its
-        # members, and each axis sees a_i(t) = r_i(t)*a(t). If r_i is CONSTANT
-        # the scalar null transfers to every axis unchanged -- a straight run
-        # is exactly as safe as a single move. It is only a direction change
-        # inside the pulse that makes r_i time-varying and breaks the null.
-        #
-        # unified_span_max_angle bounds each JUNCTION, not the run, so heading
-        # can drift across many small turns. Compare against the run's first
-        # move rather than pairwise.
-        first = group[0].axes_r
-        for move in group:
-            r = move.axes_r
-            if (
-                abs(r[0] - first[0]) > SPAN_COLLINEAR_EPS
-                or abs(r[1] - first[1]) > SPAN_COLLINEAR_EPS
-                or abs(r[2] - first[2]) > SPAN_COLLINEAR_EPS
-            ):
-                return False
-        return True
-
     def _span_plans(self, moves):
-        # Validate each multi-move run without collecting slices. Return a
+        # Validate each multi-move run without rendering it. Return a
         # lightweight {id(move): (plan, index)} map; _process_lookahead renders
         # and splits one plan at a time when its first move reaches emission.
         out = {}
@@ -933,13 +810,8 @@ class ToolHead:
             # has to be the tightest any member allows -- members can differ
             # under a direction-dependent accel limit.
             a_span = min(m.accel for m in group)
-            cons = self._pathplan_cons(
-                first,
-                v_ceil=vc + 1.0,
-                a_const=a_span,
-                for_span=not self._group_is_collinear(group),
-            )
-            self._pp_validate(vs, vc, ve, total_d, cons)
+            cons = self._pathplan_cons(first, v_ceil=vc + 1.0, a_const=a_span)
+            pathplan.validate_cubic_profile(vs, vc, ve, total_d, cons)
             plan = (group, vs, vc, ve, total_d, cons)
             for index, move in enumerate(group):
                 out[id(move)] = (plan, index)
@@ -950,8 +822,8 @@ class ToolHead:
         if not moves:
             return
         # Validate every unified profile before mutating print-time or any
-        # motion queue. Validation runs the emitter's distance recurrence
-        # without collecting slices, keeping memory bounded for dense batches.
+        # motion queue. Validation runs the emitter's closed-form distances
+        # without rendering, keeping memory bounded for dense batches.
         span_plans = self._span_plans(moves)
         for move in moves:
             if (
@@ -961,7 +833,7 @@ class ToolHead:
             ):
                 continue
             cons = self._pathplan_cons(move)
-            self._pp_validate(
+            pathplan.validate_cubic_profile(
                 move.start_v,
                 move.cruise_v,
                 move.end_v,
@@ -982,8 +854,12 @@ class ToolHead:
             segs = span_buckets.pop(id(move), None)
             if span_item is not None and span_item[1] == 0:
                 group, vs, vc, ve, total_d, cons = span_item[0]
-                rendered = self._pp_render(vs, vc, ve, total_d, cons)
-                buckets = self._pp_split(rendered, [m.move_d for m in group])
+                rendered = pathplan.render_cubic_profile(
+                    vs, vc, ve, total_d, cons
+                )
+                buckets = pathplan.split_cubic_segments(
+                    rendered, [m.move_d for m in group]
+                )
                 if not all(buckets):
                     raise AssertionError(
                         "validated span produced an empty move"
@@ -1001,7 +877,7 @@ class ToolHead:
             elif segs is None and self.unified_emit and move.is_kinematic_move:
                 cons = self._pathplan_cons(move)
                 segs = (
-                    self._pp_render(
+                    pathplan.render_cubic_profile(
                         move.start_v,
                         move.cruise_v,
                         move.end_v,
@@ -1021,20 +897,15 @@ class ToolHead:
                         ),
                     )
             if segs is not None:
-                # Emit the jerk-limited profile as a chain of constant-accel
-                # slices, driving the toolhead trapq and each extra axis (the
-                # extruder) in lock-step so pressure advance integrates the real
-                # profile. The profile's duration differs from the nominal
-                # trapezoid (a_peak = dv*f_n < max_accel), so advance
-                # next_move_time by the ACTUAL emitted duration.
-                if self.unified_cubic:
-                    next_move_time = self._emit_cubic(
-                        move, segs, next_move_time
-                    )
-                else:
-                    next_move_time = self._emit_slices(
-                        move, segs, next_move_time
-                    )
+                # Emit the notched profile as exact constant-jerk segments,
+                # driving the toolhead trapq and each extra axis (the extruder)
+                # in lock-step so pressure advance integrates the real profile.
+                # The profile's duration differs from the nominal trapezoid
+                # (a_peak = dv*f_n < max_accel), so advance next_move_time by
+                # the ACTUAL emitted duration.
+                next_move_time = self._emit_segments(
+                    move, segs, next_move_time
+                )
             else:
                 if move.is_kinematic_move:
                     self.trapq_append(
@@ -1233,10 +1104,10 @@ class ToolHead:
 
     def set_extruder(self, extruder, extrude_pos):
         # XXX - should use add_extra_axis
-        if self.unified_emit and not hasattr(extruder, "process_move_segment"):
+        if self.unified_emit and not hasattr(extruder, "process_move_cubic"):
             raise self.printer.command_error(
                 "unified_planner requires extra axis '%s' to implement"
-                " process_move_segment" % (extruder.get_axis_gcode_id(),)
+                " process_move_cubic" % (extruder.get_axis_gcode_id(),)
             )
         prev_ea_trapq = self.extra_axes[0].get_trapq()
         if prev_ea_trapq in self.flush_trapqs:
@@ -1252,10 +1123,10 @@ class ToolHead:
 
     def add_extra_axis(self, ea, axis_pos):
         self._flush_lookahead()
-        if self.unified_emit and not hasattr(ea, "process_move_segment"):
+        if self.unified_emit and not hasattr(ea, "process_move_cubic"):
             raise self.printer.command_error(
                 "unified_planner requires extra axis '%s' to implement"
-                " process_move_segment" % (ea.get_axis_gcode_id(),)
+                " process_move_cubic" % (ea.get_axis_gcode_id(),)
             )
         self.extra_axes.append(ea)
         self.commanded_pos.append(axis_pos)
@@ -1580,7 +1451,7 @@ class ToolHead:
         move._unified_notch_pair = pair
         return pair
 
-    def _pathplan_cons(self, move, v_ceil=None, a_const=None, for_span=False):
+    def _pathplan_cons(self, move, v_ceil=None, a_const=None):
         # Build the pathplan.Constraints for one move. a_const is the move's
         # constant acceleration ceiling; with a notch frequency the emitter
         # governs ordinary moves via a_peak = dv*f_n instead.
@@ -1598,30 +1469,12 @@ class ToolHead:
             # start_v/cruise_v/end_v. Use the move's configured cruise limit
             # as the conservative ceiling for reach calculations.
             v_ceil = math.sqrt(move.max_cruise_v2) + 1.0
-        # The cubic emitter is exact; there is no slice staircase to solve.
-        want_null = (
-            getattr(self, "unified_spectral_null", False)
-            and not self.unified_cubic
-        )
-        cons = pathplan.Constraints(
+        return pathplan.Constraints(
             a_const=move.accel if a_const is None else a_const,
             v_ceil=v_ceil,
-            jerk_dt=self.unified_jerk_dt,
             notch_freq=notch,
             notch_freq2=notch2,
-            # for_span is set only for a run that CHANGES DIRECTION. One scalar
-            # profile is rendered across the whole run and split among its
-            # moves, and each axis sees a_i(t) = r_i(t)*a(t) -- with r_i
-            # constant, as on a straight run, a solved scalar null transfers to
-            # every axis unchanged and spanning is exactly as safe as a single
-            # move. Only a turn inside the pulse makes r_i time-varying and
-            # breaks it. See ToolHead._group_is_collinear.
-            spectral_null=want_null and not for_span,
         )
-        if for_span and want_null:
-            # Say so rather than quietly emitting an uncorrected run.
-            cons.spectral_loss = "spectral_null_span_turned"
-        return cons
 
     def _z_couples_xy(self):
         # Does a Z-only cartesian move drive the same actuators as X or Y?
@@ -1731,7 +1584,6 @@ class ToolHead:
 
     _UNIFIED_FIELDS = (
         "unified_emit",
-        "unified_jerk_dt",
         "unified_notch_freq",
         "unified_notch_freq_x",
         "unified_notch_freq_y",
@@ -1759,12 +1611,12 @@ class ToolHead:
         if not self.unified_emit:
             return
         for ea in self.extra_axes:
-            if hasattr(ea, "process_move_segment"):
+            if hasattr(ea, "process_move_cubic"):
                 continue
             axis = ea.get_axis_gcode_id()
             msg = (
                 "unified_planner requires extra axis '%s' to implement"
-                " process_move_segment" % (axis,)
+                " process_move_cubic" % (axis,)
             )
             if error_factory is not None:
                 raise error_factory(msg)
@@ -1778,85 +1630,6 @@ class ToolHead:
                 "unified_planner requires unified_notch_freq or both"
                 " unified_notch_freq_x and unified_notch_freq_y"
             )
-        max_freq = max(self.unified_notch_freq_x, self.unified_notch_freq_y)
-        if self.unified_jerk_dt * max_freq > 0.1 + 1e-12:
-            raise error_factory(
-                "unified_jerk_dt must be at most %.9f for a %.3f Hz notch"
-                " (at least 10 slices per fastest ramp edge). Set"
-                " unified_jerk_dt to %.9f or less in [printer] and restart,"
-                " or lower the notch frequency. Slices per ramp scale as"
-                " 1/unified_jerk_dt, so halving it doubles trapq volume: the"
-                " limit is MCU link bandwidth, which saturates as"
-                " 'Timer too close', not host CPU. SET_UNIFIED revalidates"
-                " this, so a TUNING_TOWER sweeping the notch upward can trip"
-                " it partway up a print: set unified_jerk_dt for the TOP of"
-                " the intended sweep (0.1 / f_max) before starting it."
-                % (0.1 / max_freq, max_freq, 0.1 / max_freq)
-            )
-        self._check_unified_slice_budget(error_factory)
-
-    def _check_unified_slice_budget(self, error_factory):
-        # jerk_dt above is a LOWER bound on slices per ramp -- enough of them to
-        # resolve the notch edge. This is the upper bound, and it exists because
-        # over-resolving is not a recoverable condition at emit time: pathplan
-        # reports it by raising InfeasibleProfile, nothing catches that, and the
-        # print dies on the G1 that reached it. A low max_accel is what gets
-        # there: nothing shortens a saturated plateau of dv/a_max.
-        #
-        # The worst ramp these settings allow is 0 -> max_velocity: an
-        # unsaturated ramp lasts notch_period whatever dv is, but past
-        # saturation this is the longest plateau. max_accel is the configured
-        # one; M204 can lower it mid-print and lengthen that plateau further,
-        # which is exactly why this bound is a config sanity check and pathplan
-        # keeps a far looser runtime backstop rather than making it
-        # load-bearing.
-        freqs = [
-            f
-            for f in (self.unified_notch_freq_x, self.unified_notch_freq_y)
-            if f
-        ]
-        cons = pathplan.Constraints(
-            a_const=self.max_accel,
-            v_ceil=self.max_velocity,
-            jerk_dt=self.unified_jerk_dt,
-            notch_freq=min(freqs),
-            notch_freq2=max(freqs),
-        )
-        if pathplan.ramp_fits_slice_budget(0.0, self.max_velocity, cons):
-            return
-        # max_accel is named FIRST because it is always the knob that can
-        # move this number. A ramp splits into an irreducible notch period
-        # (1/f_lo + 1/f_hi, spent whatever the accel ceiling is) plus a
-        # plateau, and only the plateau answers to max_accel -- but the notch
-        # period cannot overflow the budget on its own. The 5 Hz notch floor
-        # and the 0.0001 jerk_dt minimum cap it at 0.4s / 0.0001 = 4000
-        # slices, under MAX_RAMP_SLICES. So whatever pushed a config over the
-        # limit is plateau, and plateau is exactly what max_accel removes.
-        f_lo, f_hi = min(freqs), max(freqs)
-        edge_slices = cons.notch_period / self.unified_jerk_dt
-        raise error_factory(
-            "unified planner settings need more than %d slices to ramp"
-            " 0 -> %.0f mm/s (unified_jerk_dt=%.6f notch=%.2f/%.2f Hz at"
-            " max_accel=%.0f). The notch period accounts for %.0f of them;"
-            " the rest is a plateau held down by max_accel. Raise max_accel"
-            " to %.0f (max_velocity * %.2f Hz) and the plateau disappears --"
-            " free under the notch law, where an unsaturated ramp peaks at"
-            " dv*f_lo on its own and never reaches the ceiling, and it"
-            " restores an exact spectral null in place of a partial one."
-            " Raising unified_jerk_dt also fits, but pays for it with the"
-            " broadband floor on every move."
-            % (
-                pathplan.MAX_RAMP_SLICES,
-                self.max_velocity,
-                self.unified_jerk_dt,
-                f_lo,
-                f_hi,
-                self.max_accel,
-                edge_slices,
-                self.max_velocity * f_lo,
-                f_lo,
-            )
-        )
 
     def _reset_unified_warnings(self):
         self._unified_warned = set()
@@ -1904,13 +1677,8 @@ class ToolHead:
         min_cruise_ratio = gcmd.get_float(
             "MINIMUM_CRUISE_RATIO", None, minval=0.0, below=1.0
         )
-        # Both limits size the worst ramp the unified emitter has to integrate
-        # -- max_velocity is the dv it validates against, and a lower max_accel
-        # lengthens a saturated plateau. Check them here, where the command can
-        # still be refused and rolled back, rather than at the G1 that would
-        # have hit it. M204 sets max_accel too and is deliberately NOT checked:
-        # slicers emit it per feature, so failing there would be the mid-print
-        # shutdown this is avoiding. pathplan's runtime backstop covers it.
+        # Revalidate the unified settings against the new limits, where the
+        # command can still be refused and rolled back.
         old_limits = (self.max_velocity, self.max_accel)
         if max_velocity is not None:
             self.max_velocity = max_velocity
@@ -2053,7 +1821,6 @@ class ToolHead:
                 "minimum_cruise_ratio: %.6f" % self.min_cruise_ratio,
                 "square_corner_velocity: %.6f" % self.square_corner_velocity,
                 "unified_planner: %d" % self.unified_emit,
-                "unified_jerk_dt: %.6f" % self.unified_jerk_dt,
                 "unified_notch_freq: %.6f" % self.unified_notch_freq,
                 "unified_notch_freq_x: %.6f" % self.unified_notch_freq_x,
                 "unified_notch_freq_y: %.6f" % self.unified_notch_freq_y,
