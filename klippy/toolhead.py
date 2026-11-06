@@ -1800,6 +1800,13 @@ class ToolHead:
                 "unified_planner requires unified_notch_freq or both"
                 " unified_notch_freq_x and unified_notch_freq_y"
             )
+        if self.unified_cubic:
+            # Both checks below bound the SLICE emitter (slices per ramp edge,
+            # slices per ramp). The cubic emitter writes at most three
+            # segments per ramp whatever the notch or max_accel, so neither
+            # applies -- and enforcing jerk_dt here made a TUNING_TOWER notch
+            # sweep shut the printer down when it crossed 0.1 / jerk_dt Hz.
+            return
         max_freq = max(self.unified_notch_freq_x, self.unified_notch_freq_y)
         if self.unified_jerk_dt * max_freq > 0.1 + 1e-12:
             raise error_factory(
