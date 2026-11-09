@@ -136,12 +136,17 @@ which collapse term-by-term to the single-zero triangle when `f_lo == f_hi`.
 Runway and throughput are governed by the pair's **harmonic mean**
 `f_eq = 2/(1/f_lo + 1/f_hi)` wherever this document says `f_n`.
 
-If `a_peak = dv * f_lo` would exceed `max_accel`, the plateau is forced wider
-than `1/f_lo` and only **one** zero fits. Recovering both would need a
-third-order (S-edge) pulse the notch law does not design, so the planner keeps
-the zero on whichever mode it helps more — which of the two that is depends on
-`dv`, so it is decided per ramp — and logs `second_notch_saturated` when a mode
-is genuinely left excited. Raising `max_accel` removes it.
+Two consequences worth knowing:
+
+- Ramp shape no longer depends on heading, so cross-move spanning links along a
+  curve on geometry alone (see `unified_span_ramps`).
+- If `a_peak = dv * f_lo` would exceed `max_accel`, the plateau is forced wider
+  than `1/f_lo` and only **one** zero fits. Recovering both would need a
+  third-order (S-edge) pulse the notch law does not design, so the planner keeps the
+  zero on whichever mode it helps more — which of the two that is depends on
+  `dv`, so it is decided per ramp — and logs `second_notch_saturated` when a mode
+  is genuinely left excited. Raising `max_accel`, or spanning the ramp across
+  more moves so each `dv` is smaller, removes it.
 
 Per-axis *input shaping* still differs: it filters each axis independently and so
 is not bound to a shared pulse at all, at the cost of operating post-hoc on the
@@ -162,10 +167,11 @@ slicer is an unknown command and the print aborts on the first curve, so if you
 switch arc fitting on, switch this on with it.
 
 It matters here for more than accepting the commands. Curved geometry sliced as
-sub-millimetre chords is the worst case for the notch law: every chord is held
-to the per-move ceiling `v ~= f_n * segment_length` (see **Throughput** under
-[Limitations](#limitations)) — at `f_n = 55`, about 11 mm/s on 0.2 mm chords.
-Arc fitting collapses those chords into a single `G2`/`G3`, and `[gcode_arcs]` re-expands it at `resolution`, which makes the
+sub-millimetre chords is the worst case for the notch law: anything turning more
+than `unified_span_max_angle` at *every* segment cannot be spanned and falls
+back to the per-move ceiling `v ~= f_n * segment_length` — at `f_n = 55`, about
+11 mm/s on 0.2 mm chords. Arc fitting collapses those chords into a single
+`G2`/`G3`, and `[gcode_arcs]` re-expands it at `resolution`, which makes the
 segment length that sets that ceiling a number chosen in `printer.cfg` rather
 than whatever chord tolerance the slicer happened to use. At `resolution: 1.0`
 the same curve ceilings at 55 mm/s instead; coarser values raise it
@@ -176,6 +182,13 @@ so every arc shorter than `2 * resolution` becomes one straight chord from its
 start to its end: at `resolution: 3.0` a 5.6 mm, 340° loop collapses to a
 0.33 mm chord carrying the whole loop's plastic, which aborts the print with
 "Move exceeds maximum extrusion".
+
+This is a different lever from spanning, and it does not help spanning — longer
+segments turn *more* per segment, not less. On a tight r=4 mm arc, 0.2 mm chords
+turn 2.87° per segment and 1 mm segments turn 14.4°, so neither spans at the 2°
+default; the gain is entirely in the per-move ceiling. On gentle curves 1 mm
+segments both span and carry a high ceiling, which is the case worth optimising
+for.
 
 ## Live tuning
 
@@ -297,9 +310,10 @@ oversized smoothing window measures the window as much as the melt.
   | 200 mm/s      | 7.27 mm       |
   | 300 mm/s      | 10.91 mm      |
 
-  Acceleration also cannot be spread across a run of short segments to get
-  around this, because each move's ramp returns to `a = 0` at its own end. On a
-  chain of equal-length segments the toolhead then converges to roughly
+  With `unified_span_ramps` off, acceleration also cannot be spread across a run
+  of short segments to get around this, because each move's ramp returns to
+  `a = 0` at its own end. On a chain of equal-length segments the toolhead then
+  converges to roughly
 
   ```
   v_terminal ~= f_n * segment_length
@@ -309,10 +323,77 @@ oversized smoothing window measures the window as much as the melt.
   1 mm segments and 11 mm/s on 0.2 mm segments. Curve-heavy or high-resolution
   sliced geometry is therefore speed-limited by `f_n`, not by the machine.
 
-  Slicing at a longer segment length raises the per-move ceiling directly.
-  Curves are the case that bites; emitting them as `G2`/`G3` and re-expanding
-  them via `[gcode_arcs]` makes the segment length a `printer.cfg` setting —
-  see [Arc output](#arc-output).
+  **`unified_span_ramps` (on by default) removes this ceiling without moving the
+  zero.** The floor is not a property of the notch law — it is a property of
+  requiring the ramp to start and end at `a = 0` *inside every move*. Drop that
+  requirement and let one ramp span a run of consecutive near-collinear moves,
+  and the runway is the run's length instead of a single segment's. The ramp
+  itself is unchanged: same `2 / f_n` rise, same triangular `a(t)`, same zero
+  sitting exactly on `f_n`. Measured on the emitted acceleration waveform of a
+  straight spanning profile at `f_n = 55` Hz, `|A(f_n)| / |A(0)|` is ~1e-17
+  against `0.41` at `f_n / 2` — the null is still on the mode and still exact.
+
+  Terminal speed on a chain of collinear segments, requested feedrate 300 mm/s,
+  `f_n = 55`, `max_accel = 20000`:
+
+  | segment | spanning off | spanning on |
+  | ------- | ------------ | ----------- |
+  | 0.1 mm  | 5.5 mm/s     | 300 mm/s    |
+  | 0.2 mm  | 11 mm/s      | 300 mm/s    |
+  | 0.5 mm  | 27.5 mm/s    | 300 mm/s    |
+  | 1 mm    | 55 mm/s      | 300 mm/s    |
+  | 2 mm    | 110 mm/s     | 300 mm/s    |
+  | 5 mm    | 275 mm/s     | 300 mm/s    |
+
+  A run breaks at any direction change beyond `unified_span_max_angle`, at a
+  notch-target change, and wherever a corner or feedrate limit would be
+  exceeded. Acceleration limits may vary inside a run; the emitter uses the
+  lowest limit among its member moves, so the run remains within every
+  per-move limit.
+
+  That angle limit matters more than it looks. The ramp shapes the *scalar*
+  path speed, and the axes see `a_x = rx·a(t)`. If the heading changes at time
+  `t_c` while `a(t)` is still non-zero, the turning axis gets
+
+  ```
+  a_x(t) = r1x·a(t) + (r2x - r1x)·a(t)·u(t - t_c)
+  ```
+
+  The first term keeps the zero; the second is a *truncated* triangle, which
+  has no null at `f_n`. Integrating the ideal pulse gives
+  `|A_tail(f_n)| / |a|₁ ≤ 0.159` (worst when the turn lands on the acceleration
+  peak), so the residual left on the turning axis is about `2·sin(θ/2)·0.159`.
+  A straight run nulls exactly, so there is no emitter floor for a turn to hide
+  under: this limit is a direct residual budget.
+
+  | heading change | residual at `f_n` |
+  | -------------- | ----------------- |
+  | 0.5°           | 0.0014            |
+  | 2° (default)   | 0.0055            |
+  | 5°             | 0.014             |
+  | 18°            | 0.050             |
+
+  This is why the default is 2° and not the much coarser angle a "nearly
+  collinear" intuition suggests. A scalar-only spectrum cannot see any of this,
+  which is why the test measures each axis separately. Boundary speeds are additionally
+  capped by the stock constant-acceleration reach, which keeps every move
+  individually feasible at `max_accel`. Set `unified_span_ramps: False` for the
+  strict per-move behaviour.
+
+  Slicing at a longer segment length also raises the per-move ceiling directly,
+  and is the only lever if spanning is disabled.
+
+  Geometry that turns more than `unified_span_max_angle` at *every* segment
+  cannot be spanned, and falls back to the per-move ceiling. Small arcs are the
+  case that bites: an r=4 mm circle at 0.2 mm chords turns 2.87° per segment,
+  just past the default (emitting the arc as `G2`/`G3` and re-expanding it via
+  `[gcode_arcs]` raises the per-move ceiling instead — see
+  [Arc output](#arc-output)). Widening `unified_span_max_angle` to 3° recovers the
+  full speed there for a residual of 0.0083, which is a far better trade than
+  shaping those moves on the wrong frequency would be. What is left after that
+  is genuinely sharp short-segment geometry,
+  where the corners are already speed-capped by `junction_deviation` and the
+  notch runway is usually not the binding constraint.
 
 ## How it works
 
@@ -320,9 +401,11 @@ Each ramp is queued as at most three constant-jerk segments (rise, hold, fall)
 through `trapq_append_jerk`: the host trapq carries a jerk term, and the
 integrators used by step generation, pressure advance and the smoothing input
 shapers evaluate the cubic position exactly. Step compression and the MCU are
-unchanged — there are no firmware changes. The extruder is driven
+unchanged — there are no firmware changes. A ramp spanning several moves is
+split at the move boundaries into the same segments. The extruder is driven
 segment-by-segment in lock-step with the toolhead (`process_move_cubic`), so
 pressure advance integrates the real velocity profile. The planning math lives
 in `klippy/extras/pathplan.py` and is covered by `test_pathplan.py`,
 `test_pathplan_cubic.py`, `test_pathplan_notch.py`, `test_notch_dual.py`,
-`test_notch_peraxis.py`, and `test_toolhead_unified.py`.
+`test_notch_peraxis.py`, `test_toolhead_span.py`, and
+`test_toolhead_unified.py`.
