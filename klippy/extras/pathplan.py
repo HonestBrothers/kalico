@@ -273,6 +273,17 @@ def notch_dist(v0, v1, accel, notch_freq, notch_freq2=None):
     return 0.5 * (v0 + v1) * t
 
 
+def _fit_down(v1, fits, floor):
+    # Closed-form solutions land on the feasibility boundary itself, where the
+    # recomputed distance can exceed the budget by an ULP. Step down until the
+    # distance check agrees, so callers always receive a feasible speed.
+    for _ in range(8):
+        if v1 <= floor or fits(v1):
+            return v1
+        v1 = math.nextafter(v1, -math.inf)
+    return max(floor, v1 * (1.0 - 1e-12))
+
+
 def notch_reach_v2(
     u0,
     dist,
@@ -283,12 +294,12 @@ def notch_reach_v2(
 ):
     # Max u = v^2 reachable from v0=sqrt(u0) over path-distance `dist` under a
     # notch profile. Direction-symmetric (forward accel == backward decel).
-    # Bisection on v1 over the O(1) closed-form notch_dist is cheap enough for
-    # the hot lookahead loop (no ramp integration).
     #
-    # Bisection stays valid under the notch law: distance is (v0+v1)/f while
-    # a_peak is unsaturated and 0.5*(v0+v1)*(dv/A + 1/f) past that; both are
-    # monotonically increasing in v1.
+    # Closed form while the ramp is unsaturated (a_peak = dv*f_lo <= accel):
+    # the ramp then lasts exactly 1/f_lo + 1/f_hi, so its distance is
+    # (v0+v1)/f_eq and the reach is v1 = dist*f_eq - v0. Past saturation the
+    # rise frequency is chosen per dv (sat_rise_freq), which makes distance
+    # non-monotonic in v1, so that case keeps the bisection.
     if dist <= 0.0:
         return u0
     if accel <= 0.0:
@@ -304,8 +315,7 @@ def notch_reach_v2(
     f_eq = 2.0 / (1.0 / f_lo + 1.0 / f_hi)
     # A ramp costs (v0+v1)/f_eq of distance, and that does not go to zero as
     # v1 -> v0: its infimum is 2*v0/f_eq. A move shorter than that has no room
-    # for any speed change and reach is exactly u0. This is the common
-    # short-move case, and testing it in closed form skips the whole bisection.
+    # for any speed change and reach is exactly u0.
     if dist < 2.0 * v0 / f_eq:
         return u0
 
@@ -313,6 +323,19 @@ def notch_reach_v2(
         return notch_dist(v0, v1, accel, f_lo, f_hi) <= dist
 
     hi = max(v0, v_ceil)
+    v1 = dist * f_eq - v0
+    if v1 - v0 <= accel / f_lo:
+        # Unsaturated over the whole answer (and every speed below it), so the
+        # distance is linear in v1 here and the boundary is exact.
+        if v1 >= hi:
+            return hi * hi
+        v1 = _fit_down(max(v1, v0), _fits, v0)
+        return v1 * v1
+    return _notch_reach_v2_bisect(v0, hi, _fits)
+
+
+def _notch_reach_v2_bisect(v0, hi, _fits):
+    # Saturated-ramp fallback: bisection on the closed-form notch_dist.
     if _fits(hi):
         return hi * hi
     lo = v0
@@ -443,12 +466,36 @@ def _cubic_reverse(segs):
 
 
 def _cubic_peak_velocity(vs, ve, move_d, cons):
-    # Highest cruise the move can reach: bisection on the closed-form ramp
-    # distance (accel vs->vp plus decel vp->ve), each probe O(1).
+    # Highest cruise the move can reach (accel vs->vp plus decel vp->ve).
+    #
+    # Closed form while both ramps are unsaturated: each then costs
+    # (v_end + vp)/f_eq, so vp = (move_d*f_eq - vs - ve)/2. A ramp of zero
+    # size costs nothing (not 2*v/f_eq), so vp == max(vs, ve) is feasible on
+    # its own and is the answer whenever the formula lands at or below it.
     lo = max(vs, ve)
     hi = cons.v_ceil
     if cubic_ramp_dist(vs, lo, cons) + cubic_ramp_dist(ve, lo, cons) >= move_d:
         return lo
+    if cons.notch_freq:
+        vp = 0.5 * (move_d * cons.notch_f_eq - vs - ve)
+        a = cons.a_const
+        unsat = not (a and a > 0.0) or (vp - min(vs, ve)) * cons.notch_lo <= a
+        if unsat:
+            if vp <= lo:
+                return lo
+            if vp >= hi:
+                vp = hi
+
+            def _fits(v):
+                return (cubic_ramp_dist(vs, v, cons)
+                        + cubic_ramp_dist(ve, v, cons)) <= move_d
+
+            return _fit_down(vp, _fits, lo)
+    return _cubic_peak_velocity_bisect(vs, ve, move_d, cons, lo, hi)
+
+
+def _cubic_peak_velocity_bisect(vs, ve, move_d, cons, lo, hi):
+    # Saturated-ramp fallback: bisection on the closed-form ramp distance.
     for _ in range(48):
         if hi - lo <= 1e-4:
             break
