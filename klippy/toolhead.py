@@ -797,9 +797,9 @@ class ToolHead:
             yield group, peak, cap
 
     def _span_plans(self, moves):
-        # Validate each multi-move run without rendering it. Return a
-        # lightweight {id(move): (plan, index)} map; _process_lookahead renders
-        # and splits one plan at a time when its first move reaches emission.
+        # Describe each multi-move run as ONE profile to render. Returns a
+        # {id(move): (plan, index)} map; _process_lookahead renders (which also
+        # validates) and splits each plan before it touches print_time.
         out = {}
         for group, peak, cap in self._span_groups(moves):
             first, last = group[0], group[-1]
@@ -811,7 +811,6 @@ class ToolHead:
             # under a direction-dependent accel limit.
             a_span = min(m.accel for m in group)
             cons = self._pathplan_cons(first, v_ceil=vc + 1.0, a_const=a_span)
-            pathplan.validate_cubic_profile(vs, vc, ve, total_d, cons)
             plan = (group, vs, vc, ve, total_d, cons)
             for index, move in enumerate(group):
                 out[id(move)] = (plan, index)
@@ -821,40 +820,22 @@ class ToolHead:
         moves = self.lookahead.flush(lazy=lazy)
         if not moves:
             return
-        # Validate every unified profile before mutating print-time or any
-        # motion queue. Validation runs the emitter's closed-form distances
-        # without rendering, keeping memory bounded for dense batches.
+        # Render every unified profile BEFORE touching print_time or any motion
+        # queue. Rendering is closed form and also the feasibility check
+        # (plan_cubic_profile raises InfeasibleProfile), so an impossible plan
+        # still fails before anything is emitted. Doing it ahead of the resync
+        # matters for timing too: after a resync from idle the MCU lead is
+        # only the restart lead, and rendering a full first batch (~280 moves
+        # after an M400) inside it put "Timer too close" on a CB1 host.
         span_plans = self._span_plans(moves)
-        for move in moves:
-            if (
-                id(move) in span_plans
-                or not self.unified_emit
-                or not move.is_kinematic_move
-            ):
-                continue
-            cons = self._pathplan_cons(move)
-            pathplan.validate_cubic_profile(
-                move.start_v,
-                move.cruise_v,
-                move.end_v,
-                move.move_d,
-                cons,
-            )
-        # Resync print_time if necessary
-        if self.special_queuing_state:
-            # Transition from "NeedPrime"/"Priming" state to main state
-            self.special_queuing_state = ""
-            self.need_check_pause = -1.0
-            self._calc_print_time()
-        # Queue moves into trapezoid motion queue (trapq)
-        next_move_time = self.print_time
+        rendered_segs = []
         span_buckets = {}
         for move in moves:
             span_item = span_plans.get(id(move))
             segs = span_buckets.pop(id(move), None)
             if span_item is not None and span_item[1] == 0:
                 group, vs, vc, ve, total_d, cons = span_item[0]
-                rendered = pathplan.render_cubic_profile(
+                rendered = pathplan.plan_cubic_profile(
                     vs, vc, ve, total_d, cons
                 )
                 buckets = pathplan.split_cubic_segments(
@@ -877,7 +858,7 @@ class ToolHead:
             elif segs is None and self.unified_emit and move.is_kinematic_move:
                 cons = self._pathplan_cons(move)
                 segs = (
-                    pathplan.render_cubic_profile(
+                    pathplan.plan_cubic_profile(
                         move.start_v,
                         move.cruise_v,
                         move.end_v,
@@ -896,6 +877,16 @@ class ToolHead:
                             cons,
                         ),
                     )
+            rendered_segs.append(segs)
+        # Resync print_time if necessary
+        if self.special_queuing_state:
+            # Transition from "NeedPrime"/"Priming" state to main state
+            self.special_queuing_state = ""
+            self.need_check_pause = -1.0
+            self._calc_print_time()
+        # Queue moves into trapezoid motion queue (trapq)
+        next_move_time = self.print_time
+        for move, segs in zip(moves, rendered_segs):
             if segs is not None:
                 # Emit the notched profile as exact constant-jerk segments,
                 # driving the toolhead trapq and each extra axis (the extruder)

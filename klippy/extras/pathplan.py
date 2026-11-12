@@ -536,16 +536,35 @@ def _emit_cubic_core(vs, vc, ve, move_d, cons, collect=True):
     return segs
 
 
+def _infeasible(vs, vc, ve, move_d):
+    return InfeasibleProfile(
+        "notched cubic profile does not fit move: "
+        "start=%.6f cruise=%.6f end=%.6f distance=%.6f"
+        % (vs, vc, ve, move_d)
+    )
+
+
 def validate_cubic_profile(vs, vc, ve, move_d, cons):
     """Raise InfeasibleProfile if the exact cubic profile cannot fit."""
     if move_d <= 0.0 or not cons.notch_freq:
         return
     if _emit_cubic_core(vs, vc, ve, move_d, cons, collect=False) is None:
-        raise InfeasibleProfile(
-            "notched cubic profile does not fit move: "
-            "start=%.6f cruise=%.6f end=%.6f distance=%.6f"
-            % (vs, vc, ve, move_d)
-        )
+        raise _infeasible(vs, vc, ve, move_d)
+
+
+def plan_cubic_profile(vs, vc, ve, move_d, cons):
+    """Validate and render in ONE pass: the segments, or InfeasibleProfile.
+
+    The toolhead's hot path. Rendering a cubic profile is closed form, so
+    running the feasibility recurrence once to validate and again to render
+    only doubled the work; the render already knows whether it fits.
+    """
+    if move_d > 0.0 and cons.notch_freq:
+        segs = _emit_cubic_core(vs, vc, ve, move_d, cons)
+        if segs is None:
+            raise _infeasible(vs, vc, ve, move_d)
+        return segs
+    return render_cubic_profile(vs, vc, ve, move_d, cons)
 
 
 def render_cubic_profile(vs, vc, ve, move_d, cons):
