@@ -432,6 +432,11 @@ class LookAheadQueue:
 BUFFER_TIME_LOW = 1.0
 BUFFER_TIME_HIGH = 2.0
 BUFFER_TIME_START = 0.250
+# Restart lead with the unified planner on. Rendering now happens before the
+# resync, so what follows it (trapq appends + step generation) is no heavier
+# than stock; the extra lead is margin for slow hosts whose CPU governor is
+# still at its idle clock when motion restarts after an M400.
+BUFFER_TIME_START_UNIFIED = 1.0
 BGFLUSH_LOW_TIME = 0.200
 BGFLUSH_BATCH_TIME = 0.200
 MIN_KIN_TIME = 0.100
@@ -698,7 +703,10 @@ class ToolHead:
         est_print_time = self.mcu.estimated_print_time(curtime)
         kin_time = max(est_print_time + MIN_KIN_TIME, self.min_restart_time)
         kin_time += self.kin_flush_delay
-        min_print_time = max(est_print_time + BUFFER_TIME_START, kin_time)
+        start_lead = (
+            BUFFER_TIME_START_UNIFIED if self.unified_emit else BUFFER_TIME_START
+        )
+        min_print_time = max(est_print_time + start_lead, kin_time)
         if min_print_time > self.print_time:
             self.print_time = min_print_time
             self.printer.send_event(
