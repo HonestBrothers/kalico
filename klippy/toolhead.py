@@ -1543,27 +1543,26 @@ class ToolHead:
         # ramp may span a run of moves (see SPAN_MAX_ANGLE).
         if not self._uses_unified_reach(move):
             return start_v2 + 2.0 * dist * move.accel
-        cons = self._pathplan_cons(move)
         # Memoize the last solve for this move. LookAheadQueue.flush probes the
         # same move up to three times per pass (once in the reverse sweep, twice
         # more in the unified cruise clamp) and repeats next_end_v2, so a
-        # one-entry cache removes most of the calls. cons.v_ceil is part of the
-        # key because it changes once set_junction() has run on this move.
-        key = (start_v2, cons.v_ceil, dist)
+        # one-entry cache removes most of the calls.
+        key = (start_v2, dist)
         cached = getattr(move, "_unified_reach_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
-        # cons.v_ceil deliberately unused here: it is the EMITTER's per-move
-        # ceiling (this move's own cruise target). Reachability asks how fast
-        # the toolhead could arrive, so it is bounded by the machine limit;
-        # move.max_cruise_v2 is applied separately by the caller.
+        # Reachability needs only the move's notch pair and accel -- not a
+        # Constraints object, and not the emitter's per-move v_ceil: it asks
+        # how fast the toolhead could arrive, so it is bounded by the machine
+        # limit; move.max_cruise_v2 is applied separately by the caller.
+        f_lo, f_hi = self._move_notch_pair(move)
         res = pathplan.notch_reach_v2(
             start_v2,
             dist,
             move.accel,
             self.max_velocity,
-            notch_freq=cons.notch_freq,
-            notch_freq2=cons.notch_freq2,
+            notch_freq=f_lo or None,
+            notch_freq2=f_hi or None,
         )
         move._unified_reach_cache = (key, res)
         return res
